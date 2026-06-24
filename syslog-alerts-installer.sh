@@ -3,7 +3,7 @@ set -euo pipefail
 
 #############################################
 # Syslog Alerts Platform - AIO Installer
-# Version: 1.0.0
+# Version: 1.0.1
 #############################################
 
 APP_NAME="syslog-alerts"
@@ -49,16 +49,30 @@ install_deps() {
         curl \
         openssl
 
-    pip3 install --upgrade pip
+    echo "[OK] Dependencies installed"
+}
 
-    pip3 install \
+install_python_deps() {
+    echo "[+] Installing Python dependencies into venv..."
+
+    /opt/syslog-alerts/venv/bin/pip install \
         pyyaml \
         jinja2 \
         fastapi \
         uvicorn \
         aiosmtplib
+}
+#############################################
+# Create Python virtual environment setup
+#############################################
+create_venv() {
+    echo "[+] Creating Python virtual environment..."
 
-    echo "[OK] Dependencies installed"
+    if [ ! -d "/opt/syslog-alerts/venv" ]; then
+        python3 -m venv /opt/syslog-alerts/venv
+    fi
+
+    /opt/syslog-alerts/venv/bin/pip install --upgrade pip setuptools wheel
 }
 
 #############################################
@@ -2672,6 +2686,10 @@ menu() {
             install_deps
             create_user
             create_dirs
+
+            create_venv
+            install_python_deps
+            
             init_db
             configure_postfix
             configure_syslog
