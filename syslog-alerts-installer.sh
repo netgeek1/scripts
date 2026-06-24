@@ -2664,9 +2664,9 @@ menu() {
     echo "6) Uninstall"
     echo "0) Exit"
     echo ""
-    read -p "Select: " ఎంప
+    read -p "Select: " choice
 
-    case $ఎంప in
+    case $choice in
         1)
             detect_os
             install_deps
