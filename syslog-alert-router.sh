@@ -29,7 +29,7 @@
 # Version: 2.0.0
 #
 set -euo pipefail
-VERSION="2.4.3"
+VERSION="2.5.0"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -39,6 +39,7 @@ ALERTLIB="$LIBDIR/alertlib.py"
 DISPATCH="${DISPATCH:-/usr/local/bin/alert-dispatcher.py}"
 SWEEPER="${SWEEPER:-/usr/local/bin/alert-sweeper.py}"
 ALERTRELAYS="${ALERTRELAYS:-/usr/local/bin/alert-relays.py}"
+ALERTRULES="${ALERTRULES:-/usr/local/bin/alert-rules.py}"
 CFGDIR="${CFGDIR:-/etc/alerts/config}"
 ALERTS="$CFGDIR/alerts.yaml"
 RECIP="$CFGDIR/recipients.yaml"
@@ -176,7 +177,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "2.4.3"
+__version__ = "2.5.0"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -1076,6 +1077,231 @@ def main(argv=None):
 if __name__ == "__main__":
     sys.exit(main())
 __RELAYS_PY__
+  backup "$ALERTRULES"
+  atomic_write "$ALERTRULES" 0755 <<'__RULES_PY__'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+alert-rules.py -- manage alert rules (alerts.yaml) and recipient groups
+(recipients.yaml). Driven by the menu in syslog-alert-router.sh, but also
+usable directly.
+
+Per-alert routing: each alert names its own recipient group(s) and its own
+relay (or relay failover chain). Run 'regen' after adding/removing an alert or
+changing a regex (the coarse syslog-ng filter is generated from the regexes).
+
+Subcommands:
+    alerts                         list alerts
+    alert-show NAME
+    alert-set --name N [--regex R] [--severity S] [--recipients g1,g2]
+              [--relay r1,r2] [--template T] [--program P] [--dedup-window D]
+              [--digest true|false] [--escalation-after D --escalation-group G]
+        (empty --relay clears the override; empty --escalation-after clears it)
+    alert-del NAME
+    groups                         list recipient groups
+    group-set --name N --emails a@x,b@y
+    group-del NAME
+"""
+import os
+import re
+import sys
+import argparse
+
+sys.path.insert(0, os.environ.get("ALERT_LIB_DIR", "/usr/local/lib/alerts"))
+import alertlib as A  # noqa: E402
+import yaml  # noqa: E402
+
+NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+ALERTS_HEADER = ("# Managed by alert-rules.py / syslog-alert-router.sh.\n"
+                 "# Run 'regen' after adding/removing an alert or changing a regex.\n")
+RECIP_HEADER = "# Managed by alert-rules.py / syslog-alert-router.sh.\n"
+
+
+def _load(path):
+    if os.path.exists(path):
+        return yaml.safe_load(open(path, encoding="utf-8")) or {}
+    return {}
+
+
+def _save(path, doc, header):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(header)
+        yaml.safe_dump(doc, f, default_flow_style=False, sort_keys=False)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def _alerts_doc():
+    d = _load(A.ALERTS_YAML)
+    d.setdefault("settings", {})
+    d.setdefault("alerts", {})
+    return d
+
+
+def _recip_doc():
+    d = _load(A.RECIPIENTS_YAML)
+    d.setdefault("groups", {})
+    return d
+
+
+def cmd_alerts(a):
+    al = _alerts_doc()["alerts"]
+    if not al:
+        print("  (no alerts defined)")
+    for name, x in al.items():
+        relay = x.get("relay") or (",".join(x["relays"]) if x.get("relays") else "(default order)")
+        extra = " digest" if x.get("digest") else ""
+        if x.get("escalation_after"):
+            extra += " escalate->%s@%s" % (x.get("escalation_group"), x.get("escalation_after"))
+        print("  %-16s sev=%-8s -> %s  relay=%s%s"
+              % (name, x.get("severity", "info"), x.get("recipients"), relay, extra))
+        print("      regex: %s" % x.get("regex"))
+    return 0
+
+
+def cmd_alert_show(a):
+    x = _alerts_doc()["alerts"].get(a.name)
+    if not x:
+        print("no such alert: %s" % a.name, file=sys.stderr)
+        return 1
+    yaml.safe_dump({a.name: x}, sys.stdout, default_flow_style=False, sort_keys=False)
+    return 0
+
+
+def cmd_alert_set(a):
+    if not NAME_RE.match(a.name):
+        print("invalid name: use letters/digits/_/./-", file=sys.stderr)
+        return 2
+    d = _alerts_doc()
+    x = dict(d["alerts"].get(a.name, {}))
+    if a.regex is not None:
+        x["regex"] = a.regex
+    if "regex" not in x:
+        print("new alert needs --regex", file=sys.stderr)
+        return 2
+    try:
+        re.compile(x["regex"])
+    except re.error as e:
+        print("bad regex: %s" % e, file=sys.stderr)
+        return 2
+    if a.severity:
+        x["severity"] = a.severity
+    if a.recipients:
+        parts = [p.strip() for p in a.recipients.split(",") if p.strip()]
+        x["recipients"] = parts[0] if len(parts) == 1 else parts
+    if a.template:
+        x["template"] = a.template
+    if a.program is not None:
+        x.pop("program", None)
+        if a.program:
+            x["program"] = a.program
+    if a.relay is not None:
+        x.pop("relay", None)
+        x.pop("relays", None)
+        parts = [p.strip() for p in a.relay.split(",") if p.strip()]
+        if len(parts) == 1:
+            x["relay"] = parts[0]
+        elif parts:
+            x["relays"] = parts
+    if a.dedup_window:
+        x["dedup_window"] = a.dedup_window
+    if a.digest is not None:
+        x.pop("digest", None)
+        if a.digest == "true":
+            x["digest"] = True
+    if a.escalation_after is not None:
+        x.pop("escalation_after", None)
+        x.pop("escalation_group", None)
+        if a.escalation_after:
+            x["escalation_after"] = a.escalation_after
+            if a.escalation_group:
+                x["escalation_group"] = a.escalation_group
+    d["alerts"][a.name] = x
+    _save(A.ALERTS_YAML, d, ALERTS_HEADER)
+    print("saved alert %s" % a.name)
+    return 0
+
+
+def cmd_alert_del(a):
+    d = _alerts_doc()
+    if a.name in d["alerts"]:
+        del d["alerts"][a.name]
+        _save(A.ALERTS_YAML, d, ALERTS_HEADER)
+        print("removed alert %s" % a.name)
+        return 0
+    print("no such alert: %s" % a.name, file=sys.stderr)
+    return 1
+
+
+def cmd_groups(a):
+    g = _recip_doc()["groups"]
+    if not g:
+        print("  (no groups defined)")
+    for name, emails in g.items():
+        print("  %-14s %s" % (name, ", ".join(emails or [])))
+    return 0
+
+
+def cmd_group_set(a):
+    if not NAME_RE.match(a.name):
+        print("invalid name", file=sys.stderr)
+        return 2
+    emails = [e.strip() for e in a.emails.split(",") if e.strip()]
+    if not emails:
+        print("no emails given", file=sys.stderr)
+        return 2
+    d = _recip_doc()
+    d["groups"][a.name] = emails
+    _save(A.RECIPIENTS_YAML, d, RECIP_HEADER)
+    print("saved group %s (%d recipient(s))" % (a.name, len(emails)))
+    return 0
+
+
+def cmd_group_del(a):
+    d = _recip_doc()
+    if a.name in d["groups"]:
+        del d["groups"][a.name]
+        _save(A.RECIPIENTS_YAML, d, RECIP_HEADER)
+        print("removed group %s" % a.name)
+        return 0
+    print("no such group: %s" % a.name, file=sys.stderr)
+    return 1
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("alerts")
+    s = sub.add_parser("alert-show"); s.add_argument("name")
+    s = sub.add_parser("alert-set")
+    s.add_argument("--name", required=True)
+    s.add_argument("--regex")
+    s.add_argument("--severity", choices=["critical", "high", "medium", "low", "info"])
+    s.add_argument("--recipients")
+    s.add_argument("--relay")
+    s.add_argument("--template")
+    s.add_argument("--program")
+    s.add_argument("--dedup-window", dest="dedup_window")
+    s.add_argument("--digest", choices=["true", "false"])
+    s.add_argument("--escalation-after", dest="escalation_after")
+    s.add_argument("--escalation-group", dest="escalation_group")
+    s = sub.add_parser("alert-del"); s.add_argument("name")
+    sub.add_parser("groups")
+    s = sub.add_parser("group-set"); s.add_argument("--name", required=True); s.add_argument("--emails", required=True)
+    s = sub.add_parser("group-del"); s.add_argument("name")
+    a = p.parse_args(argv)
+    return {
+        "alerts": cmd_alerts, "alert-show": cmd_alert_show, "alert-set": cmd_alert_set,
+        "alert-del": cmd_alert_del, "groups": cmd_groups, "group-set": cmd_group_set,
+        "group-del": cmd_group_del,
+    }[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+__RULES_PY__
 }
 
 # =============================================================================
@@ -1646,6 +1872,85 @@ cmd_relays() {
   info "Done. The dispatcher picks up relay changes within ~2s (no reload needed)."
 }
 
+# ---- interactive alert-rule manager ----------------------------------------
+_menu_alert_add() {
+  local name regex sev rcp relay tpl dig esc escg args
+  printf 'alert name (e.g. DISK_FULL)> '; read -r name
+  [ -n "$name" ] || { echo "cancelled"; return 0; }
+  case "$name" in *[!A-Za-z0-9_.-]*) echo "invalid name: letters/digits/_/./- only"; return 0;; esac
+  printf 'match regex (blank = keep if editing)> '; read -r regex
+  printf 'severity [critical/high/medium/low/info] (blank = keep)> '; read -r sev
+  printf 'recipient group(s), comma-separated (blank = keep)> '; read -r rcp
+  printf 'relay(s), comma-separated; failover order (blank = keep, "default" = clear)> '; read -r relay
+  printf 'template base name (blank = keep)> '; read -r tpl
+  printf 'digest only? [y/n, blank = keep]> '; read -r dig
+  printf 'escalate after, e.g. 4h (blank = keep, "none" = clear)> '; read -r esc
+  args=(alert-set --name "$name")
+  [ -n "$regex" ] && args+=(--regex "$regex")
+  [ -n "$sev" ]   && args+=(--severity "$sev")
+  [ -n "$rcp" ]   && args+=(--recipients "$rcp")
+  if [ -n "$relay" ]; then
+    [ "$relay" = "default" ] && args+=(--relay "") || args+=(--relay "$relay")
+  fi
+  [ -n "$tpl" ] && args+=(--template "$tpl")
+  case "$dig" in y|Y) args+=(--digest true);; n|N) args+=(--digest false);; esac
+  if [ -n "$esc" ]; then
+    if [ "$esc" = "none" ]; then args+=(--escalation-after "")
+    else args+=(--escalation-after "$esc"); printf 'escalation group> '; read -r escg
+         [ -n "$escg" ] && args+=(--escalation-group "$escg"); fi
+  fi
+  python3 "$ALERTRULES" "${args[@]}"
+}
+
+_menu_groups() {
+  local c n em
+  while true; do
+    echo; echo "--- Recipient Groups ---"
+    python3 "$ALERTRULES" groups
+    echo "  a) add/edit group   d) delete group   q) back"
+    printf 'choose> '; read -r c
+    case "$c" in
+      a|A) printf 'group name> '; read -r n; [ -n "$n" ] || continue
+           printf 'emails, comma-separated> '; read -r em
+           [ -n "$em" ] && { python3 "$ALERTRULES" group-set --name "$n" --emails "$em" || true; };;
+      d|D) printf 'group name to delete> '; read -r n
+           [ -n "$n" ] && { python3 "$ALERTRULES" group-del "$n" || true; };;
+      q|Q|"") break;;
+      *) echo "unknown option";;
+    esac
+  done
+}
+
+cmd_rules() {
+  need_root
+  [ -x "$ALERTRULES" ] || die "Not installed; run 'install' first."
+  local c changed=0
+  while true; do
+    echo; echo "================== Alert Rules =================="
+    python3 "$ALERTRULES" alerts
+    echo "------------------------------------------------"
+    echo "  a) add/edit alert   s) show alert details"
+    echo "  d) delete alert     g) manage recipient groups"
+    echo "  q) done"
+    printf 'choose> '; read -r c
+    case "$c" in
+      a|A) _menu_alert_add && changed=1 || changed=1;;
+      s|S) printf 'alert name> '; read -r n; [ -n "${n:-}" ] && { python3 "$ALERTRULES" alert-show "$n" || true; };;
+      d|D) printf 'alert name to delete> '; read -r n
+           [ -n "${n:-}" ] && { python3 "$ALERTRULES" alert-del "$n" && changed=1 || true; };;
+      g|G) _menu_groups || true;;
+      q|Q|"") break;;
+      *) echo "unknown option";;
+    esac
+  done
+  if [ "$changed" = "1" ]; then
+    info "Applying rule changes (regenerating filter)..."
+    cmd_regen || warn "regen failed; review config with: $0 check"
+  else
+    info "No rule changes."
+  fi
+}
+
 # ---- status + top-level menu -----------------------------------------------
 _yn() { if eval "$1" >/dev/null 2>&1; then echo yes; else echo no; fi; }
 
@@ -1708,25 +2013,26 @@ cmd_menu() {
     cmd_status
     cat <<'MENU'
 ----------------------------------------------------------------------
-  1) Install / update everything      6) Regenerate syslog-ng filter
-  2) Manage relays + credentials      7) Set up a local MTA
-  3) Send a test email                8) Run sweep now (escalate/digest)
-  4) Dry-run a rule (sample log line) 9) Disable legacy d_sendpage path
-  5) Validate configuration           u) Uninstall
-                                      q) Quit
+  1) Install / update everything       6) Validate configuration
+  2) Manage alert rules + recipients   7) Regenerate syslog-ng filter
+  3) Manage relays + credentials       8) Set up a local MTA
+  4) Send a test email                 9) Run sweep now (escalate/digest)
+  5) Dry-run a rule (sample log line) 10) Disable legacy d_sendpage path
+                                       u) Uninstall    q) Quit
 ----------------------------------------------------------------------
 MENU
     printf 'choose> '; read -r c || break
     case "$c" in
       1) cmd_install || true; _pause;;
-      2) cmd_relays || true;;
-      3) _menu_mailtest || true; _pause;;
-      4) _menu_dryrun || true; _pause;;
-      5) cmd_check || true; _pause;;
-      6) cmd_regen || true; _pause;;
-      7) _menu_setup_mta || true; _pause;;
-      8) cmd_sweep || true; _pause;;
-      9) cmd_disable_legacy || true; _pause;;
+      2) cmd_rules || true;;
+      3) cmd_relays || true;;
+      4) _menu_mailtest || true; _pause;;
+      5) _menu_dryrun || true; _pause;;
+      6) cmd_check || true; _pause;;
+      7) cmd_regen || true; _pause;;
+      8) _menu_setup_mta || true; _pause;;
+      9) cmd_sweep || true; _pause;;
+      10) cmd_disable_legacy || true; _pause;;
       u|U) _menu_uninstall || true;;
       q|Q|"") echo "Bye."; break;;
       *) echo "unknown option: $c";;
@@ -1791,6 +2097,7 @@ python3-yaml, cron, ca-certificates) are installed on first install.
 
   (no args) | menu          Interactive menu (default)
   status                    Show install / relay / MTA status
+  rules                     Submenu: add/edit alert rules + recipient groups
   install [--mta msmtp|postfix --relay HOST[:PORT]] [--relay-tls]
                             Install prereqs, code, config, filter, cron; reload
   relays                    Submenu: add/edit/test relays + secured credentials
@@ -1832,6 +2139,7 @@ main() {
   case "$cmd" in
     menu)                  cmd_menu "$@";;
     status)                cmd_status "$@";;
+    rules|alerts)          cmd_rules "$@";;
     install)               cmd_install "$@";;
     relays)                cmd_relays "$@";;
     mailtest)              cmd_mailtest "$@";;
