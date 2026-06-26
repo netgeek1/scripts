@@ -29,7 +29,7 @@
 # Version: 2.0.0
 #
 set -euo pipefail
-VERSION="2.4.2"
+VERSION="2.4.3"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -175,6 +175,8 @@ try:
     import yaml
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
+
+__version__ = "2.4.3"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -1651,6 +1653,13 @@ cmd_status() {
   echo "syslog-alert-router v$VERSION"
   printf '  dispatcher : %s\n' "$([ -f "$DISPATCH" ] && echo installed || echo MISSING)"
   printf '  sweeper    : %s\n' "$([ -f "$SWEEPER" ] && echo installed || echo MISSING)"
+  local libver
+  libver="$(python3 -c "import sys;sys.path.insert(0,'$LIBDIR');import alertlib;print(getattr(alertlib,'__version__','old'))" 2>/dev/null || echo 'missing')"
+  if [ "$libver" = "$VERSION" ]; then
+    printf '  library    : %s (current)\n' "$libver"
+  else
+    printf '  library    : %s  <-- STALE: run install (option 1) to deploy %s\n' "$libver" "$VERSION"
+  fi
   printf '  syslog-ng  : %s\n' "$(_yn 'command -v syslog-ng')"
   printf '  filter     : %s\n' "$([ -f "$FRAGMENT" ] && echo present || echo none)"
   printf '  sweeper cron: %s\n' "$([ -f "$CRON" ] && echo present || echo none)"
