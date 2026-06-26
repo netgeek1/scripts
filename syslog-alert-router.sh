@@ -26,10 +26,10 @@
 #   /etc/syslog-ng/conf.d/alert-dispatch.conf   (generated)
 #   /etc/cron.d/alert-sweeper
 #
-# Version: 2.3.0
+# Version: 2.0.0
 #
 set -euo pipefail
-VERSION="2.3.0"
+VERSION="2.4.0"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -1620,6 +1620,87 @@ cmd_relays() {
   info "Done. The dispatcher picks up relay changes within ~2s (no reload needed)."
 }
 
+# ---- status + top-level menu -----------------------------------------------
+_yn() { if eval "$1" >/dev/null 2>&1; then echo yes; else echo no; fi; }
+
+cmd_status() {
+  echo "syslog-alert-router v$VERSION"
+  printf '  dispatcher : %s\n' "$([ -f "$DISPATCH" ] && echo installed || echo MISSING)"
+  printf '  sweeper    : %s\n' "$([ -f "$SWEEPER" ] && echo installed || echo MISSING)"
+  printf '  syslog-ng  : %s\n' "$(_yn 'command -v syslog-ng')"
+  printf '  filter     : %s\n' "$([ -f "$FRAGMENT" ] && echo present || echo none)"
+  printf '  sweeper cron: %s\n' "$([ -f "$CRON" ] && echo present || echo none)"
+  printf '  local MTA  : %s\n' "$(_yn detect_sendmail)"
+  if [ -f "$RELAYS_YAML" ] && [ -x "$ALERTRELAYS" ]; then
+    echo "  relays:"
+    ALERT_LIB_DIR="$LIBDIR" ALERT_CONFIG_DIR="$CFGDIR" python3 "$ALERTRELAYS" list 2>/dev/null | sed 's/^/    /'
+  else
+    echo "  relays     : (not installed)"
+  fi
+}
+
+_pause() { printf '\nPress Enter to continue... '; read -r _ || true; }
+
+_menu_mailtest() {
+  local addr name
+  printf 'send test email to> '; read -r addr; [ -n "$addr" ] || { echo "cancelled"; return; }
+  printf 'via relay name (blank = default failover chain)> '; read -r name
+  RELAY="$name" cmd_mailtest "$addr"
+}
+
+_menu_dryrun() {
+  local msg prog
+  printf 'sample log message> '; read -r msg; [ -n "$msg" ] || { echo "cancelled"; return; }
+  printf 'program field (blank = test)> '; read -r prog
+  cmd_test "$msg" "${prog:-test}"
+}
+
+_menu_setup_mta() {
+  local m relay
+  printf 'install which MTA? [msmtp/postfix]> '; read -r m; [ -n "$m" ] || { echo "cancelled"; return; }
+  printf 'relay smarthost HOST[:PORT] (blank = direct send, postfix only)> '; read -r relay
+  MTA="$m" RELAY="$relay" cmd_setup_mta
+}
+
+_menu_uninstall() {
+  local yn
+  printf 'Uninstall code/fragment/cron? (config, secrets, DB, logs are kept) [y/N]> '; read -r yn
+  case "$yn" in y|Y) cmd_uninstall; _pause;; *) echo "cancelled";; esac
+}
+
+cmd_menu() {
+  while true; do
+    echo
+    echo "==================== syslog-alert-router v$VERSION ===================="
+    cmd_status
+    cat <<'MENU'
+----------------------------------------------------------------------
+  1) Install / update everything      6) Regenerate syslog-ng filter
+  2) Manage relays + credentials      7) Set up a local MTA
+  3) Send a test email                8) Run sweep now (escalate/digest)
+  4) Dry-run a rule (sample log line) 9) Disable legacy d_sendpage path
+  5) Validate configuration           u) Uninstall
+                                      q) Quit
+----------------------------------------------------------------------
+MENU
+    printf 'choose> '; read -r c || break
+    case "$c" in
+      1) cmd_install; _pause;;
+      2) cmd_relays;;
+      3) _menu_mailtest; _pause;;
+      4) _menu_dryrun; _pause;;
+      5) cmd_check; _pause;;
+      6) cmd_regen; _pause;;
+      7) _menu_setup_mta; _pause;;
+      8) cmd_sweep; _pause;;
+      9) cmd_disable_legacy; _pause;;
+      u|U) _menu_uninstall;;
+      q|Q|"") echo "Bye."; break;;
+      *) echo "unknown option: $c";;
+    esac
+  done
+}
+
 cmd_regen() {
   preflight
   [ -e "$ALERTS" ] || die "No $ALERTS (run 'install' first)."
@@ -1671,13 +1752,15 @@ usage() {
   cat <<EOF
 syslog-alert-router.sh v$VERSION
 
-Runs root-requiring commands under sudo automatically and installs missing
-prerequisites (syslog-ng, python3, python3-yaml, cron, ca-certificates) on
-first install. No need to pre-install anything or type 'sudo'.
+Run with no arguments for an interactive menu. Root-requiring actions elevate
+via sudo automatically and missing prerequisites (syslog-ng, python3,
+python3-yaml, cron, ca-certificates) are installed on first install.
 
+  (no args) | menu          Interactive menu (default)
+  status                    Show install / relay / MTA status
   install [--mta msmtp|postfix --relay HOST[:PORT]] [--relay-tls]
                             Install prereqs, code, config, filter, cron; reload
-  relays                    Interactive menu: add/edit/test relays + secured creds
+  relays                    Submenu: add/edit/test relays + secured credentials
   mailtest [--relay NAME] ADDR
                             Send a test email (optionally via a specific relay)
   setup-mta --mta msmtp|postfix [--relay HOST[:PORT]] [--relay-tls]
@@ -1692,12 +1775,12 @@ first install. No need to pre-install anything or type 'sudo'.
 
 Relays: multiple SMTP/sendmail relays with a failover 'order'; alerts may override
 via 'relay:'/'relays:' in alerts.yaml. Credentials live in $SECRETS/<name>.pw (0600);
-relays.yaml holds only references, never passwords.
+relays.yaml holds only references, never passwords. See CHANGELOG.md for history.
 EOF
 }
 
 main() {
-  local cmd="${1:-install}"; shift || true
+  local cmd="${1:-menu}"; shift || true
   auto_sudo "$cmd"
   local positional=()
   while [ $# -gt 0 ]; do
@@ -1714,6 +1797,8 @@ main() {
   done
   set -- ${positional[@]+"${positional[@]}"}
   case "$cmd" in
+    menu)                  cmd_menu "$@";;
+    status)                cmd_status "$@";;
     install)               cmd_install "$@";;
     relays)                cmd_relays "$@";;
     mailtest)              cmd_mailtest "$@";;
