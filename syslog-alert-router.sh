@@ -29,7 +29,7 @@
 # Version: 2.0.0
 #
 set -euo pipefail
-VERSION="2.4.1"
+VERSION="2.4.2"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -106,6 +106,22 @@ reload_syslogng() {
   if command -v syslog-ngctl >/dev/null 2>&1; then info "Reloading via syslog-ngctl"; syslog-ngctl reload
   elif command -v systemctl >/dev/null 2>&1; then info "Reloading via systemctl"; systemctl reload syslog-ng 2>/dev/null || systemctl restart syslog-ng
   else warn "Reload syslog-ng manually."; fi
+}
+
+# syslog-ng keeps program() destination children alive across a 'reload', so an
+# updated dispatcher is only picked up on a real restart. Use this after code
+# changes; reload_syslogng is fine for filter-only changes.
+restart_syslogng() {
+  if command -v systemctl >/dev/null 2>&1; then
+    info "Restarting syslog-ng (loads updated dispatcher code)"
+    systemctl restart syslog-ng
+  elif command -v syslog-ngctl >/dev/null 2>&1; then
+    info "Reloading syslog-ng and respawning dispatcher"
+    syslog-ngctl reload
+    pkill -f "$DISPATCH" 2>/dev/null || true   # syslog-ng respawns the program() child
+  else
+    warn "Restart syslog-ng manually so the dispatcher loads the new code."
+  fi
 }
 
 ensure_secrets_dir() {
@@ -1474,7 +1490,7 @@ cmd_install() {
   python3 "$DISPATCH" --check || die "Config failed validation; aborting before touching syslog-ng."
   generate_fragment
   install_cron
-  reload_syslogng
+  restart_syslogng
   info "Install complete (v$VERSION)."
   if [ "$MTA_MISSING" = "1" ]; then
     cat <<EOF
