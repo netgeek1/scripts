@@ -26,10 +26,13 @@
 #   /etc/syslog-ng/conf.d/alert-dispatch.conf   (generated)
 #   /etc/cron.d/alert-sweeper
 #
-# Version: 2.0.0
+# Version: 2.3.0
 #
 set -euo pipefail
-VERSION="2.2.0"
+VERSION="2.3.0"
+
+ORIG_ARGV=("$@")
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
 LIBDIR="${LIBDIR:-/usr/local/lib/alerts}"
 ALERTLIB="$LIBDIR/alertlib.py"
@@ -61,6 +64,19 @@ err()  { printf '[%s] [ERROR] %s\n' "$(_ts)" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
 need_root() { [ "$(id -u)" -eq 0 ] || die "Must run as root."; }
+
+# Re-exec the script under sudo for subcommands that need root. Commands that
+# only read world-readable config (help/version/test/check) are left alone.
+auto_sudo() {
+  case "${1:-}" in
+    help|-h|--help|version|--version|test|check) return 0 ;;
+  esac
+  [ "$(id -u)" -eq 0 ] && return 0
+  [ -z "${ALERT_REEXEC:-}" ] || die "Still not root after sudo; aborting."
+  command -v sudo >/dev/null 2>&1 || die "Root required and 'sudo' not found. Re-run as root."
+  info "Not running as root; elevating with sudo..."
+  exec sudo env ALERT_REEXEC=1 bash "$SELF" ${ORIG_ARGV[@]+"${ORIG_ARGV[@]}"}
+}
 
 backup() {
   local f="$1"
@@ -1227,23 +1243,73 @@ __TPL_SSH_BRUTEFORCE_TXT__
 }
 
 # =============================================================================
+# prerequisites
+# =============================================================================
+PKG_MGR=""
+detect_pkg() {
+  if command -v apt-get >/dev/null 2>&1; then PKG_MGR=apt
+  elif command -v dnf >/dev/null 2>&1; then PKG_MGR=dnf
+  elif command -v yum >/dev/null 2>&1; then PKG_MGR=yum
+  else PKG_MGR=""; fi
+}
+
+map_pkg() {  # logical name -> distro package name
+  case "$PKG_MGR:$1" in
+    apt:syslog-ng) echo "syslog-ng-core";;
+    apt:yaml)      echo "python3-yaml";;
+    apt:cron)      echo "cron";;
+    dnf:yaml|yum:yaml) echo "python3-pyyaml";;
+    dnf:cron|yum:cron) echo "cronie";;
+    *:python3)     echo "python3";;
+    *:ca-certs)    echo "ca-certificates";;
+    *)             echo "$1";;
+  esac
+}
+
+pkg_install() {
+  case "$PKG_MGR" in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+         && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@";;
+    dnf) dnf install -y "$@";;
+    yum) yum install -y "$@";;
+    *)   return 1;;
+  esac
+}
+
+install_prereqs() {
+  detect_pkg
+  local want=()
+  command -v syslog-ng >/dev/null 2>&1            || want+=("syslog-ng")
+  command -v python3   >/dev/null 2>&1            || want+=("python3")
+  python3 -c 'import yaml' >/dev/null 2>&1        || want+=("yaml")
+  command -v crontab   >/dev/null 2>&1            || want+=("cron")
+  [ -f /etc/ssl/certs/ca-certificates.crt ]      || want+=("ca-certs")
+  if [ ${#want[@]} -eq 0 ]; then
+    info "All prerequisites present."
+    return 0
+  fi
+  [ -n "$PKG_MGR" ] || die "Missing prerequisites (${want[*]}) and no apt/dnf/yum found. Install them manually."
+  local pkgs=() w
+  for w in "${want[@]}"; do pkgs+=("$(map_pkg "$w")"); done
+  printf '%s\n' "${want[@]}" | grep -q '^syslog-ng$' && \
+    warn "Installing syslog-ng. If this host currently runs rsyslog, verify which daemon owns /dev/log afterward."
+  info "Installing prerequisites: ${pkgs[*]}"
+  pkg_install "${pkgs[@]}" || die "Prerequisite install failed (see apt/dnf output above)."
+  command -v systemctl >/dev/null 2>&1 && systemctl enable --now cron >/dev/null 2>&1 || true
+  python3 -c 'import yaml' >/dev/null 2>&1 || die "python3-yaml still missing after install."
+}
+
+# =============================================================================
 # preflight
 # =============================================================================
 preflight() {
   need_root
-  command -v syslog-ng >/dev/null 2>&1 || die "syslog-ng not found."
-  command -v python3   >/dev/null 2>&1 || die "python3 not found (need >= 3.6)."
+  install_prereqs
   python3 - <<'PY' || die "Python 3.6+ required."
 import sys; sys.exit(0 if sys.version_info[:2] >= (3,6) else 1)
 PY
+  command -v syslog-ng >/dev/null 2>&1 || die "syslog-ng missing after prerequisite install."
   [ -d "$CONFD" ] || die "syslog-ng conf.d not found: $CONFD"
-  if ! python3 -c 'import yaml' >/dev/null 2>&1; then
-    if [ "$INSTALL_DEPS" = "1" ] && command -v apt-get >/dev/null 2>&1; then
-      info "Installing python3-yaml..."; apt-get update -qq && apt-get install -y python3-yaml
-    else
-      die "PyYAML missing. Run: apt install python3-yaml   (or re-run with --install-deps)"
-    fi
-  fi
 }
 
 # =============================================================================
@@ -1605,8 +1671,12 @@ usage() {
   cat <<EOF
 syslog-alert-router.sh v$VERSION
 
-  install [--install-deps] [--mta msmtp|postfix --relay HOST[:PORT]] [--relay-tls]
-                            Install code, config, filter, cron, reload.
+Runs root-requiring commands under sudo automatically and installs missing
+prerequisites (syslog-ng, python3, python3-yaml, cron, ca-certificates) on
+first install. No need to pre-install anything or type 'sudo'.
+
+  install [--mta msmtp|postfix --relay HOST[:PORT]] [--relay-tls]
+                            Install prereqs, code, config, filter, cron; reload
   relays                    Interactive menu: add/edit/test relays + secured creds
   mailtest [--relay NAME] ADDR
                             Send a test email (optionally via a specific relay)
@@ -1628,6 +1698,7 @@ EOF
 
 main() {
   local cmd="${1:-install}"; shift || true
+  auto_sudo "$cmd"
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
