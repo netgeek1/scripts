@@ -29,7 +29,7 @@
 # Version: 2.0.0
 #
 set -euo pipefail
-VERSION="2.4.0"
+VERSION="2.4.1"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -385,9 +385,9 @@ def _read_secret(relay, log=None):
     raise RuntimeError("auth enabled but no secret_file/secret_cmd configured")
 
 
-def build_message(settings, to_list, subject, text_body, html_body=None):
+def build_message(settings, to_list, subject, text_body, html_body=None, from_addr=None):
     msg = EmailMessage()
-    msg["From"] = hdr_safe(settings["from"], 256)
+    msg["From"] = hdr_safe(from_addr or settings["from"], 256)
     msg["To"] = ", ".join(hdr_safe(t, 256) for t in to_list)
     msg["Subject"] = hdr_safe(subject, settings["subject_max"])
     msg.set_content(text_body[: settings["body_max"]])
@@ -427,7 +427,8 @@ def _send_smtp(relay, settings, msg, to_list, log):
 
 def _send_sendmail(relay, settings, msg, to_list, log):
     sm = relay.get("sendmail", settings["sendmail"])
-    subprocess.run([sm, "-t", "-oi"], input=msg.as_bytes(),
+    frm = relay.get("from") or settings["from"]
+    subprocess.run([sm, "-t", "-oi", "-f", frm], input=msg.as_bytes(),
                    timeout=settings["send_timeout"], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
@@ -447,13 +448,16 @@ def send_mail(settings, to_list, subject, text_body, html_body=None,
     if not names:
         names = ["__local__"]
         relays["__local__"] = {"transport": "sendmail", "sendmail": settings["sendmail"]}
-    msg = build_message(settings, to_clean, subject, text_body, html_body)
     errors = []
     for name in names:
         r = relays.get(name)
         if not r:
             errors.append("%s:undefined" % name)
             continue
+        # Build per relay so the relay's 'from' drives both the From: header and
+        # the envelope sender (different relays may use different identities).
+        from_addr = r.get("from") or settings["from"]
+        msg = build_message(settings, to_clean, subject, text_body, html_body, from_addr)
         try:
             if str(r.get("transport", "smtp")).lower() == "sendmail":
                 _send_sendmail(r, settings, msg, to_clean, log)
@@ -1540,7 +1544,11 @@ PY
 # ---- interactive relay manager ---------------------------------------------
 _menu_add_relay() {
   local name tr host port sec frm ver au user noverify authargs sfile smp
-  printf 'relay name> '; read -r name; [ -n "$name" ] || { echo "name required"; return; }
+  printf 'relay name (short label, e.g. dreamhost)> '; read -r name
+  [ -n "$name" ] || { echo "cancelled"; return 0; }
+  case "$name" in
+    *[!A-Za-z0-9_-]*) echo "invalid name: use only letters, digits, _ or - (not a hostname)"; return 0;;
+  esac
   printf 'transport [smtp/sendmail] (smtp)> '; read -r tr; tr="${tr:-smtp}"
   if [ "$tr" = "sendmail" ]; then
     printf 'sendmail path (blank = system default)> '; read -r smp
@@ -1607,11 +1615,11 @@ cmd_relays() {
     echo "  t) test relay     q) quit"
     printf 'choose> '; read -r choice
     case "$choice" in
-      a|A) _menu_add_relay;;
-      o|O) _menu_set_order;;
-      p|P) _menu_set_password;;
-      d|D) _menu_del_relay;;
-      t|T) _menu_test_relay;;
+      a|A) _menu_add_relay || true;;
+      o|O) _menu_set_order || true;;
+      p|P) _menu_set_password || true;;
+      d|D) _menu_del_relay || true;;
+      t|T) _menu_test_relay || true;;
       q|Q|"") break;;
       *) echo "unknown option";;
     esac
@@ -1685,16 +1693,16 @@ cmd_menu() {
 MENU
     printf 'choose> '; read -r c || break
     case "$c" in
-      1) cmd_install; _pause;;
-      2) cmd_relays;;
-      3) _menu_mailtest; _pause;;
-      4) _menu_dryrun; _pause;;
-      5) cmd_check; _pause;;
-      6) cmd_regen; _pause;;
-      7) _menu_setup_mta; _pause;;
-      8) cmd_sweep; _pause;;
-      9) cmd_disable_legacy; _pause;;
-      u|U) _menu_uninstall;;
+      1) cmd_install || true; _pause;;
+      2) cmd_relays || true;;
+      3) _menu_mailtest || true; _pause;;
+      4) _menu_dryrun || true; _pause;;
+      5) cmd_check || true; _pause;;
+      6) cmd_regen || true; _pause;;
+      7) _menu_setup_mta || true; _pause;;
+      8) cmd_sweep || true; _pause;;
+      9) cmd_disable_legacy || true; _pause;;
+      u|U) _menu_uninstall || true;;
       q|Q|"") echo "Bye."; break;;
       *) echo "unknown option: $c";;
     esac
