@@ -31,7 +31,7 @@
 #   /etc/cron.d/alert-sweeper
 #
 set -euo pipefail
-VERSION="3.1.2"
+VERSION="3.1.3"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -347,7 +347,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "3.1.2"
+__version__ = "3.1.3"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -2226,6 +2226,34 @@ cmd_relays() {
 }
 
 # ---- interactive alert-rule manager ----------------------------------------
+# --- compact option listers, shown inline before multi-choice prompts ---------
+_groups_csv() {
+  RECIP="$RECIP" python3 - <<'PY' 2>/dev/null
+import os, yaml
+p = os.environ["RECIP"]
+d = yaml.safe_load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+print(", ".join(((d or {}).get("groups") or {}).keys()))
+PY
+}
+_relays_csv() {
+  RELAYS_YAML="$RELAYS_YAML" python3 - <<'PY' 2>/dev/null
+import os, yaml
+p = os.environ["RELAYS_YAML"]
+d = yaml.safe_load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+r = (d or {}).get("relays") or {}
+order = r.get("order") or []
+defs = list((r.get("defs") or {}).keys())
+print(", ".join(order + [n for n in defs if n not in order]))
+PY
+}
+_templates_csv() {
+  [ -d "$TPLDIR" ] || return 0
+  ls "$TPLDIR" 2>/dev/null | sed -E 's/\.(txt|html)$//' | sort -u | paste -sd, - | sed 's/,/, /g'
+}
+_hint() {  # _hint "label" "csv"
+  if [ -n "${2:-}" ]; then echo "    $1: $2"; else echo "    ($1: none defined yet)"; fi
+}
+
 _menu_alert_add() {
   local name regex sev rcp relay tpl dig esc escg args
   printf 'alert name (e.g. DISK_FULL)> '; read -r name
@@ -2233,8 +2261,11 @@ _menu_alert_add() {
   case "$name" in *[!A-Za-z0-9_.-]*) echo "invalid name: letters/digits/_/./- only"; return 0;; esac
   printf 'match regex (blank = keep if editing)> '; read -r regex
   printf 'severity [critical/high/medium/low/info] (blank = keep)> '; read -r sev
+  _hint "available groups" "$(_groups_csv)"
   printf 'recipient group(s), comma-separated (blank = keep)> '; read -r rcp
-  printf 'relay(s), comma-separated; failover order (blank = keep, "default" = clear)> '; read -r relay
+  _hint "available relays" "$(_relays_csv)"
+  printf 'relay(s), comma-separated; failover order (blank = keep, "default" = use global order)> '; read -r relay
+  _hint "available templates" "$(_templates_csv)"
   printf 'template base name (blank = keep)> '; read -r tpl
   printf 'digest only? [y/n, blank = keep]> '; read -r dig
   printf 'escalate after, e.g. 4h (blank = keep, "none" = clear)> '; read -r esc
@@ -2249,7 +2280,9 @@ _menu_alert_add() {
   case "$dig" in y|Y) args+=(--digest true);; n|N) args+=(--digest false);; esac
   if [ -n "$esc" ]; then
     if [ "$esc" = "none" ]; then args+=(--escalation-after "")
-    else args+=(--escalation-after "$esc"); printf 'escalation group> '; read -r escg
+    else args+=(--escalation-after "$esc")
+         _hint "available groups" "$(_groups_csv)"
+         printf 'escalation group> '; read -r escg
          [ -n "$escg" ] && args+=(--escalation-group "$escg"); fi
   fi
   python3 "$ALERTRULES" "${args[@]}"
@@ -2355,6 +2388,7 @@ _pause() { printf '\nPress Enter to continue... '; read -r _ || true; }
 _menu_mailtest() {
   local addr name
   printf 'send test email to> '; read -r addr; [ -n "$addr" ] || { echo "cancelled"; return; }
+  _hint "available relays" "$(_relays_csv)"
   printf 'via relay name (blank = default failover chain)> '; read -r name
   RELAY="$name" cmd_mailtest "$addr"
 }
