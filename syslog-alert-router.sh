@@ -31,7 +31,7 @@
 #   /etc/cron.d/alert-sweeper
 #
 set -euo pipefail
-VERSION="3.1.1"
+VERSION="3.1.2"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -225,6 +225,12 @@ o.append('destination d_local { file("/var/log/syslog"); };')
 if local:
     o.append("log { source(s_local); destination(d_local); };")
 o.append("")
+o.append("# Mail relay (Postfix) activity in its own log for easy testing/auditing.")
+o.append("filter f_mail { facility(mail); };")
+o.append('destination d_mail { file("/var/log/mail.log"); };')
+if local:
+    o.append("log { source(s_local); filter(f_mail); destination(d_mail); };")
+o.append("")
 o.append("# Archive everything received over the network, per host per day.")
 o.append("destination d_net_archive {")
 o.append('    file("%s/$HOST/$R_YEAR-$R_MONTH-$R_DAY.log" create-dirs(yes));' % arch)
@@ -341,7 +347,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "3.1.1"
+__version__ = "3.1.2"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -2334,6 +2340,7 @@ cmd_status() {
       printf '  smtp relay : disabled (sendmail only)\n'
     fi
     printf '  smarthost  : %s\n' "${rh:-none (set a relay first in the order)}"
+    printf '  mail log   : /var/log/mail.log\n'
   fi
   if [ -f "$RELAYS_YAML" ] && [ -x "$ALERTRELAYS" ]; then
     echo "  relays:"
