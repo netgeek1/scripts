@@ -1,35 +1,37 @@
 #!/usr/bin/env bash
 #
-# syslog-alert-router.sh  (v2)
+# syslog-alert-router.sh  (v3 -- dedicated appliance)
 #
-# Self-contained installer for a syslog-ng -> YAML-driven alert framework.
+# Turns a clean Ubuntu 24.04 box into a syslog-ng -> YAML-driven alert appliance.
+# The script OWNS syslog-ng: it writes the base config (its own listeners) and an
+# alert pipeline, so there is no existing config to detect or attach to.
 #
-#   syslog-ng (program() dest)
+#   network gear --(udp/tcp 514, tls 6514)--> syslog-ng
+#   local logs   --(system/internal)--------> syslog-ng
 #        -> alert-dispatcher.py   classify, dedup (SQLite), template, route, send
 #        -> alert-sweeper.py      escalation + digests + prune  (cron, time-driven)
+#        -> msmtp (system mailer) and/or SMTP relays in relays.yaml
 #
 # Single source of truth: /etc/alerts/config/alerts.yaml
-#   * Editing recipients/subject/template/severity = picked up live.
-#   * Adding/removing a 'regex' = edit YAML, then:  syslog-alert-router.sh regen
-#
-# Host install. Local sendmail (no SMTP credentials on disk). Text + HTML email.
-# Dependency: python3-yaml. Everything else is stdlib.
+#   * Editing recipients/severity/template/relay = picked up live by the dispatcher.
+#   * Adding/removing a 'regex' (or changing listeners) = 'regen' (or 'install').
 #
 # Layout:
-#   /usr/local/lib/alerts/alertlib.py     shared library
-#   /usr/local/bin/alert-dispatcher.py    syslog-ng-fed dispatcher
-#   /usr/local/bin/alert-sweeper.py       cron sweeper
-#   /etc/alerts/config/{alerts,recipients}.yaml
+#   /etc/syslog-ng/syslog-ng.conf               managed base (listeners, archive)
+#   /etc/syslog-ng/conf.d/10-alert-router.conf  generated alert filter + dispatch
+#   /usr/local/lib/alerts/alertlib.py           shared library
+#   /usr/local/bin/alert-{dispatcher,sweeper,relays,rules}.py
+#   /etc/alerts/config/{alerts,recipients,relays}.yaml
 #   /etc/alerts/templates/*.{txt,html}
-#   /var/lib/alerts/alerts.db             SQLite state (FHS: mutable data)
-#   /var/log/alerts/{dispatcher,sweeper}.log
-#   /etc/syslog-ng/conf.d/alert-dispatch.conf   (generated)
+#   /etc/alerts/secrets/<name>.pw (0600)        relay/msmtp credentials
+#   /etc/alerts/tls/{cert,key}.pem              TLS listener cert (self-signed by default)
+#   /var/lib/alerts/alerts.db                   SQLite state
+#   /var/log/alerts/*.log                       dispatcher/sweeper/msmtp logs
+#   /var/log/remote/<host>/<date>.log           received-log archive
 #   /etc/cron.d/alert-sweeper
 #
-# Version: 2.0.0
-#
 set -euo pipefail
-VERSION="2.5.1"
+VERSION="3.0.0"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -48,13 +50,14 @@ SECRETS="${SECRETS:-/etc/alerts/secrets}"
 TPLDIR="${TPLDIR:-/etc/alerts/templates}"
 DBDIR="${DBDIR:-/var/lib/alerts}"
 LOGDIR="${LOGDIR:-/var/log/alerts}"
+SYSLOGNG_CONF="${SYSLOGNG_CONF:-/etc/syslog-ng/syslog-ng.conf}"
 CONFD="${CONFD:-/etc/syslog-ng/conf.d}"
-FRAGMENT="${FRAGMENT:-$CONFD/alert-dispatch.conf}"
+FRAGMENT="${FRAGMENT:-$CONFD/10-alert-router.conf}"
+TLSDIR="${TLSDIR:-/etc/alerts/tls}"
+ARCHIVE_DIR="${ARCHIVE_DIR:-/var/log/remote}"
 CRON="${CRON:-/etc/cron.d/alert-sweeper}"
-SYSLOG_SOURCE="${SYSLOG_SOURCE:-net}"
 INSTALL_DEPS="${INSTALL_DEPS:-0}"
-MTA="${MTA:-}"                 # "", msmtp, or postfix (only used if no MTA present)
-RELAY="${RELAY:-}"            # smarthost HOST[:PORT] for msmtp / postfix satellite
+RELAY="${RELAY:-}"            # smarthost HOST[:PORT] for msmtp (overrides settings.smarthost)
 RELAY_TLS="${RELAY_TLS:-0}"
 MTA_MISSING=0
 
@@ -102,6 +105,145 @@ write_if_missing() {  # write_if_missing <dest> <mode>  (content on stdin) -- ne
 }
 
 validate_syslogng() { syslog-ng -s 2>/dev/null || syslog-ng --syntax-only; }
+
+# Read a single value from settings: in alerts.yaml (empty if unset/missing).
+_settings_get() {  # _settings_get KEY
+  [ -f "$ALERTS" ] || { echo ""; return 0; }
+  ALERTS="$ALERTS" KEY="$1" python3 - <<'PY' 2>/dev/null || echo ""
+import os
+try:
+    import yaml
+    d = yaml.safe_load(open(os.environ["ALERTS"], encoding="utf-8")) or {}
+    v = (d.get("settings") or {}).get(os.environ["KEY"])
+    print("" if v is None else v)
+except Exception:
+    print("")
+PY
+}
+
+# Installed syslog-ng major.minor, so the generated @version matches and we don't
+# trip the "configuration file format is too old" compatibility mode.
+syslogng_version() {
+  syslog-ng --version 2>/dev/null \
+    | sed -n 's/.*syslog-ng \([0-9]\{1,\}\.[0-9]\{1,\}\).*/\1/p' | head -n1
+}
+
+# Self-signed cert for the TLS (6514) listener if none exists. Replace with a
+# CA-signed pair by dropping cert.pem/key.pem into $TLSDIR (key mode 0600).
+ensure_tls_cert() {
+  [ -s "$TLSDIR/cert.pem" ] && [ -s "$TLSDIR/key.pem" ] && return 0
+  if ! command -v openssl >/dev/null 2>&1; then
+    warn "openssl missing; TLS listener will not start until $TLSDIR/{cert,key}.pem exist."
+    return 1
+  fi
+  mkdir -p "$TLSDIR"; chmod 0700 "$TLSDIR"
+  local cn; cn="$(hostname -f 2>/dev/null || hostname || echo syslog)"
+  info "Generating self-signed TLS cert for the 6514 listener (CN=$cn, 10y)"
+  if openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+       -keyout "$TLSDIR/key.pem" -out "$TLSDIR/cert.pem" -subj "/CN=$cn" >/dev/null 2>&1; then
+    chmod 0600 "$TLSDIR/key.pem"; chmod 0644 "$TLSDIR/cert.pem"
+  else
+    warn "openssl cert generation failed; TLS listener will not start."
+    return 1
+  fi
+}
+
+# Write the managed base syslog-ng.conf: our own listeners (s_net udp/tcp,
+# s_net_tls 6514, s_local), local file logging, and a per-host network archive.
+# Listener ports/toggles come from alerts.yaml settings (defaults below), so the
+# whole thing stays driven by one file. The alert filter + dispatch path live in
+# the generated conf.d fragment, included at the end -- not here.
+write_base_syslogng() {
+  local ver; ver="$(syslogng_version)"; [ -n "$ver" ] || ver="4.0"
+  info "Writing managed $SYSLOGNG_CONF (@version $ver: listeners + archive)"
+  backup "$SYSLOGNG_CONF"
+  local tmp; tmp="$(mktemp "${SYSLOGNG_CONF}.tmp.XXXXXX")"
+  ALERTS="$ALERTS" VER="$ver" TLSDIR="$TLSDIR" ARCHIVE_DIR="$ARCHIVE_DIR" CONFD="$CONFD" \
+  python3 - > "$tmp" <<'PYBASE'
+import os
+ver = os.environ["VER"]; tlsdir = os.environ["TLSDIR"]
+arch = os.environ["ARCHIVE_DIR"]; confd = os.environ["CONFD"]
+alerts = os.environ.get("ALERTS", "")
+s = {}
+try:
+    import yaml
+    if alerts and os.path.exists(alerts):
+        s = (yaml.safe_load(open(alerts, encoding="utf-8")) or {}).get("settings") or {}
+except Exception:
+    s = {}
+
+
+def asbool(v, d):
+    if v is None:
+        return d
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def asint(v, d):
+    try:
+        return int(v)
+    except Exception:
+        return d
+
+
+udp = asint(s.get("listen_udp"), 514)
+tcp = asint(s.get("listen_tcp"), 514)
+tls = asint(s.get("listen_tls"), 6514)
+local = asbool(s.get("listen_local"), True)
+o = []
+o.append("@version: %s" % ver)
+o.append('@include "scl.conf"')
+o.append("")
+o.append("# Managed by syslog-alert-router.sh -- dedicated log/alert appliance.")
+o.append("# Listener ports come from settings: in %s (re-run 'install' after changing)." % alerts)
+o.append("# The alert filter + dispatch path are generated into conf.d/ (see 'regen').")
+o.append("")
+o.append("options {")
+o.append("    chain-hostnames(off); keep-hostname(yes); use-dns(no); use-fqdn(no);")
+o.append("    flush-lines(0); log-fifo-size(10000); stats(freq(0)); create-dirs(yes);")
+o.append("};")
+o.append("")
+if local:
+    o.append("source s_local { system(); internal(); };")
+nets = []
+if udp:
+    nets.append('    network(transport("udp") port(%d));' % udp)
+if tcp:
+    nets.append('    network(transport("tcp") port(%d));' % tcp)
+if nets:
+    o.append("source s_net {")
+    o.extend(nets)
+    o.append("};")
+if tls:
+    o.append("source s_net_tls {")
+    o.append('    network(transport("tls") port(%d)' % tls)
+    o.append('        tls( key-file("%s/key.pem") cert-file("%s/cert.pem")' % (tlsdir, tlsdir))
+    o.append("             peer-verify(optional-untrusted) ) );")
+    o.append("};")
+o.append("")
+o.append("# Keep the box's own logs.")
+o.append('destination d_local { file("/var/log/syslog"); };')
+if local:
+    o.append("log { source(s_local); destination(d_local); };")
+o.append("")
+o.append("# Archive everything received over the network, per host per day.")
+o.append("destination d_net_archive {")
+o.append('    file("%s/$HOST/$R_YEAR-$R_MONTH-$R_DAY.log" create-dirs(yes));' % arch)
+o.append("};")
+netsrcs = []
+if nets:
+    netsrcs.append("source(s_net);")
+if tls:
+    netsrcs.append("source(s_net_tls);")
+if netsrcs:
+    o.append("log { %s destination(d_net_archive); };" % " ".join(netsrcs))
+o.append("")
+o.append('@include "%s/*.conf"' % confd)
+o.append("")
+print("\n".join(o))
+PYBASE
+  chmod 0644 "$tmp"; mv -f -- "$tmp" "$SYSLOGNG_CONF"
+}
 
 _syslogng_journal() {
   command -v journalctl >/dev/null 2>&1 || return 0
@@ -200,7 +342,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "2.5.1"
+__version__ = "3.0.0"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -1209,6 +1351,10 @@ def cmd_alert_set(a):
     except re.error as e:
         print("bad regex: %s" % e, file=sys.stderr)
         return 2
+    if re.search(x["regex"], "") is not None:
+        print("WARNING: this regex matches an EMPTY string (often a stray leading/"
+              "trailing '|' or '||'), so the alert will match EVERY log line.",
+              file=sys.stderr)
     if a.severity:
         x["severity"] = a.severity
     if a.recipients:
@@ -1360,6 +1506,20 @@ settings:
   digest_interval_sec: 1h
   active_grace_sec: 15m
   prune_after_sec: 7d
+
+  # --- syslog-ng listeners (this box owns them; re-run 'install' after edits) ---
+  listen_udp: 514          # 0/false to disable
+  listen_tcp: 514          # 0/false to disable
+  listen_tls: 6514         # 0/false to disable (uses /etc/alerts/tls/{cert,key}.pem)
+  listen_local: true       # collect this box's own system + internal logs
+
+  # --- msmtp smarthost (system mailer). Used by the 'local' sendmail relay. ---
+  # Leave smarthost blank to configure later via: syslog-alert-router.sh setup-mta
+  smarthost: ''            # e.g. smtp.dreamhost.com
+  smarthost_port: 587
+  smarthost_tls: true
+  smarthost_user: ''       # set for an authenticated relay; then run setup-mta to
+                           # store the password 0600 at /etc/alerts/secrets/msmtp.pw
 
 alerts:
 
@@ -1554,6 +1714,7 @@ install_prereqs() {
   command -v python3   >/dev/null 2>&1            || want+=("python3")
   python3 -c 'import yaml' >/dev/null 2>&1        || want+=("yaml")
   command -v crontab   >/dev/null 2>&1            || want+=("cron")
+  command -v openssl   >/dev/null 2>&1            || want+=("openssl")
   [ -f /etc/ssl/certs/ca-certificates.crt ]      || want+=("ca-certs")
   if [ ${#want[@]} -eq 0 ]; then
     info "All prerequisites present."
@@ -1580,119 +1741,146 @@ preflight() {
 import sys; sys.exit(0 if sys.version_info[:2] >= (3,6) else 1)
 PY
   command -v syslog-ng >/dev/null 2>&1 || die "syslog-ng missing after prerequisite install."
-  [ -d "$CONFD" ] || die "syslog-ng conf.d not found: $CONFD"
+  mkdir -p "$CONFD"
 }
 
 # =============================================================================
-# mail transport (MTA)
+# mail transport: we own msmtp as the system mailer (/usr/sbin/sendmail)
 # =============================================================================
-detect_sendmail() {
-  [ -x /usr/sbin/sendmail ] || command -v sendmail >/dev/null 2>&1
-}
+detect_sendmail() { [ -x /usr/sbin/sendmail ] || command -v sendmail >/dev/null 2>&1; }
 
 get_from() {
-  if [ -f "$ALERTS" ]; then
-    python3 - "$ALERTS" <<'PY' 2>/dev/null || echo "monitor@localhost"
-import sys, yaml
-d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
-print((d.get("settings") or {}).get("from") or "monitor@localhost")
-PY
-  else
-    echo "monitor@$(hostname -f 2>/dev/null || hostname)"
-  fi
+  local f; f="$(_settings_get from)"
+  [ -n "$f" ] && { echo "$f"; return 0; }
+  echo "monitor@$(hostname -f 2>/dev/null || hostname)"
 }
 
-write_msmtprc() {  # uses RELAY / RELAY_TLS / get_from
-  local host="${RELAY%%:*}" port="25" from; from="$(get_from)"
-  case "$RELAY" in *:*) port="${RELAY##*:}";; esac
-  local tls="off" trust=""
-  if [ "$RELAY_TLS" = "1" ]; then tls="on"; trust="tls_trust_file /etc/ssl/certs/ca-certificates.crt"; fi
-  info "Writing /etc/msmtprc (relay $host:$port, auth off, tls $tls)"
-  atomic_write /etc/msmtprc 0644 <<EOF
-# Managed by syslog-alert-router.sh -- send-only relay, no credentials on disk.
-# To use an authenticated relay instead, set 'auth on', add 'user NAME', and
-# point 'passwordeval' at a 0600 secret (e.g. passwordeval "cat /etc/alerts/relay.pw").
-defaults
-auth           off
-tls            $tls
-$trust
-logfile        $LOGDIR/msmtp.log
-
-account        default
-host           $host
-port           $port
-from           $from
-EOF
+# Write /etc/msmtprc. Password (if any) is read at send time from a 0600 secret
+# via passwordeval, so it never lives in this world-readable file.
+write_msmtprc() {  # write_msmtprc HOST PORT TLS(on|off) [USER]
+  local host="$1" port="$2" tls="$3" user="${4:-}" from secret
+  from="$(get_from)"; secret="$SECRETS/msmtp.pw"
+  { echo "# Managed by syslog-alert-router.sh -- system mailer."
+    echo "defaults"
+    echo "logfile        $LOGDIR/msmtp.log"
+    echo "tls            $tls"
+    [ "$tls" = on ] && echo "tls_trust_file /etc/ssl/certs/ca-certificates.crt"
+    echo ""
+    echo "account        default"
+    echo "host           $host"
+    echo "port           $port"
+    echo "from           $from"
+    if [ -n "$user" ]; then
+      echo "auth           on"
+      echo "user           $user"
+      echo "passwordeval   \"cat $secret\""
+    else
+      echo "auth           off"
+    fi
+  } | atomic_write /etc/msmtprc 0644
 }
 
-install_msmtp() {
-  [ -n "$RELAY" ] || die "msmtp needs a relay: pass --relay HOST[:PORT] (an SMTP relay that accepts mail from this box)."
-  command -v apt-get >/dev/null 2>&1 || die "apt-get unavailable; install 'msmtp msmtp-mta' manually, then re-run setup-mta."
-  info "Installing msmtp + msmtp-mta..."
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y msmtp msmtp-mta
-  write_msmtprc
+write_msmtprc_template() {
+  { echo "# Managed by syslog-alert-router.sh -- NOT YET CONFIGURED."
+    echo "# Set a smarthost with:  syslog-alert-router.sh setup-mta --relay HOST[:PORT] [--relay-tls]"
+    echo "# or add 'smarthost:' (and optional smarthost_user:) under settings: in alerts.yaml."
+    echo "defaults"
+    echo "logfile        $LOGDIR/msmtp.log"
+    echo "tls            on"
+    echo "tls_trust_file /etc/ssl/certs/ca-certificates.crt"
+    echo ""
+    echo "account        default"
+    echo "host           localhost"
+    echo "port           25"
+    echo "from           $(get_from)"
+    echo "auth           off"
+  } | atomic_write /etc/msmtprc 0644
+}
+
+install_msmtp_pkg() {
+  command -v msmtp >/dev/null 2>&1 && command -v /usr/sbin/sendmail >/dev/null 2>&1 && return 0
+  detect_pkg
+  [ "$PKG_MGR" = apt ] || die "Need apt to install msmtp. Install 'msmtp msmtp-mta' manually."
+  info "Installing msmtp + msmtp-mta (system mailer)..."
+  pkg_install msmtp msmtp-mta || die "msmtp install failed (see apt output above)."
   detect_sendmail || die "msmtp-mta did not provide /usr/sbin/sendmail."
-  info "msmtp ready; /usr/sbin/sendmail now relays to $RELAY."
 }
 
-install_postfix() {
-  command -v apt-get >/dev/null 2>&1 || die "apt-get unavailable; install postfix manually."
-  command -v debconf-set-selections >/dev/null 2>&1 || die "debconf-set-selections missing."
-  local mailname; mailname="$(hostname -f 2>/dev/null || hostname)"
+# Configure msmtp from --relay/--relay-tls flags, else settings.smarthost* in
+# alerts.yaml. With no smarthost anywhere, leave a template and flag it.
+configure_msmtp() {
+  local host port tls user
   if [ -n "$RELAY" ]; then
-    local host="${RELAY%%:*}" port="25"; case "$RELAY" in *:*) port="${RELAY##*:}";; esac
-    echo "postfix postfix/main_mailer_type select Satellite system" | debconf-set-selections
-    echo "postfix postfix/relayhost string [$host]:$port" | debconf-set-selections
-    info "Postfix as satellite -> relay [$host]:$port"
+    host="${RELAY%%:*}"; port=587; case "$RELAY" in *:*) port="${RELAY##*:}";; esac
   else
-    echo "postfix postfix/main_mailer_type select Internet Site" | debconf-set-selections
-    warn "Postfix will deliver DIRECTLY (no relay). SOHO IPs are frequently spam-filtered; --relay is far more reliable."
+    host="$(_settings_get smarthost)"; port="$(_settings_get smarthost_port)"; port="${port:-587}"
   fi
-  echo "postfix postfix/mailname string $mailname" | debconf-set-selections
-  info "Installing postfix (noninteractive)..."
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y postfix
-  detect_sendmail || die "postfix did not provide /usr/sbin/sendmail."
-  command -v systemctl >/dev/null 2>&1 && systemctl enable --now postfix >/dev/null 2>&1 || true
-  info "postfix ready."
-}
-
-ensure_mta() {
-  if detect_sendmail; then
-    info "MTA present; reusing existing $(command -v sendmail 2>/dev/null || echo /usr/sbin/sendmail)."
+  if [ -z "$host" ]; then
+    write_msmtprc_template; MTA_MISSING=1
+    warn "msmtp installed but no smarthost set yet (alerts can't be delivered until you configure it)."
     return 0
   fi
-  warn "No local MTA found (nothing provides /usr/sbin/sendmail)."
-  case "$MTA" in
-    msmtp)   install_msmtp;;
-    postfix) install_postfix;;
-    "")      MTA_MISSING=1
-             warn "No --mta chosen: the framework installs fine but CANNOT send mail yet.";;
-    *)       die "Unknown --mta '$MTA' (use: msmtp or postfix).";;
-  esac
+  tls=on
+  case "$(_settings_get smarthost_tls)" in 0|false|False|no|No|off|Off) tls=off;; esac
+  [ "$RELAY_TLS" = 1 ] && tls=on
+  user="$(_settings_get smarthost_user)"
+  if [ -n "$user" ] && [ ! -s "$SECRETS/msmtp.pw" ]; then
+    warn "smarthost_user '$user' set but $SECRETS/msmtp.pw is missing."
+    warn "Set it with:  $0 setup-mta   (interactive password prompt)"
+  fi
+  write_msmtprc "$host" "$port" "$tls" "$user"
+  info "msmtp -> $host:$port (tls $tls${user:+, auth as $user}); /usr/sbin/sendmail ready."
 }
+
+ensure_mta() { install_msmtp_pkg; configure_msmtp; }
 
 # =============================================================================
 # generate the syslog-ng coarse filter from alerts.yaml
 # =============================================================================
 generate_fragment() {
-  info "Generating syslog-ng fragment from $ALERTS"
+  info "Generating alert filter + dispatch path -> $FRAGMENT"
   local tmp; tmp="$(mktemp "${FRAGMENT}.tmp.XXXXXX")"
-  DISPATCH="$DISPATCH" SYSLOG_SOURCE="$SYSLOG_SOURCE" \
-  python3 - "$ALERTS" <<'PYGEN' > "$tmp"
-import sys, os, yaml
-doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+  DISPATCH="$DISPATCH" ALERTS="$ALERTS" python3 - <<'PYGEN' > "$tmp"
+import os, sys, yaml
+doc = yaml.safe_load(open(os.environ["ALERTS"], encoding="utf-8")) or {}
 pats = [a["regex"] for a in (doc.get("alerts") or {}).values()
         if isinstance(a, dict) and a.get("regex")]
 if not pats:
     sys.stderr.write("no regex patterns in alerts.yaml\n"); sys.exit(1)
-disp = os.environ["DISPATCH"]; src = os.environ["SYSLOG_SOURCE"]
-def esc(p): return p.replace("\\", "\\\\").replace('"', '\\"')
+s = doc.get("settings") or {}
+
+
+def asbool(v, d):
+    return d if v is None else str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def asint(v, d):
+    try:
+        return int(v)
+    except Exception:
+        return d
+
+
+srcs = []
+if asint(s.get("listen_udp"), 514) or asint(s.get("listen_tcp"), 514):
+    srcs.append("source(s_net);")
+if asint(s.get("listen_tls"), 6514):
+    srcs.append("source(s_net_tls);")
+if asbool(s.get("listen_local"), True):
+    srcs.append("source(s_local);")
+if not srcs:
+    srcs = ["source(s_net);"]
+disp = os.environ["DISPATCH"]
+
+
+def esc(p):
+    return p.replace("\\", "\\\\").replace('"', '\\"')
+
+
 terms = ['    message("%s" type(pcre) flags(ignore-case))' % esc(p) for p in pats]
 print("# AUTO-GENERATED by syslog-alert-router.sh -- do not edit by hand.")
-print("# Source of truth: %s   Regenerate: syslog-alert-router.sh regen" % sys.argv[1])
-print("# Requires source(%s) defined elsewhere in the syslog-ng config." % src)
+print("# Source of truth: %s   Regenerate: syslog-alert-router.sh regen" % os.environ["ALERTS"])
+print("# Sources s_net / s_net_tls / s_local are defined in syslog-ng.conf.")
 print()
 print("filter f_alert_coarse {")
 print(" or\n".join(terms) + ";")
@@ -1703,7 +1891,7 @@ print('    program("%s"' % disp)
 print('        template("$ISODATE|$HOST|$PROGRAM|$MESSAGE\\n"));')
 print("};")
 print()
-print("log { source(%s); filter(f_alert_coarse); destination(d_alert_dispatch); };" % src)
+print("log { %s filter(f_alert_coarse); destination(d_alert_dispatch); };" % " ".join(srcs))
 PYGEN
   backup "$FRAGMENT"; chmod 0644 "$tmp"; mv -f -- "$tmp" "$FRAGMENT"
   info "Validating syslog-ng configuration..."
@@ -1731,62 +1919,64 @@ EOF
 # =============================================================================
 cmd_install() {
   preflight
-  mkdir -p "$LIBDIR" "$CFGDIR" "$TPLDIR" "$DBDIR" "$LOGDIR"
+  mkdir -p "$LIBDIR" "$CFGDIR" "$TPLDIR" "$DBDIR" "$LOGDIR" "$ARCHIVE_DIR"
   chmod 0755 "$DBDIR" "$LOGDIR"
   ensure_secrets_dir
   write_code
   bootstrap_config
+  ensure_tls_cert || true
   ensure_mta
   info "Validating config..."
   python3 "$DISPATCH" --check || die "Config failed validation; aborting before touching syslog-ng."
+  write_base_syslogng
   generate_fragment
   install_cron
   if restart_syslogng; then
     info "Install complete (v$VERSION)."
   else
-    err "Install wrote all files, but syslog-ng failed to restart — see the log above."
+    err "Install wrote all files, but syslog-ng failed to start — see the log above."
     err "Recover with: systemctl status syslog-ng ; journalctl -xeu syslog-ng"
+    return 1
   fi
   if [ "$MTA_MISSING" = "1" ]; then
     cat <<EOF
 
 *** MAIL NOT YET CONFIGURED ***
-Nothing provides /usr/sbin/sendmail, so alerts cannot be delivered. Pick one:
+msmtp is installed but has no smarthost, so alerts cannot be delivered yet:
 
-  # Lightweight relay (recommended; no daemon, no credentials):
-  $0 setup-mta --mta msmtp --relay YOUR_RELAY_HOST[:PORT]
+  $0 setup-mta --relay smtp.example.com:587 --relay-tls     # then set creds if needed
 
-  # Or Postfix (satellite via relay, or direct Internet Site if --relay omitted):
-  $0 setup-mta --mta postfix --relay YOUR_RELAY_HOST[:PORT]
-
-YOUR_RELAY_HOST = an SMTP relay that accepts mail from this box without auth
-(e.g. an internal mail server, or a provider relay with this IP allowlisted).
-Then confirm:   $0 mailtest you@certifiedgeeks.net
+Or add under settings: in $ALERTS:
+  smarthost: smtp.example.com
+  smarthost_port: 587
+  smarthost_user: you@example.com      # omit for an unauthenticated relay
+…then run '$0 setup-mta' (it will prompt for the password) and '$0 install'.
 EOF
   fi
   cat <<EOF
 
+Listening: UDP/TCP 514 and TLS 6514 (self-signed cert in $TLSDIR), plus local logs.
+Point your FortiGate / pfSense / Ubiquiti syslog at this box's IP.
+
 Next steps:
-  1. Edit recipients:   $RECIP
-  2. Configure relays:  $0 relays           (interactive; add SMTP relays + secured creds)
-  3. Confirm mail path: $0 mailtest you@certifiedgeeks.net
-  4. Dry-run a rule:    $0 test "kernel: Out of memory: Killed process 1 (mysqld)"
-  5. Avoid DUPLICATES:  legacy d_sendpage still fires; when satisfied: $0 disable-legacy
+  1. Recipients/relays: $0 rules    and    $0 relays
+  2. Confirm mail path: $0 mailtest you@certifiedgeeks.net
+  3. Dry-run a rule:    $0 test "kernel: Out of memory: Killed process 1 (mysqld)"
+  4. Watch it work:     tail -f $LOGDIR/dispatcher.log   (and $ARCHIVE_DIR/<host>/…)
 EOF
 }
 
 cmd_setup_mta() {
   need_root
-  case "$MTA" in
-    msmtp)   install_msmtp;;
-    postfix) install_postfix;;
-    "")      if detect_sendmail; then
-               info "MTA already present: $(command -v sendmail 2>/dev/null || echo /usr/sbin/sendmail). Nothing to do."
-             else
-               die "No MTA present. Specify one: $0 setup-mta --mta msmtp --relay HOST[:PORT]"
-             fi;;
-    *)       die "Unknown --mta '$MTA' (use: msmtp or postfix).";;
-  esac
+  install_msmtp_pkg
+  # If the smarthost needs auth and we don't have the secret yet, prompt for it.
+  local user; user="$(_settings_get smarthost_user)"
+  if [ -n "$user" ] && [ ! -s "$SECRETS/msmtp.pw" ]; then
+    info "Smarthost user '$user' needs a password (stored 0600 at $SECRETS/msmtp.pw)."
+    write_secret msmtp >/dev/null || die "Password not set."
+  fi
+  configure_msmtp
+  detect_sendmail && info "Mailer ready: /usr/sbin/sendmail -> msmtp." || warn "sendmail still missing."
 }
 
 cmd_mailtest() {
@@ -1990,12 +2180,20 @@ cmd_status() {
   if [ "$libver" = "$VERSION" ]; then
     printf '  library    : %s (current)\n' "$libver"
   else
-    printf '  library    : %s  <-- STALE: run install (option 1) to deploy %s\n' "$libver" "$VERSION"
+    printf '  library    : %s  <-- STALE: run install to deploy %s\n' "$libver" "$VERSION"
   fi
-  printf '  syslog-ng  : %s\n' "$(_yn 'command -v syslog-ng')"
+  printf '  syslog-ng  : %s%s\n' "$(_yn 'command -v syslog-ng')" \
+    "$(command -v syslog-ng >/dev/null 2>&1 && printf ' (v%s)' "$(syslogng_version)")"
+  printf '  base config: %s\n' "$([ -f "$SYSLOGNG_CONF" ] && grep -q 'syslog-alert-router' "$SYSLOGNG_CONF" 2>/dev/null && echo managed || echo 'not managed (run install)')"
+  local lu lt ls ll
+  lu="$(_settings_get listen_udp)"; lt="$(_settings_get listen_tcp)"
+  ls="$(_settings_get listen_tls)"; ll="$(_settings_get listen_local)"
+  printf '  listeners  : udp=%s tcp=%s tls=%s local=%s\n' \
+    "${lu:-514}" "${lt:-514}" "${ls:-6514}" "${ll:-true}"
+  printf '  tls cert   : %s\n' "$([ -s "$TLSDIR/cert.pem" ] && echo present || echo none)"
   printf '  filter     : %s\n' "$([ -f "$FRAGMENT" ] && echo present || echo none)"
   printf '  sweeper cron: %s\n' "$([ -f "$CRON" ] && echo present || echo none)"
-  printf '  local MTA  : %s\n' "$(_yn detect_sendmail)"
+  printf '  mailer     : %s\n' "$(detect_sendmail && echo 'msmtp (/usr/sbin/sendmail)' || echo none)"
   if [ -f "$RELAYS_YAML" ] && [ -x "$ALERTRELAYS" ]; then
     echo "  relays:"
     ALERT_LIB_DIR="$LIBDIR" ALERT_CONFIG_DIR="$CFGDIR" python3 "$ALERTRELAYS" list 2>/dev/null | sed 's/^/    /'
@@ -2021,10 +2219,11 @@ _menu_dryrun() {
 }
 
 _menu_setup_mta() {
-  local m relay
-  printf 'install which MTA? [msmtp/postfix]> '; read -r m; [ -n "$m" ] || { echo "cancelled"; return; }
-  printf 'relay smarthost HOST[:PORT] (blank = direct send, postfix only)> '; read -r relay
-  MTA="$m" RELAY="$relay" cmd_setup_mta
+  local relay tls
+  printf 'smarthost HOST[:PORT] (blank = keep settings.smarthost)> '; read -r relay
+  printf 'use TLS/STARTTLS? [Y/n]> '; read -r tls
+  case "$tls" in n|N) tls=0;; *) tls=1;; esac
+  RELAY="$relay" RELAY_TLS="$tls" cmd_setup_mta
 }
 
 _menu_uninstall() {
@@ -2041,11 +2240,10 @@ cmd_menu() {
     cat <<'MENU'
 ----------------------------------------------------------------------
   1) Install / update everything       6) Validate configuration
-  2) Manage alert rules + recipients   7) Regenerate syslog-ng filter
-  3) Manage relays + credentials       8) Set up a local MTA
+  2) Manage alert rules + recipients   7) Regenerate filter + base config
+  3) Manage relays + credentials       8) Configure mailer (msmtp smarthost)
   4) Send a test email                 9) Run sweep now (escalate/digest)
-  5) Dry-run a rule (sample log line) 10) Disable legacy d_sendpage path
-                                       u) Uninstall    q) Quit
+  5) Dry-run a rule (sample log line)  u) Uninstall    q) Quit
 ----------------------------------------------------------------------
 MENU
     printf 'choose> '; read -r c || break
@@ -2059,7 +2257,6 @@ MENU
       7) cmd_regen || true; _pause;;
       8) _menu_setup_mta || true; _pause;;
       9) cmd_sweep || true; _pause;;
-      10) cmd_disable_legacy || true; _pause;;
       u|U) _menu_uninstall || true;;
       q|Q|"") echo "Bye."; break;;
       *) echo "unknown option: $c";;
@@ -2071,11 +2268,13 @@ cmd_regen() {
   preflight
   [ -e "$ALERTS" ] || die "No $ALERTS (run 'install' first)."
   python3 "$DISPATCH" --check || die "Config invalid; not regenerating."
+  ensure_tls_cert || true
+  write_base_syslogng
   generate_fragment
   if reload_syslogng; then
-    info "Filter regenerated and syslog-ng reloaded."
+    info "Base config + filter regenerated and syslog-ng reloaded."
   else
-    err "Filter was regenerated and validated, but syslog-ng did NOT reload."
+    err "Config was regenerated and validated, but syslog-ng did NOT reload."
     err "Check: systemctl status syslog-ng ; journalctl -xeu syslog-ng"
     return 1
   fi
@@ -2090,65 +2289,48 @@ cmd_test() {
 cmd_check() { python3 "$DISPATCH" --check; }
 cmd_sweep() { need_root; python3 "$SWEEPER"; info "Sweep complete (see $LOGDIR/sweeper.log)."; }
 
-cmd_disable_legacy() {
-  need_root
-  local remote="$CONFD/remote.conf"
-  [ -e "$remote" ] || die "Not found: $remote"
-  backup "$remote"
-  REMOTE="$remote" python3 - <<'PYDL'
-import os, re, sys
-p = os.environ["REMOTE"]; src = open(p).read()
-pat = re.compile(r'(?ms)^(\s*log\s*\{(?:(?!\}).)*?destination\s*\(\s*d_sendpage\s*\).*?\}\s*;)')
-m = pat.search(src)
-if not m:
-    sys.stderr.write("Could not find the legacy 'log { ... d_sendpage ... };' block; comment it out manually.\n")
-    sys.exit(1)
-blk = m.group(1)
-out = "\n".join(("# "+ln) if ln.strip() else ln for ln in blk.splitlines())
-open(p,"w").write(src[:m.start(1)] + "# [disabled by syslog-alert-router]\n" + out + src[m.end(1):])
-print("Commented out the legacy d_sendpage log block.")
-PYDL
-  info "Validating..."; validate_syslogng || die "Validation failed; restore from the .bak just created."
-  reload_syslogng; info "Legacy single-recipient path disabled."
-}
-
 cmd_uninstall() {
   need_root
-  info "Removing fragment, cron, and code (config / secrets / DB / logs are kept)."
-  backup "$FRAGMENT"; rm -f -- "$FRAGMENT" "$CRON" "$DISPATCH" "$SWEEPER" "$ALERTRELAYS" "$ALERTLIB"
+  info "Removing fragment, cron, and code (config / secrets / DB / logs / archive are kept)."
+  backup "$FRAGMENT"; rm -f -- "$FRAGMENT" "$CRON" "$DISPATCH" "$SWEEPER" "$ALERTRELAYS" "$ALERTRULES" "$ALERTLIB"
+  warn "$SYSLOGNG_CONF is managed by this tool; left in place so logging keeps working."
+  warn "To fully revert syslog-ng, restore one of: ${SYSLOGNG_CONF}.bak.*"
   validate_syslogng && reload_syslogng || warn "Validate/reload skipped or failed; check syslog-ng."
-  info "Uninstalled. Config at $CFGDIR, secrets at $SECRETS, state at $DBDIR, logs at $LOGDIR remain."
+  info "Uninstalled. Config at $CFGDIR, secrets at $SECRETS, state at $DBDIR remain."
 }
 
 usage() {
   cat <<EOF
-syslog-alert-router.sh v$VERSION
+syslog-alert-router.sh v$VERSION  (dedicated log/alert appliance)
 
 Run with no arguments for an interactive menu. Root-requiring actions elevate
-via sudo automatically and missing prerequisites (syslog-ng, python3,
-python3-yaml, cron, ca-certificates) are installed on first install.
+via sudo automatically; prerequisites (syslog-ng-core, python3, python3-yaml,
+cron, openssl, ca-certificates, msmtp) are installed on first install.
+
+This script OWNS syslog-ng on this box: it writes $SYSLOGNG_CONF with its own
+listeners (UDP/TCP 514, TLS 6514, local) and a per-host archive under
+$ARCHIVE_DIR, plus the alert pipeline in $FRAGMENT.
 
   (no args) | menu          Interactive menu (default)
-  status                    Show install / relay / MTA status
+  status                    Show install / listener / mailer / relay status
+  install [--relay HOST[:PORT]] [--relay-tls]
+                            Install everything; own syslog-ng; configure msmtp
   rules                     Submenu: add/edit alert rules + recipient groups
-  install [--mta msmtp|postfix --relay HOST[:PORT]] [--relay-tls]
-                            Install prereqs, code, config, filter, cron; reload
-  relays                    Submenu: add/edit/test relays + secured credentials
-  mailtest [--relay NAME] ADDR
-                            Send a test email (optionally via a specific relay)
-  setup-mta --mta msmtp|postfix [--relay HOST[:PORT]] [--relay-tls]
-                            Install a local send-only MTA (for the 'local' relay)
-  regen                     Rebuild the coarse syslog-ng filter from alerts.yaml
+  relays                    Submenu: add/edit/test SMTP relays + secured creds
+  mailtest [--relay NAME] ADDR    Send a test email (optionally via one relay)
+  setup-mta [--relay HOST[:PORT]] [--relay-tls]
+                            (Re)configure the msmtp smarthost; prompts for auth
+  regen                     Rebuild base config + filter from alerts.yaml; reload
   test "<msg>" [program]    Dry-run classification + rendered email (no send)
   check                     Validate the YAML config
   sweep                     Run the escalation/digest/prune sweep once now
-  disable-legacy            Comment out the old single-recipient d_sendpage block
-  uninstall                 Remove code + fragment + cron (keeps config/secrets/DB/logs)
+  uninstall                 Remove code + fragment + cron (keeps config/secrets/DB)
   version | help
 
-Relays: multiple SMTP/sendmail relays with a failover 'order'; alerts may override
-via 'relay:'/'relays:' in alerts.yaml. Credentials live in $SECRETS/<name>.pw (0600);
-relays.yaml holds only references, never passwords. See CHANGELOG.md for history.
+Listeners are set under settings: in $ALERTS
+  (listen_udp / listen_tcp / listen_tls ports, listen_local true|false) and the
+  msmtp smarthost (smarthost / smarthost_port / smarthost_tls / smarthost_user).
+Credentials live in $SECRETS/<name>.pw (0600); YAML holds only references.
 EOF
 }
 
@@ -2159,8 +2341,6 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --install-deps) INSTALL_DEPS=1;;
-      --mta)          MTA="${2:-}"; shift;;
-      --mta=*)        MTA="${1#*=}";;
       --relay)        RELAY="${2:-}"; shift;;
       --relay=*)      RELAY="${1#*=}";;
       --relay-tls)    RELAY_TLS=1;;
@@ -2181,7 +2361,6 @@ main() {
     test)                  cmd_test "$@";;
     check)                 cmd_check "$@";;
     sweep)                 cmd_sweep "$@";;
-    disable-legacy)        cmd_disable_legacy "$@";;
     uninstall)             cmd_uninstall "$@";;
     version|--version)     echo "$VERSION";;
     help|-h|--help)        usage;;
