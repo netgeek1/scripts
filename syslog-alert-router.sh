@@ -10,7 +10,7 @@
 #   local logs   --(system/internal)--------> syslog-ng
 #        -> alert-dispatcher.py   classify, dedup (SQLite), template, route, send
 #        -> alert-sweeper.py      escalation + digests + prune  (cron, time-driven)
-#        -> msmtp (system mailer) and/or SMTP relays in relays.yaml
+#        -> Postfix smarthost (LAN SMTP relay) and/or SMTP relays in relays.yaml
 #
 # Single source of truth: /etc/alerts/config/alerts.yaml
 #   * Editing recipients/severity/template/relay = picked up live by the dispatcher.
@@ -23,15 +23,15 @@
 #   /usr/local/bin/alert-{dispatcher,sweeper,relays,rules}.py
 #   /etc/alerts/config/{alerts,recipients,relays}.yaml
 #   /etc/alerts/templates/*.{txt,html}
-#   /etc/alerts/secrets/<name>.pw (0600)        relay/msmtp credentials
+#   /etc/alerts/secrets/<name>.pw (0600)        relay credentials
 #   /etc/alerts/tls/{cert,key}.pem              TLS listener cert (self-signed by default)
 #   /var/lib/alerts/alerts.db                   SQLite state
-#   /var/log/alerts/*.log                       dispatcher/sweeper/msmtp logs
+#   /var/log/alerts/*.log                       dispatcher / sweeper logs
 #   /var/log/remote/<host>/<date>.log           received-log archive
 #   /etc/cron.d/alert-sweeper
 #
 set -euo pipefail
-VERSION="3.0.0"
+VERSION="3.1.0"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -57,8 +57,7 @@ TLSDIR="${TLSDIR:-/etc/alerts/tls}"
 ARCHIVE_DIR="${ARCHIVE_DIR:-/var/log/remote}"
 CRON="${CRON:-/etc/cron.d/alert-sweeper}"
 INSTALL_DEPS="${INSTALL_DEPS:-0}"
-RELAY="${RELAY:-}"            # smarthost HOST[:PORT] for msmtp (overrides settings.smarthost)
-RELAY_TLS="${RELAY_TLS:-0}"
+RELAY="${RELAY:-}"            # relay NAME for 'mailtest --relay NAME'
 MTA_MISSING=0
 
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -342,7 +341,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -1513,13 +1512,12 @@ settings:
   listen_tls: 6514         # 0/false to disable (uses /etc/alerts/tls/{cert,key}.pem)
   listen_local: true       # collect this box's own system + internal logs
 
-  # --- msmtp smarthost (system mailer). Used by the 'local' sendmail relay. ---
-  # Leave smarthost blank to configure later via: syslog-alert-router.sh setup-mta
-  smarthost: ''            # e.g. smtp.dreamhost.com
-  smarthost_port: 587
-  smarthost_tls: true
-  smarthost_user: ''       # set for an authenticated relay; then run setup-mta to
-                           # store the password 0600 at /etc/alerts/secrets/msmtp.pw
+  # --- outbound mail relay (Postfix smarthost) ---
+  # The box listens on SMTP/25 and relays mail from RFC 1918 clients out through
+  # the DEFAULT relay = the first SMTP relay in relays.yaml 'order' (manage via
+  # the relay menu). No smarthost host/creds here -- they live in relays.yaml.
+  smtp_relay_enable: true   # false = sendmail only, no inbound :25 listener
+  relay_networks: '127.0.0.0/8,[::1]/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
 
 alerts:
 
@@ -1745,8 +1743,14 @@ PY
 }
 
 # =============================================================================
-# mail transport: we own msmtp as the system mailer (/usr/sbin/sendmail)
+# mail transport: Postfix as an outbound smarthost.
+#   * listens on SMTP/25, relays only for RFC 1918 clients (mynetworks),
+#   * forwards everything through the DEFAULT relay (first SMTP relay in the
+#     relays.yaml failover order), reusing its host/port/security/credentials,
+#   * provides /usr/sbin/sendmail for the box itself.
 # =============================================================================
+RELAY_NETWORKS_DEFAULT="127.0.0.0/8,[::1]/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
 detect_sendmail() { [ -x /usr/sbin/sendmail ] || command -v sendmail >/dev/null 2>&1; }
 
 get_from() {
@@ -1755,84 +1759,115 @@ get_from() {
   echo "monitor@$(hostname -f 2>/dev/null || hostname)"
 }
 
-# Write /etc/msmtprc. Password (if any) is read at send time from a 0600 secret
-# via passwordeval, so it never lives in this world-readable file.
-write_msmtprc() {  # write_msmtprc HOST PORT TLS(on|off) [USER]
-  local host="$1" port="$2" tls="$3" user="${4:-}" from secret
-  from="$(get_from)"; secret="$SECRETS/msmtp.pw"
-  { echo "# Managed by syslog-alert-router.sh -- system mailer."
-    echo "defaults"
-    echo "logfile        $LOGDIR/msmtp.log"
-    echo "tls            $tls"
-    [ "$tls" = on ] && echo "tls_trust_file /etc/ssl/certs/ca-certificates.crt"
-    echo ""
-    echo "account        default"
-    echo "host           $host"
-    echo "port           $port"
-    echo "from           $from"
-    if [ -n "$user" ]; then
-      echo "auth           on"
-      echo "user           $user"
-      echo "passwordeval   \"cat $secret\""
-    else
-      echo "auth           off"
-    fi
-  } | atomic_write /etc/msmtprc 0644
+# Emit "host<TAB>port<TAB>security<TAB>auth(0|1)<TAB>user" for the default relay
+# (first smtp relay in the failover order). If $1 is given and auth is on, also
+# writes that path as a Postfix sasl_passwd map (0600) using the relay's secret.
+postfix_smarthost() {  # [sasl_passwd_path]
+  SASL="${1:-}" ALERT_LIB_DIR="$LIBDIR" ALERT_CONFIG_DIR="$CFGDIR" python3 - <<'PY'
+import os, sys, logging
+sys.path.insert(0, os.environ["ALERT_LIB_DIR"])
+import alertlib as A
+sasl = os.environ.get("SASL", "")
+try:
+    order, relays = A.load_relays()
+except Exception:
+    sys.exit(0)
+chosen = None
+for name in (order or list(relays)):
+    r = relays.get(name) or {}
+    if str(r.get("transport", "smtp")).lower() == "smtp" and r.get("host"):
+        chosen = r; break
+if not chosen:
+    sys.exit(0)
+host = chosen["host"]; port = int(chosen.get("port", 587))
+sec = str(chosen.get("security", "starttls")).lower()
+auth = 1 if chosen.get("auth") else 0
+user = chosen.get("user", "") if auth else ""
+if auth and sasl:
+    try:
+        pw = A._read_secret(chosen, logging.getLogger("postfix"))
+    except Exception as e:
+        sys.stderr.write("could not read relay secret: %s\n" % e); pw = None
+    if pw:
+        with open(sasl, "w") as f:
+            f.write("[%s]:%s %s:%s\n" % (host, port, user, pw))
+        os.chmod(sasl, 0o600)
+print("%s\t%s\t%s\t%s\t%s" % (host, port, sec, auth, user))
+PY
 }
 
-write_msmtprc_template() {
-  { echo "# Managed by syslog-alert-router.sh -- NOT YET CONFIGURED."
-    echo "# Set a smarthost with:  syslog-alert-router.sh setup-mta --relay HOST[:PORT] [--relay-tls]"
-    echo "# or add 'smarthost:' (and optional smarthost_user:) under settings: in alerts.yaml."
-    echo "defaults"
-    echo "logfile        $LOGDIR/msmtp.log"
-    echo "tls            on"
-    echo "tls_trust_file /etc/ssl/certs/ca-certificates.crt"
-    echo ""
-    echo "account        default"
-    echo "host           localhost"
-    echo "port           25"
-    echo "from           $(get_from)"
-    echo "auth           off"
-  } | atomic_write /etc/msmtprc 0644
-}
-
-install_msmtp_pkg() {
-  command -v msmtp >/dev/null 2>&1 && command -v /usr/sbin/sendmail >/dev/null 2>&1 && return 0
+install_postfix_pkg() {
+  if command -v postfix >/dev/null 2>&1 && detect_sendmail; then return 0; fi
   detect_pkg
-  [ "$PKG_MGR" = apt ] || die "Need apt to install msmtp. Install 'msmtp msmtp-mta' manually."
-  info "Installing msmtp + msmtp-mta (system mailer)..."
-  pkg_install msmtp msmtp-mta || die "msmtp install failed (see apt output above)."
-  detect_sendmail || die "msmtp-mta did not provide /usr/sbin/sendmail."
+  [ "$PKG_MGR" = apt ] || die "Need apt to install postfix. Install 'postfix' manually."
+  local mailname; mailname="$(hostname -f 2>/dev/null || hostname)"
+  echo "postfix postfix/main_mailer_type select Local only" | debconf-set-selections 2>/dev/null || true
+  echo "postfix postfix/mailname string $mailname"          | debconf-set-selections 2>/dev/null || true
+  info "Installing postfix (noninteractive)..."
+  DEBIAN_FRONTEND=noninteractive pkg_install postfix || die "postfix install failed (see apt output)."
+  detect_sendmail || die "postfix did not provide /usr/sbin/sendmail."
 }
 
-# Configure msmtp from --relay/--relay-tls flags, else settings.smarthost* in
-# alerts.yaml. With no smarthost anywhere, leave a template and flag it.
-configure_msmtp() {
-  local host port tls user
-  if [ -n "$RELAY" ]; then
-    host="${RELAY%%:*}"; port=587; case "$RELAY" in *:*) port="${RELAY##*:}";; esac
+# Configure Postfix as a relay/smarthost driven by the default relay + settings.
+configure_postfix() {
+  command -v postconf >/dev/null 2>&1 || { warn "postfix not installed; skipping mail config."; return 1; }
+  local mailname nets enable
+  mailname="$(hostname -f 2>/dev/null || hostname)"
+  nets="$(_settings_get relay_networks)"; nets="${nets:-$RELAY_NETWORKS_DEFAULT}"
+  enable="$(_settings_get smtp_relay_enable)"
+  postconf -e "myhostname = $mailname"
+  postconf -e "myorigin = \$myhostname"
+  postconf -e "mydestination = localhost"
+  postconf -e "inet_protocols = ipv4"
+  postconf -e "mynetworks = ${nets//,/ }"
+  postconf -e "message_size_limit = 20480000"
+  postconf -e "smtpd_relay_restrictions = permit_mynetworks, reject_unauth_destination"
+  postconf -e "smtpd_recipient_restrictions = permit_mynetworks, reject_unauth_destination"
+  case "$enable" in
+    0|false|False|no|No|off|Off)
+      postconf -e "inet_interfaces = loopback-only"
+      info "SMTP relay listener DISABLED (sendmail only; set smtp_relay_enable: true to enable).";;
+    *)
+      postconf -e "inet_interfaces = all"
+      postconf -e "smtpd_client_restrictions = permit_mynetworks, reject"
+      info "SMTP relay listening on :25 for: ${nets//,/ }";;
+  esac
+  local relayinfo host port sec auth user
+  relayinfo="$(postfix_smarthost /etc/postfix/sasl_passwd)" || true
+  if [ -z "$relayinfo" ]; then
+    MTA_MISSING=1
+    postconf -e "relayhost ="
+    postconf -e "smtp_sasl_auth_enable = no"
+    warn "No SMTP relay defined yet: Postfix will accept LAN mail but cannot relay it out."
+    warn "Add an SMTP relay in the relay manager (option 3) and put it first in the order."
   else
-    host="$(_settings_get smarthost)"; port="$(_settings_get smarthost_port)"; port="${port:-587}"
+    IFS=$'\t' read -r host port sec auth user <<<"$relayinfo"
+    postconf -e "relayhost = [$host]:$port"
+    postconf -e "smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt"
+    case "$sec" in
+      tls)      postconf -e "smtp_tls_security_level = encrypt"; postconf -e "smtp_tls_wrappermode = yes";;
+      starttls) postconf -e "smtp_tls_security_level = encrypt"; postconf -e "smtp_tls_wrappermode = no";;
+      *)        postconf -e "smtp_tls_security_level = may";     postconf -e "smtp_tls_wrappermode = no";;
+    esac
+    if [ "$auth" = "1" ]; then
+      postconf -e "smtp_sasl_auth_enable = yes"
+      postconf -e "smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd"
+      postconf -e "smtp_sasl_security_options = noanonymous"
+      [ -f /etc/postfix/sasl_passwd ] && { chmod 0600 /etc/postfix/sasl_passwd; postmap /etc/postfix/sasl_passwd; }
+    else
+      postconf -e "smtp_sasl_auth_enable = no"
+    fi
+    info "Postfix smarthost -> [$host]:$port (tls $sec${user:+, auth $user})."
   fi
-  if [ -z "$host" ]; then
-    write_msmtprc_template; MTA_MISSING=1
-    warn "msmtp installed but no smarthost set yet (alerts can't be delivered until you configure it)."
-    return 0
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable postfix >/dev/null 2>&1 || true
+    systemctl restart postfix || warn "postfix restart failed; check: journalctl -xeu postfix"
+  else
+    service postfix restart 2>/dev/null || warn "Could not restart postfix."
   fi
-  tls=on
-  case "$(_settings_get smarthost_tls)" in 0|false|False|no|No|off|Off) tls=off;; esac
-  [ "$RELAY_TLS" = 1 ] && tls=on
-  user="$(_settings_get smarthost_user)"
-  if [ -n "$user" ] && [ ! -s "$SECRETS/msmtp.pw" ]; then
-    warn "smarthost_user '$user' set but $SECRETS/msmtp.pw is missing."
-    warn "Set it with:  $0 setup-mta   (interactive password prompt)"
-  fi
-  write_msmtprc "$host" "$port" "$tls" "$user"
-  info "msmtp -> $host:$port (tls $tls${user:+, auth as $user}); /usr/sbin/sendmail ready."
 }
 
-ensure_mta() { install_msmtp_pkg; configure_msmtp; }
+ensure_mta() { install_postfix_pkg; configure_postfix; }
 
 # =============================================================================
 # generate the syslog-ng coarse filter from alerts.yaml
@@ -1941,42 +1976,38 @@ cmd_install() {
   if [ "$MTA_MISSING" = "1" ]; then
     cat <<EOF
 
-*** MAIL NOT YET CONFIGURED ***
-msmtp is installed but has no smarthost, so alerts cannot be delivered yet:
+*** OUTBOUND MAIL NOT YET CONFIGURED ***
+Postfix is installed and listening on :25 for RFC 1918 clients, but no SMTP
+relay is defined yet, so it can't forward mail out (and alerts via the 'local'
+relay won't deliver). Add your smarthost as the FIRST relay:
 
-  $0 setup-mta --relay smtp.example.com:587 --relay-tls     # then set creds if needed
+  $0 relays      # add an SMTP relay (host/port/STARTTLS/auth), set it first in the order
 
-Or add under settings: in $ALERTS:
-  smarthost: smtp.example.com
-  smarthost_port: 587
-  smarthost_user: you@example.com      # omit for an unauthenticated relay
-…then run '$0 setup-mta' (it will prompt for the password) and '$0 install'.
+The first SMTP relay in the order becomes both the alert default and the Postfix
+smarthost. Re-run is automatic when you leave the relay manager.
 EOF
   fi
   cat <<EOF
 
-Listening: UDP/TCP 514 and TLS 6514 (self-signed cert in $TLSDIR), plus local logs.
-Point your FortiGate / pfSense / Ubiquiti syslog at this box's IP.
+Listening:
+  syslog : UDP/TCP 514 and TLS 6514 (self-signed cert in $TLSDIR), plus local logs.
+  mail   : SMTP 25 for RFC 1918 clients -> relayed via the default relay.
+Point your FortiGate / pfSense / Ubiquiti syslog AND their email at this box's IP.
 
 Next steps:
-  1. Recipients/relays: $0 rules    and    $0 relays
-  2. Confirm mail path: $0 mailtest you@certifiedgeeks.net
-  3. Dry-run a rule:    $0 test "kernel: Out of memory: Killed process 1 (mysqld)"
-  4. Watch it work:     tail -f $LOGDIR/dispatcher.log   (and $ARCHIVE_DIR/<host>/…)
+  1. Relay/smarthost:   $0 relays    (first SMTP relay = default + Postfix smarthost)
+  2. Recipients/rules:  $0 rules
+  3. Confirm mail path: $0 mailtest you@certifiedgeeks.net
+  4. Dry-run a rule:    $0 test "kernel: Out of memory: Killed process 1 (mysqld)"
+  5. Watch it work:     tail -f $LOGDIR/dispatcher.log   (and $ARCHIVE_DIR/<host>/…)
 EOF
 }
 
 cmd_setup_mta() {
   need_root
-  install_msmtp_pkg
-  # If the smarthost needs auth and we don't have the secret yet, prompt for it.
-  local user; user="$(_settings_get smarthost_user)"
-  if [ -n "$user" ] && [ ! -s "$SECRETS/msmtp.pw" ]; then
-    info "Smarthost user '$user' needs a password (stored 0600 at $SECRETS/msmtp.pw)."
-    write_secret msmtp >/dev/null || die "Password not set."
-  fi
-  configure_msmtp
-  detect_sendmail && info "Mailer ready: /usr/sbin/sendmail -> msmtp." || warn "sendmail still missing."
+  install_postfix_pkg
+  configure_postfix
+  detect_sendmail && info "Mailer ready: Postfix (/usr/sbin/sendmail)." || warn "sendmail still missing."
 }
 
 cmd_mailtest() {
@@ -2086,6 +2117,10 @@ cmd_relays() {
     esac
   done
   python3 "$ALERTRELAYS" check || warn "relays.yaml has issues; review above."
+  if command -v postconf >/dev/null 2>&1; then
+    info "Re-syncing Postfix smarthost with the default (first) relay..."
+    configure_postfix || true
+  fi
   info "Done. The dispatcher picks up relay changes within ~2s (no reload needed)."
 }
 
@@ -2193,7 +2228,18 @@ cmd_status() {
   printf '  tls cert   : %s\n' "$([ -s "$TLSDIR/cert.pem" ] && echo present || echo none)"
   printf '  filter     : %s\n' "$([ -f "$FRAGMENT" ] && echo present || echo none)"
   printf '  sweeper cron: %s\n' "$([ -f "$CRON" ] && echo present || echo none)"
-  printf '  mailer     : %s\n' "$(detect_sendmail && echo 'msmtp (/usr/sbin/sendmail)' || echo none)"
+  printf '  mailer     : %s\n' "$(detect_sendmail && echo 'postfix (/usr/sbin/sendmail)' || echo none)"
+  if command -v postconf >/dev/null 2>&1; then
+    local ii rh
+    ii="$(postconf -h inet_interfaces 2>/dev/null)"
+    rh="$(postconf -h relayhost 2>/dev/null)"
+    if [ "$ii" = "all" ]; then
+      printf '  smtp relay : listening :25 for %s\n' "$(postconf -h mynetworks 2>/dev/null)"
+    else
+      printf '  smtp relay : disabled (sendmail only)\n'
+    fi
+    printf '  smarthost  : %s\n' "${rh:-none (set a relay first in the order)}"
+  fi
   if [ -f "$RELAYS_YAML" ] && [ -x "$ALERTRELAYS" ]; then
     echo "  relays:"
     ALERT_LIB_DIR="$LIBDIR" ALERT_CONFIG_DIR="$CFGDIR" python3 "$ALERTRELAYS" list 2>/dev/null | sed 's/^/    /'
@@ -2219,11 +2265,8 @@ _menu_dryrun() {
 }
 
 _menu_setup_mta() {
-  local relay tls
-  printf 'smarthost HOST[:PORT] (blank = keep settings.smarthost)> '; read -r relay
-  printf 'use TLS/STARTTLS? [Y/n]> '; read -r tls
-  case "$tls" in n|N) tls=0;; *) tls=1;; esac
-  RELAY="$relay" RELAY_TLS="$tls" cmd_setup_mta
+  echo "Configuring Postfix from settings + the default (first) relay..."
+  cmd_setup_mta
 }
 
 _menu_uninstall() {
@@ -2241,7 +2284,7 @@ cmd_menu() {
 ----------------------------------------------------------------------
   1) Install / update everything       6) Validate configuration
   2) Manage alert rules + recipients   7) Regenerate filter + base config
-  3) Manage relays + credentials       8) Configure mailer (msmtp smarthost)
+  3) Manage relays + credentials       8) Configure mail relay (Postfix/smarthost)
   4) Send a test email                 9) Run sweep now (escalate/digest)
   5) Dry-run a rule (sample log line)  u) Uninstall    q) Quit
 ----------------------------------------------------------------------
@@ -2305,21 +2348,20 @@ syslog-alert-router.sh v$VERSION  (dedicated log/alert appliance)
 
 Run with no arguments for an interactive menu. Root-requiring actions elevate
 via sudo automatically; prerequisites (syslog-ng-core, python3, python3-yaml,
-cron, openssl, ca-certificates, msmtp) are installed on first install.
+cron, openssl, ca-certificates, postfix) are installed on first install.
 
-This script OWNS syslog-ng on this box: it writes $SYSLOGNG_CONF with its own
-listeners (UDP/TCP 514, TLS 6514, local) and a per-host archive under
-$ARCHIVE_DIR, plus the alert pipeline in $FRAGMENT.
+This script OWNS syslog-ng and Postfix on this box. syslog-ng listens on UDP/TCP
+514, TLS 6514, and local; Postfix listens on SMTP 25 and relays mail from RFC
+1918 clients out through the default relay (the first SMTP relay in relays.yaml).
 
   (no args) | menu          Interactive menu (default)
   status                    Show install / listener / mailer / relay status
-  install [--relay HOST[:PORT]] [--relay-tls]
-                            Install everything; own syslog-ng; configure msmtp
+  install                   Install everything; own syslog-ng + Postfix
   rules                     Submenu: add/edit alert rules + recipient groups
   relays                    Submenu: add/edit/test SMTP relays + secured creds
+                            (first relay in the order = default + Postfix smarthost)
   mailtest [--relay NAME] ADDR    Send a test email (optionally via one relay)
-  setup-mta [--relay HOST[:PORT]] [--relay-tls]
-                            (Re)configure the msmtp smarthost; prompts for auth
+  setup-mta                 (Re)configure Postfix from settings + the default relay
   regen                     Rebuild base config + filter from alerts.yaml; reload
   test "<msg>" [program]    Dry-run classification + rendered email (no send)
   check                     Validate the YAML config
@@ -2327,9 +2369,8 @@ $ARCHIVE_DIR, plus the alert pipeline in $FRAGMENT.
   uninstall                 Remove code + fragment + cron (keeps config/secrets/DB)
   version | help
 
-Listeners are set under settings: in $ALERTS
-  (listen_udp / listen_tcp / listen_tls ports, listen_local true|false) and the
-  msmtp smarthost (smarthost / smarthost_port / smarthost_tls / smarthost_user).
+Listeners + relay posture are set under settings: in $ALERTS
+  (listen_udp/tcp/tls, listen_local, smtp_relay_enable, relay_networks).
 Credentials live in $SECRETS/<name>.pw (0600); YAML holds only references.
 EOF
 }
@@ -2343,7 +2384,6 @@ main() {
       --install-deps) INSTALL_DEPS=1;;
       --relay)        RELAY="${2:-}"; shift;;
       --relay=*)      RELAY="${1#*=}";;
-      --relay-tls)    RELAY_TLS=1;;
       *)              positional+=("$1");;
     esac
     shift
