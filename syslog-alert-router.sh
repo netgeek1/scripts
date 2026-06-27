@@ -29,7 +29,7 @@
 # Version: 2.0.0
 #
 set -euo pipefail
-VERSION="2.5.0"
+VERSION="2.5.1"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -103,26 +103,49 @@ write_if_missing() {  # write_if_missing <dest> <mode>  (content on stdin) -- ne
 
 validate_syslogng() { syslog-ng -s 2>/dev/null || syslog-ng --syntax-only; }
 
-reload_syslogng() {
-  if command -v syslog-ngctl >/dev/null 2>&1; then info "Reloading via syslog-ngctl"; syslog-ngctl reload
-  elif command -v systemctl >/dev/null 2>&1; then info "Reloading via systemctl"; systemctl reload syslog-ng 2>/dev/null || systemctl restart syslog-ng
-  else warn "Reload syslog-ng manually."; fi
+_syslogng_journal() {
+  command -v journalctl >/dev/null 2>&1 || return 0
+  err "Recent syslog-ng log:"
+  journalctl -xeu syslog-ng.service --no-pager -n 20 2>/dev/null | sed 's/^/    /' || true
 }
 
-# syslog-ng keeps program() destination children alive across a 'reload', so an
-# updated dispatcher is only picked up on a real restart. Use this after code
-# changes; reload_syslogng is fine for filter-only changes.
+# Graceful config reload (for filter-only changes). Returns non-zero on failure
+# and does NOT escalate to a restart, so a working daemon is never taken down.
+reload_syslogng() {
+  if command -v syslog-ng-ctl >/dev/null 2>&1; then
+    info "Reloading syslog-ng (syslog-ng-ctl reload)"
+    if syslog-ng-ctl reload; then return 0; fi
+    warn "syslog-ng-ctl reload failed."
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    info "Reloading syslog-ng (systemctl reload)"
+    if systemctl reload syslog-ng; then return 0; fi
+    err "syslog-ng reload FAILED. The previous config is likely still running."
+    _syslogng_journal
+    return 1
+  fi
+  warn "No reload mechanism found; reload syslog-ng manually."
+  return 1
+}
+
+# Full restart (needed after dispatcher code changes, since syslog-ng keeps
+# program() children across a reload). Verifies the service comes back.
 restart_syslogng() {
   if command -v systemctl >/dev/null 2>&1; then
     info "Restarting syslog-ng (loads updated dispatcher code)"
-    systemctl restart syslog-ng
-  elif command -v syslog-ngctl >/dev/null 2>&1; then
+    if systemctl restart syslog-ng && systemctl is-active --quiet syslog-ng; then
+      return 0
+    fi
+    err "syslog-ng FAILED to restart and may be down."
+    _syslogng_journal
+    return 1
+  elif command -v syslog-ng-ctl >/dev/null 2>&1; then
     info "Reloading syslog-ng and respawning dispatcher"
-    syslog-ngctl reload
-    pkill -f "$DISPATCH" 2>/dev/null || true   # syslog-ng respawns the program() child
-  else
-    warn "Restart syslog-ng manually so the dispatcher loads the new code."
+    syslog-ng-ctl reload && pkill -f "$DISPATCH" 2>/dev/null || true
+    return 0
   fi
+  warn "Restart syslog-ng manually so the dispatcher loads the new code."
+  return 1
 }
 
 ensure_secrets_dir() {
@@ -177,7 +200,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -1718,8 +1741,12 @@ cmd_install() {
   python3 "$DISPATCH" --check || die "Config failed validation; aborting before touching syslog-ng."
   generate_fragment
   install_cron
-  restart_syslogng
-  info "Install complete (v$VERSION)."
+  if restart_syslogng; then
+    info "Install complete (v$VERSION)."
+  else
+    err "Install wrote all files, but syslog-ng failed to restart — see the log above."
+    err "Recover with: systemctl status syslog-ng ; journalctl -xeu syslog-ng"
+  fi
   if [ "$MTA_MISSING" = "1" ]; then
     cat <<EOF
 
@@ -2044,8 +2071,14 @@ cmd_regen() {
   preflight
   [ -e "$ALERTS" ] || die "No $ALERTS (run 'install' first)."
   python3 "$DISPATCH" --check || die "Config invalid; not regenerating."
-  generate_fragment; reload_syslogng
-  info "Filter regenerated and syslog-ng reloaded."
+  generate_fragment
+  if reload_syslogng; then
+    info "Filter regenerated and syslog-ng reloaded."
+  else
+    err "Filter was regenerated and validated, but syslog-ng did NOT reload."
+    err "Check: systemctl status syslog-ng ; journalctl -xeu syslog-ng"
+    return 1
+  fi
 }
 
 cmd_test() {
