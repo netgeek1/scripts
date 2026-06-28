@@ -31,7 +31,7 @@
 #   /etc/cron.d/alert-sweeper
 #
 set -euo pipefail
-VERSION="3.1.3"
+VERSION="3.2.0"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -347,7 +347,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "3.1.3"
+__version__ = "3.2.0"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -369,6 +369,7 @@ DEFAULT_SETTINGS = {
     "subject_max": 200,
     "body_max": 16000,
     "send_timeout": 20,
+    "match_mode": "first",        # "first" = one rule per line; "all" = every match
 }
 
 DURATION_KEYS = ("dedup_window_sec", "digest_interval_sec", "active_grace_sec",
@@ -414,7 +415,7 @@ def load_template(base, ext):
 
 class Alert:
     __slots__ = ("name", "rx", "program", "template", "recipients", "severity",
-                 "subject", "dedup_window", "digest", "escalation_after",
+                 "subject", "dedup_window", "digest", "stop", "escalation_after",
                  "escalation_group", "dedup_key", "relay_chain")
 
     def __init__(self, name, a, settings):
@@ -431,6 +432,7 @@ class Alert:
         self.dedup_window = parse_duration(a["dedup_window"]) if "dedup_window" in a \
             else settings["dedup_window_sec"]
         self.digest = bool(a.get("digest", False))
+        self.stop = bool(a.get("stop", False))
         self.escalation_after = parse_duration(a["escalation_after"]) if a.get("escalation_after") else None
         self.escalation_group = a.get("escalation_group")
         self.dedup_key = re.compile(a["dedup_key"]) if a.get("dedup_key") else None
@@ -694,13 +696,19 @@ import alertlib as A  # noqa: E402
 LOG_FILE = os.environ.get("ALERT_DISPATCH_LOG", "/var/log/alerts/dispatcher.log")
 
 
-def classify(alerts, program, message):
+def matches(alerts, program, message, mode="first"):
+    """Return the alerts this line matches. In 'first' mode, at most one (the
+    earliest in alerts.yaml order). In 'all' mode, every match in order, but an
+    alert with stop:true halts evaluation after it (firewall-style)."""
+    out = []
     for al in alerts:
         if al.program and not al.program.search(program or ""):
             continue
         if al.rx.search(message):
-            return al
-    return None
+            out.append(al)
+            if mode == "first" or getattr(al, "stop", False):
+                break
+    return out
 
 
 def build_ctx(al, t, host, program, message, count):
@@ -740,10 +748,7 @@ def deliver(settings, groups, al, ctx, suppressed, log, relays, order):
     return ok
 
 
-def handle(con, settings, groups, alerts, log, t, host, program, message, relays, order):
-    al = classify(alerts, program, message)
-    if al is None:
-        return
+def process_one(con, settings, groups, al, log, t, host, program, message, relays, order):
     now = int(time.time())
     sig = al.signature(host, message)
     cur = con.cursor()
@@ -789,6 +794,12 @@ def handle(con, settings, groups, alerts, log, t, host, program, message, relays
     deliver(settings, groups, al, ctx, suppressed, log, relays, order)
     cur.execute("UPDATE dedup SET last_sent=?, count=0 WHERE signature=?", (now, sig))
     con.commit()
+
+
+def handle(con, settings, groups, alerts, log, t, host, program, message, relays, order):
+    mode = str(settings.get("match_mode", "first")).lower()
+    for al in matches(alerts, program, message, mode):
+        process_one(con, settings, groups, al, log, t, host, program, message, relays, order)
 
 
 def parse_line(raw):
@@ -874,24 +885,30 @@ def main(argv=None):
     if args.test is not None:
         settings, alerts, groups = A.load_config()
         order, relays = A.load_relays()
-        al = classify(alerts, args.program, args.test)
-        if al is None:
+        mode = str(settings.get("match_mode", "first")).lower()
+        ms = matches(alerts, args.program, args.test, mode)
+        if not ms:
             print("NO MATCH (event would be ignored)")
             return 3
-        ctx = build_ctx(al, time.strftime("%Y-%m-%dT%H:%M:%S"),
-                        args.host, args.program, args.test, 1)
-        subject = A.hdr_safe(A.render(al.subject, ctx), settings["subject_max"])
-        text, html_body = render_bodies(al, ctx, 0)
-        to = A.resolve_recipients(al.recipients, groups)
-        chain = al.relay_chain or order or ["local-sendmail"]
-        print("MATCH alert : %s (severity=%s, digest=%s)" % (al.name, al.severity, al.digest))
-        print("To          : %s" % ", ".join(to))
-        print("Relay chain : %s" % " -> ".join(chain))
-        print("Subject     : %s" % subject)
-        print("--- text ---\n%s" % text, end="")
-        print("------------")
-        if html_body:
-            print("(HTML alternative: %d bytes)" % len(html_body))
+        print("match_mode=%s -> %d rule(s) matched%s\n"
+              % (mode, len(ms), "" if mode == "all" or len(ms) == 1
+                 else " (only the first fires; set match_mode: all for more)"))
+        for al in ms:
+            ctx = build_ctx(al, time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            args.host, args.program, args.test, 1)
+            subject = A.hdr_safe(A.render(al.subject, ctx), settings["subject_max"])
+            text, html_body = render_bodies(al, ctx, 0)
+            to = A.resolve_recipients(al.recipients, groups)
+            chain = al.relay_chain or order or ["local-sendmail"]
+            print("MATCH alert : %s (severity=%s, digest=%s%s)"
+                  % (al.name, al.severity, al.digest, ", stop" if al.stop else ""))
+            print("To          : %s" % ", ".join(to))
+            print("Relay chain : %s" % " -> ".join(chain))
+            print("Subject     : %s" % subject)
+            print("--- text ---\n%s------------" % text)
+            if html_body:
+                print("(HTML alternative: %d bytes)" % len(html_body))
+            print()
         return 0
 
     log = A.setup_logging(LOG_FILE, os.environ.get("ALERT_LOG_LEVEL", "INFO"))
@@ -1384,6 +1401,8 @@ def cmd_alerts(a):
     for name, x in al.items():
         relay = x.get("relay") or (",".join(x["relays"]) if x.get("relays") else "(default order)")
         extra = " digest" if x.get("digest") else ""
+        if x.get("stop"):
+            extra += " stop"
         if x.get("escalation_after"):
             extra += " escalate->%s@%s" % (x.get("escalation_group"), x.get("escalation_after"))
         print("  %-16s sev=%-8s -> %s  relay=%s%s"
@@ -1446,6 +1465,10 @@ def cmd_alert_set(a):
         x.pop("digest", None)
         if a.digest == "true":
             x["digest"] = True
+    if a.stop is not None:
+        x.pop("stop", None)
+        if a.stop == "true":
+            x["stop"] = True
     if a.escalation_after is not None:
         x.pop("escalation_after", None)
         x.pop("escalation_group", None)
@@ -1520,6 +1543,7 @@ def main(argv=None):
     s.add_argument("--program")
     s.add_argument("--dedup-window", dest="dedup_window")
     s.add_argument("--digest", choices=["true", "false"])
+    s.add_argument("--stop", choices=["true", "false"])
     s.add_argument("--escalation-after", dest="escalation_after")
     s.add_argument("--escalation-group", dest="escalation_group")
     s = sub.add_parser("alert-del"); s.add_argument("name")
@@ -1572,6 +1596,11 @@ settings:
   digest_interval_sec: 1h
   active_grace_sec: 15m
   prune_after_sec: 7d
+
+  # How many rules a single log line may fire:
+  #   first = stop at the first matching rule (rules are tried in file order)
+  #   all   = fire every matching rule (a rule with 'stop: true' halts the rest)
+  match_mode: first
 
   # --- syslog-ng listeners (this box owns them; re-run 'install' after edits) ---
   listen_udp: 514          # 0/false to disable
@@ -2255,7 +2284,7 @@ _hint() {  # _hint "label" "csv"
 }
 
 _menu_alert_add() {
-  local name regex sev rcp relay tpl dig esc escg args
+  local name regex sev rcp relay tpl dig stp esc escg args
   printf 'alert name (e.g. DISK_FULL)> '; read -r name
   [ -n "$name" ] || { echo "cancelled"; return 0; }
   case "$name" in *[!A-Za-z0-9_.-]*) echo "invalid name: letters/digits/_/./- only"; return 0;; esac
@@ -2268,6 +2297,7 @@ _menu_alert_add() {
   _hint "available templates" "$(_templates_csv)"
   printf 'template base name (blank = keep)> '; read -r tpl
   printf 'digest only? [y/n, blank = keep]> '; read -r dig
+  printf 'stop after this rule fires (only matters in match_mode: all)? [y/n, blank = keep]> '; read -r stp
   printf 'escalate after, e.g. 4h (blank = keep, "none" = clear)> '; read -r esc
   args=(alert-set --name "$name")
   [ -n "$regex" ] && args+=(--regex "$regex")
@@ -2278,6 +2308,7 @@ _menu_alert_add() {
   fi
   [ -n "$tpl" ] && args+=(--template "$tpl")
   case "$dig" in y|Y) args+=(--digest true);; n|N) args+=(--digest false);; esac
+  case "$stp" in y|Y) args+=(--stop true);; n|N) args+=(--stop false);; esac
   if [ -n "$esc" ]; then
     if [ "$esc" = "none" ]; then args+=(--escalation-after "")
     else args+=(--escalation-after "$esc")
