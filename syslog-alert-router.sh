@@ -31,7 +31,7 @@
 #   /etc/cron.d/alert-sweeper
 #
 set -euo pipefail
-VERSION="3.4.0"
+VERSION="3.4.1"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -54,7 +54,7 @@ SYSLOGNG_CONF="${SYSLOGNG_CONF:-/etc/syslog-ng/syslog-ng.conf}"
 CONFD="${CONFD:-/etc/syslog-ng/conf.d}"
 FRAGMENT="${FRAGMENT:-$CONFD/10-alert-router.conf}"
 TLSDIR="${TLSDIR:-/etc/alerts/tls}"
-ARCHIVE_DIR="${ARCHIVE_DIR:-/var/log/remote}"
+ARCHIVE_DIR="${ARCHIVE_DIR:-/logs}"
 CRON="${CRON:-/etc/cron.d/alert-sweeper}"
 INSTALL_DEPS="${INSTALL_DEPS:-0}"
 RELAY="${RELAY:-}"            # relay NAME for 'mailtest --relay NAME'
@@ -240,17 +240,17 @@ if local:
 o.append("")
 if asbool(s.get("archive_enable"), True):
     a_root = (s.get("archive_root") or arch).rstrip("/")
-    a_sub = s.get("archive_subpath") or "$R_YEAR/$R_MONTH/$R_DAY/$HOST/$R_HOUR-syslog.log"
+    a_sub = s.get("archive_subpath") or "$YEAR/$MONTH/$DAY/$HOST/$HOUR-syslog.log"
     a_tpl = s.get("archive_template")
     if a_tpl is None:
         a_tpl = "slogtime=$ISODATE host=$HOST $MESSAGE\\n"   # default line format
     elif a_tpl in ("", "default", "raw"):
         a_tpl = None                                          # syslog-ng native format
     a_perm = s.get("archive_perm");  a_perm = "0644" if a_perm is None else a_perm
-    a_dperm = s.get("archive_dir_perm"); a_dperm = "0755" if a_dperm is None else a_dperm
-    a_owner = s.get("archive_owner")
-    a_group = s.get("archive_group")
-    a_fifo = s.get("archive_fifo_size")
+    a_dperm = s.get("archive_dir_perm"); a_dperm = "0775" if a_dperm is None else a_dperm
+    a_owner = s.get("archive_owner"); a_owner = "root" if a_owner is None else a_owner
+    a_group = s.get("archive_group"); a_group = "root" if a_group is None else a_group
+    a_fifo = s.get("archive_fifo_size"); a_fifo = "10" if a_fifo is None else a_fifo
     opts = ['    create-dirs(yes)']
     if a_tpl:
         opts.append('    template("%s") template-escape(no)' % a_tpl)
@@ -292,7 +292,7 @@ PYBASE
 write_logmaint() {
   local root comp del syms
   root="$(_settings_get archive_root)"; root="${root:-$ARCHIVE_DIR}"; root="${root%/}"
-  comp="$(_settings_get archive_compress_after_days)"; comp="${comp:-7}"
+  comp="$(_settings_get archive_compress_after_days)"; comp="${comp:-1}"
   del="$(_settings_get archive_delete_after_days)";   del="${del:-90}"
   syms="$(_settings_get archive_symlinks)"
   case "$syms" in ""|1|true|True|yes|Yes|on|On) syms=true;; *) syms=false;; esac
@@ -435,7 +435,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "3.4.0"
+__version__ = "3.4.1"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -1753,21 +1753,21 @@ settings:
   relay_networks: '127.0.0.0/8,[::1]/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
 
   # --- received-log archive (the box's log-server role) ---
-  # Defaults (when a key is omitted) make this a full log server:
-  #   <root>/$R_YEAR/$R_MONTH/$R_DAY/$HOST/$R_HOUR-syslog.log
-  #   line format "slogtime=$ISODATE host=$HOST $MESSAGE", perm 0644 / dir 0755,
-  #   today/yesterday symlinks on, gzip after 7 days, delete after 90.
+  # Defaults (when a key is omitted) reproduce the standard log-server scheme:
+  #   /logs/$YEAR/$MONTH/$DAY/$HOST/$HOUR-syslog.log
+  #   line format "slogtime=$ISODATE host=$HOST $MESSAGE", perm 0644 / dir 0775,
+  #   log_fifo_size 10, today/yesterday symlinks on, gzip after 1 day, delete 90.
   # Configure interactively from the menu (9) or set keys here.
   archive_enable: true
-  archive_root: /var/log/remote
-  archive_subpath: '$R_YEAR/$R_MONTH/$R_DAY/$HOST/$R_HOUR-syslog.log'
+  archive_root: /logs
+  archive_subpath: '$YEAR/$MONTH/$DAY/$HOST/$HOUR-syslog.log'
   archive_template: 'slogtime=$ISODATE host=$HOST $MESSAGE\n'   # 'default' = native format
   archive_perm: '0644'
-  archive_dir_perm: '0755'
-  archive_owner: ''
-  archive_group: ''
-  archive_fifo_size: ''            # e.g. 10
-  archive_compress_after_days: 7   # gzip *.log older than this (cron, daily)
+  archive_dir_perm: '0775'
+  archive_owner: 'root'
+  archive_group: 'root'
+  archive_fifo_size: '10'
+  archive_compress_after_days: 1   # gzip *.log older than this (cron, daily)
   archive_delete_after_days: 90    # rm *.log.gz older than this
   archive_symlinks: true           # maintain <root>/today and <root>/yesterday
 
@@ -2490,12 +2490,12 @@ _menu_archive() {
   while :; do
     echo
     echo "============== Log Archive + Retention =============="
-    printf '  root:          %s\n' "$(_arch_show archive_root /var/log/remote)"
-    printf '  subpath:       %s\n' "$(_arch_show archive_subpath '$R_YEAR/$R_MONTH/$R_DAY/$HOST/$R_HOUR-syslog.log')"
+    printf '  root:          %s\n' "$(_arch_show archive_root /logs)"
+    printf '  subpath:       %s\n' "$(_arch_show archive_subpath '$YEAR/$MONTH/$DAY/$HOST/$HOUR-syslog.log')"
     printf '  template:      %s\n' "$(_arch_show archive_template 'slogtime=$ISODATE host=$HOST $MESSAGE\n')"
-    printf '  perm / dir:    %s / %s\n' "$(_arch_show archive_perm 0644)" "$(_arch_show archive_dir_perm 0755)"
+    printf '  perm / dir:    %s / %s\n' "$(_arch_show archive_perm 0644)" "$(_arch_show archive_dir_perm 0775)"
     printf '  symlinks:      %s\n' "$(_arch_show archive_symlinks true)"
-    printf '  gzip > days:   %s     delete > days: %s\n' "$(_arch_show archive_compress_after_days 7)" "$(_arch_show archive_delete_after_days 90)"
+    printf '  gzip > days:   %s     delete > days: %s\n' "$(_arch_show archive_compress_after_days 1)" "$(_arch_show archive_delete_after_days 90)"
     printf '  headerless:    facility=%s priority=%s\n' "$(_arch_show headerless_facility '(none)')" "$(_arch_show headerless_priority '(none)')"
     echo "-----------------------------------------------------"
     echo "  r) root        p) subpath      t) template"
