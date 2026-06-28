@@ -31,7 +31,7 @@
 #   /etc/cron.d/alert-sweeper
 #
 set -euo pipefail
-VERSION="3.3.0"
+VERSION="3.4.0"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -240,10 +240,14 @@ if local:
 o.append("")
 if asbool(s.get("archive_enable"), True):
     a_root = (s.get("archive_root") or arch).rstrip("/")
-    a_sub = s.get("archive_subpath") or "$HOST/$R_YEAR-$R_MONTH-$R_DAY.log"
+    a_sub = s.get("archive_subpath") or "$R_YEAR/$R_MONTH/$R_DAY/$HOST/$R_HOUR-syslog.log"
     a_tpl = s.get("archive_template")
-    a_perm = s.get("archive_perm")
-    a_dperm = s.get("archive_dir_perm")
+    if a_tpl is None:
+        a_tpl = "slogtime=$ISODATE host=$HOST $MESSAGE\\n"   # default line format
+    elif a_tpl in ("", "default", "raw"):
+        a_tpl = None                                          # syslog-ng native format
+    a_perm = s.get("archive_perm");  a_perm = "0644" if a_perm is None else a_perm
+    a_dperm = s.get("archive_dir_perm"); a_dperm = "0755" if a_dperm is None else a_dperm
     a_owner = s.get("archive_owner")
     a_group = s.get("archive_group")
     a_fifo = s.get("archive_fifo_size")
@@ -291,7 +295,7 @@ write_logmaint() {
   comp="$(_settings_get archive_compress_after_days)"; comp="${comp:-7}"
   del="$(_settings_get archive_delete_after_days)";   del="${del:-90}"
   syms="$(_settings_get archive_symlinks)"
-  case "$syms" in 1|true|True|yes|Yes|on|On) syms=true;; *) syms=false;; esac
+  case "$syms" in ""|1|true|True|yes|Yes|on|On) syms=true;; *) syms=false;; esac
   info "Writing log-maintenance script + cron (compress >${comp}d, delete >${del}d, symlinks=$syms)"
   {
     echo '#!/bin/sh'
@@ -431,7 +435,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -1594,6 +1598,19 @@ def cmd_alert_order(a):
     return 0
 
 
+def cmd_setting(a):
+    """Get (no value) or set a single key under settings: in alerts.yaml."""
+    d = _alerts_doc()
+    if a.value is None:
+        v = d["settings"].get(a.key)
+        print("" if v is None else v)
+        return 0
+    d["settings"][a.key] = a.value
+    _save(A.ALERTS_YAML, d, ALERTS_HEADER)
+    print("%s = %s" % (a.key, a.value))
+    return 0
+
+
 def cmd_match_mode(a):
     """Show (no arg) or set the global match_mode in alerts.yaml settings."""
     d = _alerts_doc()
@@ -1665,6 +1682,7 @@ def main(argv=None):
     s = sub.add_parser("alert-del"); s.add_argument("name")
     s = sub.add_parser("order"); s.add_argument("order")
     s = sub.add_parser("match-mode"); s.add_argument("value", nargs="?")
+    s = sub.add_parser("setting"); s.add_argument("key"); s.add_argument("value", nargs="?")
     sub.add_parser("groups")
     s = sub.add_parser("group-set"); s.add_argument("--name", required=True); s.add_argument("--emails", required=True)
     s = sub.add_parser("group-del"); s.add_argument("name")
@@ -1672,6 +1690,7 @@ def main(argv=None):
     return {
         "alerts": cmd_alerts, "alert-show": cmd_alert_show, "alert-set": cmd_alert_set,
         "alert-del": cmd_alert_del, "order": cmd_alert_order, "match-mode": cmd_match_mode,
+        "setting": cmd_setting,
         "groups": cmd_groups, "group-set": cmd_group_set, "group-del": cmd_group_del,
     }[a.cmd](a)
 
@@ -1734,26 +1753,23 @@ settings:
   relay_networks: '127.0.0.0/8,[::1]/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
 
   # --- received-log archive (the box's log-server role) ---
-  # Defaults: /var/log/remote/<host>/<date>.log, syslog-ng's default line format.
-  # To reproduce a classic /logs/YEAR/MONTH/DAY/HOST/HOUR scheme, set e.g.:
-  #   archive_root: /logs
-  #   archive_subpath: '$YEAR/$MONTH/$DAY/$HOST/$HOUR-syslog.log'
-  #   archive_template: 'slogtime=$ISODATE host=$HOST $MESSAGE\n'
-  #   archive_perm: '0644'
-  #   archive_dir_perm: '0775'
-  #   archive_symlinks: true        # maintain <root>/today and <root>/yesterday
+  # Defaults (when a key is omitted) make this a full log server:
+  #   <root>/$R_YEAR/$R_MONTH/$R_DAY/$HOST/$R_HOUR-syslog.log
+  #   line format "slogtime=$ISODATE host=$HOST $MESSAGE", perm 0644 / dir 0755,
+  #   today/yesterday symlinks on, gzip after 7 days, delete after 90.
+  # Configure interactively from the menu (9) or set keys here.
   archive_enable: true
   archive_root: /var/log/remote
-  archive_subpath: '$HOST/$R_YEAR-$R_MONTH-$R_DAY.log'
-  archive_template: ''              # blank = syslog-ng default format
-  archive_perm: ''                 # blank = default; e.g. '0644'
-  archive_dir_perm: ''             # e.g. '0755'
+  archive_subpath: '$R_YEAR/$R_MONTH/$R_DAY/$HOST/$R_HOUR-syslog.log'
+  archive_template: 'slogtime=$ISODATE host=$HOST $MESSAGE\n'   # 'default' = native format
+  archive_perm: '0644'
+  archive_dir_perm: '0755'
   archive_owner: ''
   archive_group: ''
   archive_fifo_size: ''            # e.g. 10
   archive_compress_after_days: 7   # gzip *.log older than this (cron, daily)
   archive_delete_after_days: 90    # rm *.log.gz older than this
-  archive_symlinks: false          # today/yesterday symlinks (needs a date-first subpath)
+  archive_symlinks: true           # maintain <root>/today and <root>/yesterday
 
   # Tag messages that arrive without a valid syslog header (blank = leave as-is):
   headerless_facility: ''          # e.g. syslog
@@ -2464,6 +2480,53 @@ _menu_alert_add() {
   python3 "$ALERTRULES" "${args[@]}"
 }
 
+_arch_show() {  # key default-label
+  local v; v="$(python3 "$ALERTRULES" setting "$1" 2>/dev/null)"
+  if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s [default]' "$2"; fi
+}
+
+_menu_archive() {
+  local changed=0 v
+  while :; do
+    echo
+    echo "============== Log Archive + Retention =============="
+    printf '  root:          %s\n' "$(_arch_show archive_root /var/log/remote)"
+    printf '  subpath:       %s\n' "$(_arch_show archive_subpath '$R_YEAR/$R_MONTH/$R_DAY/$HOST/$R_HOUR-syslog.log')"
+    printf '  template:      %s\n' "$(_arch_show archive_template 'slogtime=$ISODATE host=$HOST $MESSAGE\n')"
+    printf '  perm / dir:    %s / %s\n' "$(_arch_show archive_perm 0644)" "$(_arch_show archive_dir_perm 0755)"
+    printf '  symlinks:      %s\n' "$(_arch_show archive_symlinks true)"
+    printf '  gzip > days:   %s     delete > days: %s\n' "$(_arch_show archive_compress_after_days 7)" "$(_arch_show archive_delete_after_days 90)"
+    printf '  headerless:    facility=%s priority=%s\n' "$(_arch_show headerless_facility '(none)')" "$(_arch_show headerless_priority '(none)')"
+    echo "-----------------------------------------------------"
+    echo "  r) root        p) subpath      t) template"
+    echo "  m) perms       y) symlinks     c) retention"
+    echo "  h) headerless  q) done (apply + regen)"
+    printf 'choose> '; read -r k
+    case "$k" in
+      r) printf 'archive root> '; read -r v; [ -n "$v" ] && { python3 "$ALERTRULES" setting archive_root "$v" && changed=1; };;
+      p) printf 'subpath (under root)> '; read -r v; [ -n "$v" ] && { python3 "$ALERTRULES" setting archive_subpath "$v" && changed=1; };;
+      t) echo "syslog-ng template; macros like \$ISODATE \$HOST \$MESSAGE. Type 'default' for native format."
+         printf 'template> '; read -r v; [ -n "$v" ] && { python3 "$ALERTRULES" setting archive_template "$v" && changed=1; };;
+      m) printf 'file perm [e.g. 0644]> '; read -r v; [ -n "$v" ] && { python3 "$ALERTRULES" setting archive_perm "$v" && changed=1; }
+         printf 'dir perm  [e.g. 0755]> '; read -r v; [ -n "$v" ] && { python3 "$ALERTRULES" setting archive_dir_perm "$v" && changed=1; };;
+      y) printf 'maintain today/yesterday symlinks? [y/n]> '; read -r v
+         case "$v" in y|Y) python3 "$ALERTRULES" setting archive_symlinks true && changed=1;;
+                      n|N) python3 "$ALERTRULES" setting archive_symlinks false && changed=1;; esac;;
+      c) printf 'gzip *.log older than N days> '; read -r v; [ -n "$v" ] && { python3 "$ALERTRULES" setting archive_compress_after_days "$v" && changed=1; }
+         printf 'delete *.log.gz older than N days> '; read -r v; [ -n "$v" ] && { python3 "$ALERTRULES" setting archive_delete_after_days "$v" && changed=1; };;
+      h) printf 'headerless facility [blank = none, e.g. syslog]> '; read -r v; python3 "$ALERTRULES" setting headerless_facility "$v" && changed=1
+         printf 'headerless priority [blank = none, e.g. emerg]> '; read -r v; python3 "$ALERTRULES" setting headerless_priority "$v" && changed=1;;
+      q|Q|"") break;;
+      *) echo "unknown option";;
+    esac
+  done
+  if [ "$changed" = 1 ]; then
+    echo "Applying: regenerating base config + maintenance and reloading..."
+    cmd_regen || true
+  fi
+  _pause
+}
+
 _menu_match_mode() {
   local cur mm
   cur="$(python3 "$ALERTRULES" match-mode 2>/dev/null)"
@@ -2619,8 +2682,9 @@ cmd_menu() {
   1) Install / update everything       6) Validate configuration
   2) Manage alert rules + recipients   7) Regenerate filter + base config
   3) Manage relays + credentials       8) Configure mail relay (Postfix/smarthost)
-  4) Send a test email                 9) Run sweep now (escalate/digest)
-  5) Dry-run a rule (sample log line)  u) Uninstall    q) Quit
+  4) Send a test email                 9) Configure log archive + retention
+  5) Dry-run a rule (sample log line) 10) Run sweep now (escalate/digest)
+                                       u) Uninstall    q) Quit
 ----------------------------------------------------------------------
 MENU
     printf 'choose> '; read -r c || break
@@ -2633,7 +2697,8 @@ MENU
       6) cmd_check || true; _pause;;
       7) cmd_regen || true; _pause;;
       8) _menu_setup_mta || true; _pause;;
-      9) cmd_sweep || true; _pause;;
+      9) _menu_archive || true;;
+      10) cmd_sweep || true; _pause;;
       u|U) _menu_uninstall || true;;
       q|Q|"") echo "Bye."; break;;
       *) echo "unknown option: $c";;
