@@ -4,6 +4,81 @@ All notable changes to `syslog-alert-router.sh` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [3.2.2] - 2026-06-27
+### Added
+- **Change `match_mode` from the menu.** The rule submenu now shows the active
+  mode in its header (`Alert Rules (match_mode: first)`) and has an `m)` option to
+  switch first/all; also `alert-rules.py match-mode [first|all]`. Other settings
+  in `alerts.yaml` are preserved.
+- The per-rule override (`stop`) was already shown in the rule list and in
+  `s) show alert details`; the header now makes the global mode visible too.
+
+## [3.2.1] - 2026-06-27
+### Added
+- **Reorder alert rules** from the rule submenu (`o`) and via
+  `alert-rules.py order "NAME1,NAME2,..."`, mirroring relay ordering. Rule order
+  is the evaluation order, so this controls which rule wins in `match_mode: first`
+  and where a `stop` rule short-circuits in `match_mode: all`. Listed rules move
+  to the front in the given order; omitted rules keep their relative order at the
+  end, so partial reordering works without retyping everything.
+
+## [3.2.0] - 2026-06-27
+### Added
+- **Multiple-match support.** A single log line can now fire more than one rule.
+  New `settings.match_mode`:
+  - `first` (default, unchanged): stop at the first matching rule, in file order.
+  - `all`: fire every matching rule, each with its own recipients/relay/template
+    and its own dedup signature (so no rule suppresses another).
+- Per-alert **`stop: true`** flag (editable via the rule menu and
+  `alert-rules.py --stop`): in `all` mode, matching this rule halts evaluation of
+  later rules — firewall-style, e.g. to keep a broad catch-all from also firing.
+- `test` (dry-run) now reports the match mode and shows **every** matched rule,
+  not just the first.
+
+## [3.1.3] - 2026-06-27
+### Added
+- Multi-choice prompts now **list the valid options inline**. When adding or
+  editing an alert, the recipient-group, relay, template, and escalation-group
+  prompts show what's defined (e.g. `available groups: ops, storage, security`);
+  the mailtest relay prompt lists relays too. (Relay/group/alert name pickers
+  already showed their lists.)
+
+## [3.1.2] - 2026-06-27
+### Added
+- Dedicated **`/var/log/mail.log`** for Postfix relay activity (the managed
+  syslog-ng config routes the `mail` facility there), so testing/auditing the
+  SMTP relay no longer means grepping `/var/log/syslog`. Shown in `status`.
+
+## [3.1.1] - 2026-06-27
+### Added
+- **Edit relay** in the relay manager (menu `e`, and `alert-relays.py edit`).
+  Changes only the fields you supply and keeps the rest — so you can change a
+  port or security mode without re-entering the host, user, auth, or secret.
+  Previously the only way to change a relay was to re-add it under the same name
+  (which required re-specifying every field).
+
+## [3.1.0] - 2026-06-27
+### Added
+- **Outbound SMTP relay (smarthost).** The box now runs Postfix listening on
+  **SMTP/25**, accepts mail only from **RFC 1918** clients (`mynetworks`, a
+  `permit_mynetworks, reject` client restriction, and `reject_unauth_destination`
+  so it is never an open relay), and forwards everything through the **default
+  relay** — the first SMTP relay in the `relays.yaml` failover order. Point any
+  LAN device's email at this box and it relays out via that relay.
+- Postfix's smarthost (`relayhost`, TLS level, and SASL credentials) is derived
+  from that relay, reusing its host/port/security and its 0600 secret (written to
+  `/etc/postfix/sasl_passwd`, mode 0600). Editing relays in the relay manager
+  re-syncs Postfix automatically on exit.
+- `settings.smtp_relay_enable` (default true; false = sendmail only, no :25
+  listener) and `settings.relay_networks` (default the RFC 1918 ranges).
+- `status` now shows the SMTP relay listener and the active smarthost.
+
+### Changed
+- **Mailer is now Postfix, not msmtp.** msmtp cannot listen, which the relay role
+  requires. Postfix provides `/usr/sbin/sendmail` for the box as before.
+- `setup-mta` (re)configures Postfix from settings + the default relay; the
+  `smarthost*` settings keys are removed (the smarthost lives in `relays.yaml`).
+
 ## [3.0.0] - 2026-06-27
 Major refactor for a **dedicated log/alert appliance** (Ubuntu 24.04 /
 syslog-ng 4.x). The script now owns syslog-ng instead of attaching to an
