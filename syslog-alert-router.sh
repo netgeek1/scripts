@@ -31,7 +31,7 @@
 #   /etc/cron.d/alert-sweeper
 #
 set -euo pipefail
-VERSION="3.2.1"
+VERSION="3.2.2"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -347,7 +347,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "3.2.1"
+__version__ = "3.2.2"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -1510,6 +1510,21 @@ def cmd_alert_order(a):
     return 0
 
 
+def cmd_match_mode(a):
+    """Show (no arg) or set the global match_mode in alerts.yaml settings."""
+    d = _alerts_doc()
+    if not a.value:
+        print(d["settings"].get("match_mode", "first"))
+        return 0
+    if a.value not in ("first", "all"):
+        print("match_mode must be 'first' or 'all'", file=sys.stderr)
+        return 2
+    d["settings"]["match_mode"] = a.value
+    _save(A.ALERTS_YAML, d, ALERTS_HEADER)
+    print("match_mode = %s" % a.value)
+    return 0
+
+
 def cmd_groups(a):
     g = _recip_doc()["groups"]
     if not g:
@@ -1565,14 +1580,15 @@ def main(argv=None):
     s.add_argument("--escalation-group", dest="escalation_group")
     s = sub.add_parser("alert-del"); s.add_argument("name")
     s = sub.add_parser("order"); s.add_argument("order")
+    s = sub.add_parser("match-mode"); s.add_argument("value", nargs="?")
     sub.add_parser("groups")
     s = sub.add_parser("group-set"); s.add_argument("--name", required=True); s.add_argument("--emails", required=True)
     s = sub.add_parser("group-del"); s.add_argument("name")
     a = p.parse_args(argv)
     return {
         "alerts": cmd_alerts, "alert-show": cmd_alert_show, "alert-set": cmd_alert_set,
-        "alert-del": cmd_alert_del, "order": cmd_alert_order, "groups": cmd_groups,
-        "group-set": cmd_group_set, "group-del": cmd_group_del,
+        "alert-del": cmd_alert_del, "order": cmd_alert_order, "match-mode": cmd_match_mode,
+        "groups": cmd_groups, "group-set": cmd_group_set, "group-del": cmd_group_del,
     }[a.cmd](a)
 
 
@@ -2337,6 +2353,16 @@ _menu_alert_add() {
   python3 "$ALERTRULES" "${args[@]}"
 }
 
+_menu_match_mode() {
+  local cur mm
+  cur="$(python3 "$ALERTRULES" match-mode 2>/dev/null)"
+  echo "Current match_mode: ${cur:-first}"
+  echo "  first = one rule per line (first match wins, in rule order)"
+  echo "  all   = every matching rule fires (add 'stop' to a rule to halt the rest)"
+  printf 'set [first/all, blank = keep]> '; read -r mm
+  [ -n "$mm" ] && python3 "$ALERTRULES" match-mode "$mm"
+}
+
 _menu_reorder_rules() {
   local ord
   echo "Current evaluation order:"
@@ -2370,17 +2396,19 @@ cmd_rules() {
   [ -x "$ALERTRULES" ] || die "Not installed; run 'install' first."
   local c changed=0
   while true; do
-    echo; echo "================== Alert Rules =================="
+    local mm; mm="$(python3 "$ALERTRULES" match-mode 2>/dev/null)"
+    echo; echo "========== Alert Rules (match_mode: ${mm:-first}) =========="
     python3 "$ALERTRULES" alerts
     echo "------------------------------------------------"
     echo "  a) add/edit alert   s) show alert details"
     echo "  o) reorder rules    d) delete alert"
-    echo "  g) manage recipient groups   q) done"
+    echo "  m) match mode (first/all)   g) recipient groups   q) done"
     printf 'choose> '; read -r c
     case "$c" in
       a|A) _menu_alert_add && changed=1 || changed=1;;
       s|S) printf 'alert name> '; read -r n; [ -n "${n:-}" ] && { python3 "$ALERTRULES" alert-show "$n" || true; };;
       o|O) _menu_reorder_rules && changed=1 || changed=1;;
+      m|M) _menu_match_mode && changed=1 || changed=1;;
       d|D) printf 'alert name to delete> '; read -r n
            [ -n "${n:-}" ] && { python3 "$ALERTRULES" alert-del "$n" && changed=1 || true; };;
       g|G) _menu_groups || true;;
