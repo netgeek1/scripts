@@ -31,7 +31,7 @@
 #   /etc/cron.d/alert-sweeper
 #
 set -euo pipefail
-VERSION="3.2.0"
+VERSION="3.2.1"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -347,7 +347,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "3.2.0"
+__version__ = "3.2.1"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -1493,6 +1493,23 @@ def cmd_alert_del(a):
     return 1
 
 
+def cmd_alert_order(a):
+    """Reorder alert rules (evaluation order). Listed names move to the front in
+    the given order; any unlisted rules keep their relative order at the end."""
+    d = _alerts_doc()
+    al = d["alerts"]
+    names = [s.strip() for s in a.order.split(",") if s.strip()]
+    unknown = [n for n in names if n not in al]
+    if unknown:
+        print("unknown alert(s): %s" % ", ".join(unknown), file=sys.stderr)
+        return 2
+    new_order = names + [n for n in al if n not in names]
+    d["alerts"] = {n: al[n] for n in new_order}
+    _save(A.ALERTS_YAML, d, ALERTS_HEADER)
+    print("rule order: %s" % ", ".join(new_order))
+    return 0
+
+
 def cmd_groups(a):
     g = _recip_doc()["groups"]
     if not g:
@@ -1547,14 +1564,15 @@ def main(argv=None):
     s.add_argument("--escalation-after", dest="escalation_after")
     s.add_argument("--escalation-group", dest="escalation_group")
     s = sub.add_parser("alert-del"); s.add_argument("name")
+    s = sub.add_parser("order"); s.add_argument("order")
     sub.add_parser("groups")
     s = sub.add_parser("group-set"); s.add_argument("--name", required=True); s.add_argument("--emails", required=True)
     s = sub.add_parser("group-del"); s.add_argument("name")
     a = p.parse_args(argv)
     return {
         "alerts": cmd_alerts, "alert-show": cmd_alert_show, "alert-set": cmd_alert_set,
-        "alert-del": cmd_alert_del, "groups": cmd_groups, "group-set": cmd_group_set,
-        "group-del": cmd_group_del,
+        "alert-del": cmd_alert_del, "order": cmd_alert_order, "groups": cmd_groups,
+        "group-set": cmd_group_set, "group-del": cmd_group_del,
     }[a.cmd](a)
 
 
@@ -2319,6 +2337,15 @@ _menu_alert_add() {
   python3 "$ALERTRULES" "${args[@]}"
 }
 
+_menu_reorder_rules() {
+  local ord
+  echo "Current evaluation order:"
+  python3 "$ALERTRULES" alerts | grep -vE '^      regex:' | sed 's/^/  /'
+  echo "Enter the new order. Rules you omit keep their relative order at the end."
+  printf 'new order (comma-separated alert names)> '; read -r ord
+  [ -n "$ord" ] && python3 "$ALERTRULES" order "$ord"
+}
+
 _menu_groups() {
   local c n em
   while true; do
@@ -2347,12 +2374,13 @@ cmd_rules() {
     python3 "$ALERTRULES" alerts
     echo "------------------------------------------------"
     echo "  a) add/edit alert   s) show alert details"
-    echo "  d) delete alert     g) manage recipient groups"
-    echo "  q) done"
+    echo "  o) reorder rules    d) delete alert"
+    echo "  g) manage recipient groups   q) done"
     printf 'choose> '; read -r c
     case "$c" in
       a|A) _menu_alert_add && changed=1 || changed=1;;
       s|S) printf 'alert name> '; read -r n; [ -n "${n:-}" ] && { python3 "$ALERTRULES" alert-show "$n" || true; };;
+      o|O) _menu_reorder_rules && changed=1 || changed=1;;
       d|D) printf 'alert name to delete> '; read -r n
            [ -n "${n:-}" ] && { python3 "$ALERTRULES" alert-del "$n" && changed=1 || true; };;
       g|G) _menu_groups || true;;
