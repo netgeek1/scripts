@@ -214,6 +214,7 @@ alerts:
 ```
 
 Per-alert keys: `regex` (required), `program` (optional gate on `$PROGRAM`),
+`host` / `host_exclude` (optional regex on the sending `$HOST` — only-fire-if / never-fire-if),
 `severity`, `recipients`, `relay`/`relays`, `template`, `subject`, `digest: true`,
 `stop: true`, `dedup_window`, `dedup_key` (regex with a capture group to split
 dedup, e.g. per source IP), `escalation_after` + `escalation_group`.
