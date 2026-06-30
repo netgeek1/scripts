@@ -59,8 +59,9 @@ Running the script with no arguments prints current status, then this menu:
   1) Install / update everything       6) Validate configuration
   2) Manage alert rules + recipients   7) Regenerate filter + base config
   3) Manage relays + credentials       8) Configure mail relay (Postfix/smarthost)
-  4) Send a test email                 9) Run sweep now (escalate/digest)
-  5) Dry-run a rule (sample log line)  u) Uninstall    q) Quit
+  4) Send a test email                 9) Configure log archive + retention
+  5) Dry-run a rule (sample log line) 10) Run sweep now (escalate/digest)
+                                       u) Uninstall    q) Quit
 ----------------------------------------------------------------------
 ```
 
@@ -74,7 +75,8 @@ Running the script with no arguments prints current status, then this menu:
 | **6) Validate configuration** | Parses `alerts.yaml` / `recipients.yaml` / `relays.yaml` and prints a summary (alert count, groups, relays). Non-zero exit on error. |
 | **7) Regenerate filter + base config** | Rebuilds `syslog-ng.conf` and the alert fragment from `alerts.yaml`, then reloads syslog-ng (graceful, no restart). Use after editing listeners or regex by hand. |
 | **8) Configure mail relay (Postfix/smarthost)** | (Re)configures Postfix from `settings` plus the default relay: listener on :25 for RFC 1918, smarthost = first SMTP relay, TLS and SASL credentials from that relay. |
-| **9) Run sweep now** | Runs the escalation/digest/prune pass immediately instead of waiting for the 5-minute cron. Sends any due escalations and digests. |
+| **9) Configure log archive + retention** | Interactive submenu to set the archive root, subpath, line template, perms, today/yesterday symlinks, gzip/delete retention, and headerless facility/priority. Applies via regen on exit. |
+| **10) Run sweep now** | Runs the escalation/digest/prune pass immediately instead of waiting for the 5-minute cron. Sends any due escalations and digests. |
 | **u) Uninstall** | Removes the code, the alert fragment, and the cron job. Keeps config, secrets, the SQLite database, and the managed `syslog-ng.conf` (so logging keeps working). |
 | **q) Quit** | Exit the menu. |
 
@@ -242,8 +244,12 @@ Managed through the relay submenu (option 3). Holds relay definitions under
 - **Email:** SMTP **25** from any RFC 1918 address — relayed out via the
   smarthost.
 
-All received syslog is archived per host per day under
-`/var/log/remote/<host>/<date>.log`, regardless of whether it matched an alert.
+Received syslog is archived under `/logs/$YEAR/$MONTH/$DAY/$HOST/$HOUR-syslog.log` by default.
+The archive is configurable (`archive_root`, `archive_subpath`, `archive_template`,
+perms, etc.) to reproduce a classic `YEAR/MONTH/DAY/HOST/HOUR` log-server layout, and
+a generated `alert-logmaint.sh` cron handles `today`/`yesterday` symlinks plus gzip
+(`archive_compress_after_days`, default 1) and retention (`archive_delete_after_days`,
+default 90).
 
 ---
 
