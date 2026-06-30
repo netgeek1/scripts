@@ -4,6 +4,15 @@ All notable changes to `syslog-alert-router.sh` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [3.5.0] - 2026-06-27
+### Added
+- **Per-rule host filtering.** Two optional alert keys, both regex matched against
+  the sending host (`$HOST`): `host` (only fire when the host matches) and
+  `host_exclude` (never fire when it matches). Prompted in the rule editor, settable
+  via `alert-rules.py alert-set --host/--host-exclude`, shown in the rule list as
+  `host=~...` / `host!=...`, and testable with `--host` in the dry-run. Use it to,
+  e.g., alert on login/logout from every host except one.
+
 ## [3.4.1] - 2026-06-27
 ### Changed
 - **Archive defaults now reproduce the operator's existing log server exactly**,
