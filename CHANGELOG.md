@@ -4,6 +4,52 @@ All notable changes to `syslog-alert-router.sh` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [3.4.1] - 2026-06-27
+### Changed
+- **Archive defaults now reproduce the operator's existing log server exactly**,
+  rather than an approximation: root `/logs`, message-time path
+  `$YEAR/$MONTH/$DAY/$HOST/$HOUR-syslog.log`, `slogtime=$ISODATE host=$HOST
+  $MESSAGE` template, `perm 0644`, `dir-perm 0775`, `owner/group root`,
+  `log-fifo-size 10`, gzip after 1 day, delete after 90, symlinks on. The
+  generated `d_net_archive` now matches the prior hand-written `remote.conf`
+  (aside from syslog-ng 4.x dash-form option names).
+
+## [3.4.0] - 2026-06-27
+### Changed
+- **Archive defaults are now a full log-server scheme.** When the `archive_*`
+  keys are absent, the box writes
+  `<root>/$R_YEAR/$R_MONTH/$R_DAY/$HOST/$R_HOUR-syslog.log` with a
+  `slogtime=$ISODATE host=$HOST $MESSAGE` line format, perm 0644 / dir 0755,
+  today/yesterday symlinks on, gzip after 7 days, and delete after 90 — instead
+  of the previous bare flat file. Set `archive_template: default` for syslog-ng's
+  native format.
+
+### Added
+- **Menu option 9, "Configure log archive + retention"** — interactively set the
+  root, subpath, line template, perms, symlinks, gzip/delete retention, and
+  headerless facility/priority; applies via regen on exit. (Run sweep moved to 10.)
+- Generic `alert-rules.py setting KEY [VALUE]` to read/write any `settings` key.
+
+## [3.3.0] - 2026-06-27
+### Added
+- **Configurable received-log archive**, so the box can reproduce a classic
+  log-server layout. New `settings`: `archive_root`, `archive_subpath` (e.g.
+  `$YEAR/$MONTH/$DAY/$HOST/$HOUR-syslog.log`), `archive_template` (e.g.
+  `slogtime=$ISODATE host=$HOST $MESSAGE\n`), `archive_perm`, `archive_dir_perm`,
+  `archive_owner`, `archive_group`, `archive_fifo_size`, and `archive_enable`.
+- **Log maintenance** (`/usr/local/bin/alert-logmaint.sh` + `cron.d`), the
+  equivalent of typical loglinks/logclean scripts: daily `today`/`yesterday`
+  symlinks with a "DAY COMPLETE" banner appended to the previous day's files
+  (`archive_symlinks`), gzip of `*.log` older than `archive_compress_after_days`
+  (default 7), and removal of `*.log.gz` older than `archive_delete_after_days`
+  (default 90).
+- **Headerless-message tagging** via `headerless_facility` / `headerless_priority`
+  applied to the network listeners (e.g. `syslog` / `emerg`).
+
+### Notes
+- Defaults keep the prior behavior (`/var/log/remote/<host>/<date>.log`, no
+  symlinks); set the `archive_*` keys to match an existing scheme.
+
 ## [3.2.2] - 2026-06-27
 ### Added
 - **Change `match_mode` from the menu.** The rule submenu now shows the active
