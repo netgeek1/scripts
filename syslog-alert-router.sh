@@ -31,7 +31,7 @@
 #   /etc/cron.d/alert-sweeper
 #
 set -euo pipefail
-VERSION="3.5.0"
+VERSION="3.5.1"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -435,7 +435,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "3.5.0"
+__version__ = "3.5.1"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -502,8 +502,8 @@ def load_template(base, ext):
 
 
 class Alert:
-    __slots__ = ("name", "rx", "program", "host_rx", "host_exclude", "template",
-                 "recipients", "severity",
+    __slots__ = ("name", "rx", "program", "program_exclude", "host_rx", "host_exclude",
+                 "template", "recipients", "severity",
                  "subject", "dedup_window", "digest", "stop", "escalation_after",
                  "escalation_group", "dedup_key", "relay_chain")
 
@@ -511,6 +511,7 @@ class Alert:
         self.name = name
         self.rx = re.compile(a["regex"], re.IGNORECASE)
         self.program = re.compile(a["program"], re.IGNORECASE) if a.get("program") else None
+        self.program_exclude = re.compile(a["program_exclude"], re.IGNORECASE) if a.get("program_exclude") else None
         self.host_rx = re.compile(a["host"], re.IGNORECASE) if a.get("host") else None
         self.host_exclude = re.compile(a["host_exclude"], re.IGNORECASE) if a.get("host_exclude") else None
         tpl = str(a.get("template", name.lower()))
@@ -794,6 +795,8 @@ def matches(alerts, host, program, message, mode="first"):
     out = []
     for al in alerts:
         if al.program and not al.program.search(program or ""):
+            continue
+        if al.program_exclude and al.program_exclude.search(program or ""):
             continue
         if al.host_rx and not al.host_rx.search(host or ""):
             continue
@@ -1498,6 +1501,10 @@ def cmd_alerts(a):
         extra = " digest" if x.get("digest") else ""
         if x.get("stop"):
             extra += " stop"
+        if x.get("program"):
+            extra += " prog=~%s" % x.get("program")
+        if x.get("program_exclude"):
+            extra += " prog!=%s" % x.get("program_exclude")
         if x.get("host"):
             extra += " host=~%s" % x.get("host")
         if x.get("host_exclude"):
@@ -1550,7 +1557,8 @@ def cmd_alert_set(a):
         x.pop("program", None)
         if a.program:
             x["program"] = a.program
-    for fld, val in (("host", a.host), ("host_exclude", a.host_exclude)):
+    for fld, val in (("host", a.host), ("host_exclude", a.host_exclude),
+                     ("program_exclude", a.program_exclude)):
         if val is not None:
             x.pop(fld, None)
             if val:
@@ -1695,6 +1703,7 @@ def main(argv=None):
     s.add_argument("--relay")
     s.add_argument("--template")
     s.add_argument("--program")
+    s.add_argument("--program-exclude")
     s.add_argument("--host")
     s.add_argument("--host-exclude")
     s.add_argument("--dedup-window", dest="dedup_window")
@@ -2468,7 +2477,7 @@ _hint() {  # _hint "label" "csv"
 }
 
 _menu_alert_add() {
-  local name regex sev rcp relay tpl dig stp esc escg args hostinc hostexc
+  local name regex sev rcp relay tpl dig stp esc escg args hostinc hostexc proginc progexc
   printf 'alert name (e.g. DISK_FULL)> '; read -r name
   [ -n "$name" ] || { echo "cancelled"; return 0; }
   case "$name" in *[!A-Za-z0-9_.-]*) echo "invalid name: letters/digits/_/./- only"; return 0;; esac
@@ -2482,6 +2491,8 @@ _menu_alert_add() {
   printf 'template base name (blank = keep)> '; read -r tpl
   printf 'digest only? [y/n, blank = keep]> '; read -r dig
   printf 'stop after this rule fires (only matters in match_mode: all)? [y/n, blank = keep]> '; read -r stp
+  printf 'only alert for program (regex on $PROGRAM; blank = keep, "none" = clear)> '; read -r proginc
+  printf 'exclude program (regex on $PROGRAM; blank = keep, "none" = clear)> '; read -r progexc
   printf 'only alert when sending host matches (regex; blank = keep, "none" = clear)> '; read -r hostinc
   printf 'exclude sending hosts matching (regex; blank = keep, "none" = clear)> '; read -r hostexc
   printf 'escalate after, e.g. 4h (blank = keep, "none" = clear)> '; read -r esc
@@ -2495,6 +2506,8 @@ _menu_alert_add() {
   [ -n "$tpl" ] && args+=(--template "$tpl")
   case "$dig" in y|Y) args+=(--digest true);; n|N) args+=(--digest false);; esac
   case "$stp" in y|Y) args+=(--stop true);; n|N) args+=(--stop false);; esac
+  if [ -n "$proginc" ]; then [ "$proginc" = none ] && args+=(--program "") || args+=(--program "$proginc"); fi
+  if [ -n "$progexc" ]; then [ "$progexc" = none ] && args+=(--program-exclude "") || args+=(--program-exclude "$progexc"); fi
   if [ -n "$hostinc" ]; then [ "$hostinc" = none ] && args+=(--host "") || args+=(--host "$hostinc"); fi
   if [ -n "$hostexc" ]; then [ "$hostexc" = none ] && args+=(--host-exclude "") || args+=(--host-exclude "$hostexc"); fi
   if [ -n "$esc" ]; then
