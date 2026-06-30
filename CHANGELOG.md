@@ -4,6 +4,13 @@ All notable changes to `syslog-alert-router.sh` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [3.5.1] - 2026-06-27
+### Added
+- **`program_exclude`** per-rule key (regex on `$PROGRAM`) to mirror `host_exclude`:
+  the rule fires unless the program matches. Completes the include/exclude pair for
+  both program and host. `program` (include) is now also promptable in the rule
+  editor and both show in the rule list (`prog=~...` / `prog!=...`).
+
 ## [3.5.0] - 2026-06-27
 ### Added
 - **Per-rule host filtering.** Two optional alert keys, both regex matched against
