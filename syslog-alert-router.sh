@@ -31,7 +31,7 @@
 #   /etc/cron.d/alert-sweeper
 #
 set -euo pipefail
-VERSION="3.4.1"
+VERSION="3.5.0"
 
 ORIG_ARGV=("$@")
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -435,7 +435,7 @@ try:
 except ImportError:  # surfaced with a clear message by callers
     yaml = None
 
-__version__ = "3.4.1"
+__version__ = "3.5.0"
 
 CONFIG_DIR = os.environ.get("ALERT_CONFIG_DIR", "/etc/alerts/config")
 TEMPLATE_DIR = os.environ.get("ALERT_TEMPLATE_DIR", "/etc/alerts/templates")
@@ -502,7 +502,8 @@ def load_template(base, ext):
 
 
 class Alert:
-    __slots__ = ("name", "rx", "program", "template", "recipients", "severity",
+    __slots__ = ("name", "rx", "program", "host_rx", "host_exclude", "template",
+                 "recipients", "severity",
                  "subject", "dedup_window", "digest", "stop", "escalation_after",
                  "escalation_group", "dedup_key", "relay_chain")
 
@@ -510,6 +511,8 @@ class Alert:
         self.name = name
         self.rx = re.compile(a["regex"], re.IGNORECASE)
         self.program = re.compile(a["program"], re.IGNORECASE) if a.get("program") else None
+        self.host_rx = re.compile(a["host"], re.IGNORECASE) if a.get("host") else None
+        self.host_exclude = re.compile(a["host_exclude"], re.IGNORECASE) if a.get("host_exclude") else None
         tpl = str(a.get("template", name.lower()))
         if tpl.endswith((".txt", ".html")):
             tpl = tpl.rsplit(".", 1)[0]
@@ -784,13 +787,17 @@ import alertlib as A  # noqa: E402
 LOG_FILE = os.environ.get("ALERT_DISPATCH_LOG", "/var/log/alerts/dispatcher.log")
 
 
-def matches(alerts, program, message, mode="first"):
+def matches(alerts, host, program, message, mode="first"):
     """Return the alerts this line matches. In 'first' mode, at most one (the
     earliest in alerts.yaml order). In 'all' mode, every match in order, but an
     alert with stop:true halts evaluation after it (firewall-style)."""
     out = []
     for al in alerts:
         if al.program and not al.program.search(program or ""):
+            continue
+        if al.host_rx and not al.host_rx.search(host or ""):
+            continue
+        if al.host_exclude and al.host_exclude.search(host or ""):
             continue
         if al.rx.search(message):
             out.append(al)
@@ -886,7 +893,7 @@ def process_one(con, settings, groups, al, log, t, host, program, message, relay
 
 def handle(con, settings, groups, alerts, log, t, host, program, message, relays, order):
     mode = str(settings.get("match_mode", "first")).lower()
-    for al in matches(alerts, program, message, mode):
+    for al in matches(alerts, host, program, message, mode):
         process_one(con, settings, groups, al, log, t, host, program, message, relays, order)
 
 
@@ -974,7 +981,7 @@ def main(argv=None):
         settings, alerts, groups = A.load_config()
         order, relays = A.load_relays()
         mode = str(settings.get("match_mode", "first")).lower()
-        ms = matches(alerts, args.program, args.test, mode)
+        ms = matches(alerts, args.host, args.program, args.test, mode)
         if not ms:
             print("NO MATCH (event would be ignored)")
             return 3
@@ -1491,6 +1498,10 @@ def cmd_alerts(a):
         extra = " digest" if x.get("digest") else ""
         if x.get("stop"):
             extra += " stop"
+        if x.get("host"):
+            extra += " host=~%s" % x.get("host")
+        if x.get("host_exclude"):
+            extra += " host!=%s" % x.get("host_exclude")
         if x.get("escalation_after"):
             extra += " escalate->%s@%s" % (x.get("escalation_group"), x.get("escalation_after"))
         print("  %-16s sev=%-8s -> %s  relay=%s%s"
@@ -1539,6 +1550,16 @@ def cmd_alert_set(a):
         x.pop("program", None)
         if a.program:
             x["program"] = a.program
+    for fld, val in (("host", a.host), ("host_exclude", a.host_exclude)):
+        if val is not None:
+            x.pop(fld, None)
+            if val:
+                try:
+                    re.compile(val)
+                except re.error as e:
+                    print("bad %s regex: %s" % (fld, e), file=sys.stderr)
+                    return 2
+                x[fld] = val
     if a.relay is not None:
         x.pop("relay", None)
         x.pop("relays", None)
@@ -1674,6 +1695,8 @@ def main(argv=None):
     s.add_argument("--relay")
     s.add_argument("--template")
     s.add_argument("--program")
+    s.add_argument("--host")
+    s.add_argument("--host-exclude")
     s.add_argument("--dedup-window", dest="dedup_window")
     s.add_argument("--digest", choices=["true", "false"])
     s.add_argument("--stop", choices=["true", "false"])
@@ -2445,7 +2468,7 @@ _hint() {  # _hint "label" "csv"
 }
 
 _menu_alert_add() {
-  local name regex sev rcp relay tpl dig stp esc escg args
+  local name regex sev rcp relay tpl dig stp esc escg args hostinc hostexc
   printf 'alert name (e.g. DISK_FULL)> '; read -r name
   [ -n "$name" ] || { echo "cancelled"; return 0; }
   case "$name" in *[!A-Za-z0-9_.-]*) echo "invalid name: letters/digits/_/./- only"; return 0;; esac
@@ -2459,6 +2482,8 @@ _menu_alert_add() {
   printf 'template base name (blank = keep)> '; read -r tpl
   printf 'digest only? [y/n, blank = keep]> '; read -r dig
   printf 'stop after this rule fires (only matters in match_mode: all)? [y/n, blank = keep]> '; read -r stp
+  printf 'only alert when sending host matches (regex; blank = keep, "none" = clear)> '; read -r hostinc
+  printf 'exclude sending hosts matching (regex; blank = keep, "none" = clear)> '; read -r hostexc
   printf 'escalate after, e.g. 4h (blank = keep, "none" = clear)> '; read -r esc
   args=(alert-set --name "$name")
   [ -n "$regex" ] && args+=(--regex "$regex")
@@ -2470,6 +2495,8 @@ _menu_alert_add() {
   [ -n "$tpl" ] && args+=(--template "$tpl")
   case "$dig" in y|Y) args+=(--digest true);; n|N) args+=(--digest false);; esac
   case "$stp" in y|Y) args+=(--stop true);; n|N) args+=(--stop false);; esac
+  if [ -n "$hostinc" ]; then [ "$hostinc" = none ] && args+=(--host "") || args+=(--host "$hostinc"); fi
+  if [ -n "$hostexc" ]; then [ "$hostexc" = none ] && args+=(--host-exclude "") || args+=(--host-exclude "$hostexc"); fi
   if [ -n "$esc" ]; then
     if [ "$esc" = "none" ]; then args+=(--escalation-after "")
     else args+=(--escalation-after "$esc")
