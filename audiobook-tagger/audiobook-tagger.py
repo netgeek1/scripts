@@ -12,7 +12,7 @@ state of the fields this tool manages.
 Required:  mutagen
 Optional:  PyYAML (yaml config), rapidfuzz (better matching), Pillow (cover resize)
 
-Author: netgeek1 / certifiedgeeks.net
+Author: netgeek1 / Claude.ai
 License: MIT
 """
 
