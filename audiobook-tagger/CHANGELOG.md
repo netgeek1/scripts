@@ -6,6 +6,26 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.28.0] - 2026-07-21
+
+### Fixed
+- `rename` skipped single-file books entirely (the `total < 2` guard), so a
+  lone `Book.m4b` was never renamed. Single-file books now use
+  `rename_template_single` (default `{title}`).
+- `organize` built its `Author/Series/Book` tree under whatever path it was
+  given, so pointing it at one book folder nested the destination inside the
+  source (`Cannot move a directory into itself`). It now roots the tree at the
+  configured library, or climbs to a safe base, and skips any move whose
+  destination is inside its source.
+- Series titles that reduce to a generic marketing subtitle
+  (`He Who Fights with Monsters 9: A LitRPG Adventure`) no longer lose their
+  real name — the `Series N` form is kept instead of `A LitRPG Adventure`.
+
+### Added
+- `rename_template_single` for single-file books.
+
+---
+
 ## [1.27.0] - 2026-07-21
 
 ### Fixed
