@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.27.0
+audiobook-tagger 1.28.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -12,8 +12,9 @@ state of the fields this tool manages.
 Required:  mutagen
 Optional:  PyYAML (yaml config), rapidfuzz (better matching), Pillow (cover resize)
 
-Author: netgeek1 / Claude.ai
-License: MIT
+Author: netgeek1 / certifiedgeeks.net
+License: MIT (see LICENSE)
+Changelog: CHANGELOG.md
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.27.0"
+__version__ = "1.28.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -155,6 +156,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "organize_template": "{author}/{series}/Book {index2} - {title}",
     "organize_template_no_series": "{author}/{title}",
     "rename_template": "{track2} - {title}",
+    "rename_template_single": "{title}",
     # TITLE tag for multi-file books; Plex shows it as the chapter name.
     # Empty = every file carries the book title. e.g. "Chapter {track}"
     "chapter_title_template": "",
@@ -346,6 +348,8 @@ overwrite_fields: "{overwrite_fields}"
 organize_template: "{organize_template}"
 organize_template_no_series: "{organize_template_no_series}"
 rename_template: "{rename_template}"
+# Used when a book is a single file (no track number to insert).
+rename_template_single: "{rename_template_single}"
 # TITLE tag for books split across several files. Plex shows TITLE as the
 # chapter name, so identical titles give you N identically named tracks.
 # Empty = every file gets the book title.
@@ -425,6 +429,7 @@ def render_config(cfg: Dict[str, Any]) -> str:
         "organize_template": get("organize_template"),
         "organize_template_no_series": get("organize_template_no_series"),
         "rename_template": get("rename_template"),
+        "rename_template_single": get("rename_template_single"),
         "chapter_title_template": get("chapter_title_template"),
         "album_template": get("album_template"),
         "report_formats": get("report_formats"),
@@ -667,6 +672,67 @@ def find_asin(*texts: Optional[str]) -> Optional[str]:
         if m:
             return m.group(1).upper()
     return None
+
+
+GENERIC_SUBTITLES = re.compile(
+    r"^(a|an|the)?\s*(lit ?rpg|gamelit|epic|dark|urban|high|cozy|space)?\s*"
+    r"(litrpg|fantasy|adventure|novel|saga|series|story|audiobook|"
+    r"light novel|progression fantasy|cultivation)"
+    r"(\s+(adventure|novel|saga|series|story|epic))?\s*$", re.I)
+
+
+def clean_book_title(title: str, series: Optional[str],
+                     index: Optional[int]) -> str:
+    """Reduce a provider's full product title to just the book title.
+
+    Handles, in order:
+      'Series #6: The Last Hope'            -> 'The Last Hope'  (# segment)
+      'Series: Book 9: A LitRPG Adventure'  -> keeps full title minus series
+      'Series 9: A LitRPG Adventure'        -> 'A LitRPG Adventure' only when
+                                               the number matches the volume
+    A trailing subtitle after a colon is kept unless what precedes it is
+    nothing but the series (and number), which is pure shelving noise.
+    """
+    original = title.strip()
+
+    # 1. explicit '#N: Book Title' - the part after the number is the book
+    m = re.search(r"#\s*\d+\s*[:" + DASHES + r"]\s*(.+)$", original)
+    if m and len(m.group(1).strip()) >= 3:
+        return m.group(1).strip()
+
+    if not series:
+        return original
+
+    # 2. remove a leading series name if the title actually starts with it
+    stripped = strip_series_prefix(original, series).strip()
+    if stripped == original:
+        return original            # series not a prefix; leave the title alone
+
+    # If stripping the series leaves only a generic marketing subtitle
+    # ('A LitRPG Adventure'), the book has no distinct title of its own -
+    # keep the 'Series N' form the folder already uses instead of a subtitle
+    # that would collide with every other book in the series.
+    if GENERIC_SUBTITLES.match(stripped):
+        if index is not None:
+            return f"{series} {index}"
+        return original
+
+    # 3. 'Series N: Subtitle' - drop the number only when it is THIS volume and
+    #    a real subtitle follows. 'Series 9' with nothing after is not a
+    #    subtitle, so the number stays part of the title.
+    lead = re.match(r"^(\d{1,3})\s*[:" + DASHES + r"]\s+(.+)$", stripped)
+    if lead and index is not None and int(lead.group(1)) == int(index) \
+            and len(lead.group(2).strip()) >= 3:
+        return lead.group(2).strip()
+
+    # 4. what remains still begins with the volume number ('9', '9: ' handled
+    #    above): the book has no separate title, so keep the series+number form
+    #    the folder already uses rather than inventing one.
+    if re.match(r"^\d{1,3}\b", stripped):
+        return original
+
+    stripped = stripped.strip(" :-" + DASHES)
+    return stripped if len(stripped) >= 3 else original
 
 
 def strip_series_prefix(title: str, series: Optional[str]) -> str:
@@ -2231,15 +2297,9 @@ class AudibleProvider(Provider):
         # Last Hope'. Keep the book's own title in the album tag; the series
         # already has its own fields.
         if m.title and self.cfg.get("strip_series_from_title", True):
-            cleaned = m.title
-            m2 = re.search(r"#\s*\d+\s*[:" + DASHES + r"]\s*(.+)$", cleaned)
-            if m2 and len(m2.group(1).strip()) >= 3:
-                cleaned = m2.group(1).strip()
-            elif series_for_title:
-                stripped = strip_series_prefix(cleaned, series_for_title)
-                if len(stripped) >= 3:
-                    cleaned = stripped
-            if cleaned != m.title:
+            cleaned = clean_book_title(m.title, series_for_title,
+                                       first_int(m.series_index))
+            if cleaned and cleaned != m.title:
                 log.debug("audible: title %r -> %r", m.title, cleaned)
                 m.title = cleaned
 
@@ -3316,6 +3376,48 @@ def plan_layout(book: Book, root: Path, cfg: Dict[str, Any]) -> Optional[Path]:
     return root.joinpath(*rendered.split("/"))
 
 
+def _organize_base(scan_root: Path, books: Sequence[Book],
+                   cfg: Dict[str, Any]) -> Path:
+    """Where the Author/Series/Book tree should be rooted.
+
+    Never a folder that is itself one of the books being moved, or the move
+    lands inside its own source.
+    """
+    scan_root = scan_root.resolve()
+    book_dirs = {b.path.resolve() for b in books}
+
+    configured = cfg.get("library")
+    if configured:
+        lib = Path(str(configured)).expanduser().resolve()
+        # use it only if it is a real ancestor of every book and not a book itself
+        if lib.is_dir() and lib not in book_dirs and all(
+                lib in bd.parents for bd in book_dirs):
+            return lib
+
+    # scan root is safe as long as it is not one of the books
+    if scan_root not in book_dirs:
+        return scan_root
+
+    # scan root IS the single book: climb past the inferred Author/Series
+    # layers so we land at the library, not inside the book.
+    b = books[0]
+    depth = 0
+    m = b.final if b.final.title else b.existing
+    if m.author:
+        depth += 1
+    if m.series:
+        depth += 1
+    base = scan_root
+    for _ in range(depth):
+        if base.parent and base.parent != base:
+            base = base.parent
+    if base in book_dirs or base == scan_root:
+        base = scan_root.parent
+    log.info("organize: target points at a single book; rooting the moved tree "
+             "at %s", base)
+    return base
+
+
 def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
                 dry_run: bool) -> int:
     moved = 0
@@ -3328,6 +3430,15 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
             skipped += 1
             continue
         target = plan_layout(b, root, cfg)
+        if target is not None:
+            src = b.path.resolve()
+            dst = target.resolve()
+            if dst == src or src in dst.parents:
+                log.warning("skip %s: destination would be inside the source "
+                            "(%s). Point organize at the LIBRARY ROOT, not a "
+                            "single book folder.", b.path.name, target)
+                skipped += 1
+                continue
         if not target or target.resolve() == b.path.resolve():
             continue
         if target.exists():
@@ -3346,22 +3457,34 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
 
 def do_rename(books: Sequence[Book], cfg: Dict[str, Any], dry_run: bool) -> int:
     renamed = 0
+    skipped = 0
     for b in books:
         total = len(b.files)
-        if total < 2:
-            continue
-        for idx, f in enumerate(sorted(b.files, key=natural_key), start=1):
-            stem = render_template(cfg["rename_template"],
+        files = sorted(b.files, key=natural_key)
+        # A single-file book uses the single-file template (no track number),
+        # so 'He Who Fights with Monsters 9.mp3' becomes the clean book title.
+        single = total < 2
+        template = cfg["rename_template_single"] if single else cfg["rename_template"]
+        for idx, f in enumerate(files, start=1):
+            stem = render_template(template,
                                    template_fields(b, index=idx, total=total))
             if not stem:
                 continue
             new = f.with_name(f"{stem}{f.suffix.lower()}")
-            if new == f or new.exists():
+            if new == f:
+                continue
+            if new.exists():
+                log.warning("skip rename %s: %s already exists", f.name, new.name)
+                skipped += 1
                 continue
             log.info("%srename %s -> %s", "[dry-run] " if dry_run else "", f.name, new.name)
             if not dry_run:
                 f.rename(new)
             renamed += 1
+    if skipped:
+        log.info("rename: %d file(s) skipped (target already exists)", skipped)
+    if renamed == 0 and not skipped:
+        log.info("rename: every file is already named correctly - nothing to do")
     return renamed
 
 
@@ -4184,6 +4307,7 @@ MENU: Dict[str, Any] = {
     "organize_template": "{author}/{series}/Book {index2} - {title}",
     "organize_template_no_series": "{author}/{title}",
     "rename_template": "{track2} - {title}",
+    "rename_template_single": "{title}",
     # TITLE tag for multi-file books; Plex shows it as the chapter name.
     # Empty = every file carries the book title. e.g. "Chapter {track}"
     "chapter_title_template": "",
@@ -5001,7 +5125,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             b.final = resolve_metadata(b, cfg, providers, opts)
             return b
         books = run_parallel(books, _prep, cfg["workers"])
-        moved = do_organize(books, root, cfg, opts.dry_run)
+        # If the path points AT a single book (or into a shallow subtree), the
+        # scan root is that book's own folder - organizing into it would nest
+        # Author/Series/Book inside the source. Use the library root from
+        # config when it is an ancestor; otherwise climb to a sensible base.
+        org_root = _organize_base(root, books, cfg)
+        moved = do_organize(books, org_root, cfg, opts.dry_run)
         log.info("organize: %d folder(s) %s", moved, "planned" if opts.dry_run else "moved")
         return 0
     elif args.command == "rename":
