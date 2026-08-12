@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.30.0
+audiobook-tagger 1.31.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.30.0"
+__version__ = "1.31.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -194,6 +194,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "only_missing": False,
     "chapter_titles": False,
     "write_cover_file": False,
+    "write_opf": False,          # Audiobookshelf: metadata.opf sidecar
+    "write_desc_txt": False,     # Audiobookshelf: desc.txt (description)
+    "write_reader_txt": False,   # Audiobookshelf: reader.txt (narrator)
     "no_backup": False,
     "ask_asin": False,
     "manual": False,
@@ -333,6 +336,11 @@ renumber: {renumber}
 only_missing: {only_missing}
 chapter_titles: {chapter_titles}
 write_cover_file: {write_cover_file}
+# Audiobookshelf sidecar files (written next to each book). ABS reads these
+# above embedded tags. metadata.json is intentionally NOT written - ABS owns it.
+write_opf: {write_opf}
+write_desc_txt: {write_desc_txt}
+write_reader_txt: {write_reader_txt}
 no_backup: {no_backup}
 ask_asin: {ask_asin}
 manual: {manual}
@@ -436,7 +444,8 @@ def render_config(cfg: Dict[str, Any]) -> str:
         "overwrite_fields": str(get("overwrite_fields") or ""),
     }
     for key in ("plex", "overwrite", "renumber", "only_missing", "chapter_titles",
-                "write_cover_file", "no_backup", "ask_asin", "manual"):
+                "write_cover_file", "no_backup", "ask_asin", "manual",
+                "write_opf", "write_desc_txt", "write_reader_txt"):
         values[key] = _yaml_bool(get(key))
     return CONFIG_TEMPLATE.format(**values)
 
@@ -2734,6 +2743,97 @@ def process_cover(data: bytes, mime: str, cfg: Dict[str, Any]) -> Tuple[bytes, s
         return data, mime
 
 
+def _xml_escape(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def write_abs_sidecars(book: Book, m: Meta, cfg: Dict[str, Any],
+                       dry_run: bool) -> List[str]:
+    """Write Audiobookshelf-friendly sidecar files next to the book.
+
+    ABS reads these at higher priority than embedded tags:
+      metadata.opf  - authors, narrators, series+index, ASIN/ISBN, description
+      desc.txt      - description
+      reader.txt    - narrator
+    We deliberately do NOT write metadata.json: ABS owns that file and
+    regenerates it, so writing our own would fight the app.
+    """
+    written: List[str] = []
+    if not book.files:
+        return written
+    folder = book.path
+
+    authors = [a.strip() for a in re.split(r"[,;/]|\band\b",
+                                           m.author or "") if a.strip()]
+    narrators = [n.strip() for n in re.split(r"[,;/]|\band\b",
+                                             m.narrator or "") if n.strip()]
+
+    if cfg.get("write_opf", False):
+        lines = ['<?xml version="1.0" encoding="utf-8"?>',
+                 '<package xmlns="http://www.idpf.org/2007/opf" version="2.0" '
+                 'unique-identifier="bookid">',
+                 '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" '
+                 'xmlns:opf="http://www.idpf.org/2007/opf">']
+        if m.title:
+            lines.append(f'    <dc:title>{_xml_escape(m.title)}</dc:title>')
+        for a in authors:
+            lines.append(f'    <dc:creator opf:role="aut">{_xml_escape(a)}</dc:creator>')
+        for n in narrators:
+            lines.append(f'    <dc:creator opf:role="nrt">{_xml_escape(n)}</dc:creator>')
+        if m.publisher:
+            lines.append(f'    <dc:publisher>{_xml_escape(m.publisher)}</dc:publisher>')
+        if m.year:
+            lines.append(f'    <dc:date>{_xml_escape(str(m.year))}</dc:date>')
+        if m.language:
+            lines.append(f'    <dc:language>{_xml_escape(m.language)}</dc:language>')
+        if m.description:
+            lines.append(f'    <dc:description>{_xml_escape(m.description)}</dc:description>')
+        if m.asin:
+            lines.append(f'    <dc:identifier opf:scheme="ASIN">{_xml_escape(m.asin)}</dc:identifier>')
+        if m.isbn:
+            lines.append(f'    <dc:identifier opf:scheme="ISBN">{_xml_escape(m.isbn)}</dc:identifier>')
+        if m.genre:
+            lines.append(f'    <dc:subject>{_xml_escape(m.genre)}</dc:subject>')
+        if m.series:
+            lines.append(f'    <meta name="calibre:series" '
+                         f'content="{_xml_escape(m.series)}"/>')
+            if m.series_index:
+                lines.append(f'    <meta name="calibre:series_index" '
+                             f'content="{_xml_escape(str(m.series_index))}"/>')
+        lines.append("  </metadata>")
+        lines.append("</package>")
+        opf = folder / "metadata.opf"
+        log.info("%swrite %s", "[dry-run] " if dry_run else "", opf.name)
+        if not dry_run:
+            try:
+                opf.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError as exc:
+                log.warning("could not write %s: %s", opf, exc)
+        written.append("metadata.opf")
+
+    if cfg.get("write_desc_txt", False) and m.description:
+        f = folder / "desc.txt"
+        log.info("%swrite %s", "[dry-run] " if dry_run else "", f.name)
+        if not dry_run:
+            try:
+                f.write_text(m.description.strip() + "\n", encoding="utf-8")
+            except OSError as exc:
+                log.warning("could not write %s: %s", f, exc)
+        written.append("desc.txt")
+
+    if cfg.get("write_reader_txt", False) and m.narrator:
+        f = folder / "reader.txt"
+        log.info("%swrite %s", "[dry-run] " if dry_run else "", f.name)
+        if not dry_run:
+            try:
+                f.write_text(m.narrator.strip() + "\n", encoding="utf-8")
+            except OSError as exc:
+                log.warning("could not write %s: %s", f, exc)
+        written.append("reader.txt")
+    return written
+
+
 def save_cover_file(book: Book, m: Meta, dry_run: bool) -> None:
     if not m.cover:
         return
@@ -3351,6 +3451,7 @@ def tag_book(book: Book, cfg: Dict[str, Any], providers: Dict[str, Provider],
 
         if opts.write_cover_file:
             save_cover_file(book, book.final, opts.dry_run)
+        changed.extend(write_abs_sidecars(book, book.final, cfg, opts.dry_run))
 
         book.changes = sorted(set(changed))
         book.status = "updated" if book.changes else "ok"
@@ -4400,6 +4501,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--keep-cover", action="store_true")
     sp.add_argument("--remove-cover", action="store_true")
     sp.add_argument("--write-cover-file", action="store_true", help="also save cover.jpg in the folder")
+    sp.add_argument("--abs", action="store_true",
+                    help="Audiobookshelf mode: also write metadata.opf, desc.txt, "
+                         "reader.txt and cover.jpg sidecars next to each book")
     sp.add_argument("--no-backup", action="store_true")
     sp.add_argument("--report", default="html,csv,json", help="report formats, or 'none'")
 
@@ -4471,7 +4575,10 @@ MENU: Dict[str, Any] = {
     # tag behaviour
     "plex": True, "force": False, "renumber": False, "only_missing": False,
     "overwrite_fields": "",
-    "write_cover_file": False, "no_backup": False, "cover_mode": "auto",
+    "write_cover_file": False,
+    "write_opf": False,          # Audiobookshelf: metadata.opf sidecar
+    "write_desc_txt": False,     # Audiobookshelf: desc.txt (description)
+    "write_reader_txt": False,   # Audiobookshelf: reader.txt (narrator) "no_backup": False, "cover_mode": "auto",
     # matching and prompting
     "ask_asin": True, "manual": False, "yes": False,
     "ask_below": 100, "match_threshold": 82, "title_only_threshold": 90,
@@ -4578,6 +4685,8 @@ def _tag_args(dry_run: bool = False, manual: bool = False) -> List[str]:
         out += ["--overwrite-fields", MENU["overwrite_fields"]]
     if not MENU["preserve_mtime"]:
         out.append("--no-preserve-mtime")
+    if MENU["write_opf"] or MENU["write_desc_txt"] or MENU["write_reader_txt"]:
+        out.append("--abs")
     if MENU["write_cover_file"]:
         out.append("--write-cover-file")
     if MENU["no_backup"]:
@@ -4637,6 +4746,7 @@ def menu_tag_options() -> None:
         print(f"   3. [{_onoff(MENU['renumber'])}] Rewrite track numbers 1..N (--renumber)")
         print(f"   4. [{_onoff(MENU['only_missing'])}] Skip fully tagged books (--only-missing)")
         print(f"   5. [{_onoff(MENU['write_cover_file'])}] Also save cover.jpg in each folder")
+        print(f"   A. [{_onoff(MENU['write_opf'])}] Audiobookshelf sidecars (metadata.opf, desc/reader.txt)")
         print(f"   6. [{_onoff(MENU['no_backup'])}] Disable rollback snapshots (--no-backup)")
         print(f"   7. cover art mode: {MENU['cover_mode']}  (auto/replace/keep/remove)")
         print(f"   8. genre written: {MENU['genre']}")
@@ -4666,6 +4776,14 @@ def menu_tag_options() -> None:
             _toggle("only_missing")
         elif choice == "5":
             _toggle("write_cover_file")
+        elif choice in ("a", "A"):
+            new = not MENU["write_opf"]
+            MENU["write_opf"] = new
+            MENU["write_desc_txt"] = new
+            MENU["write_reader_txt"] = new
+            if new:
+                MENU["write_cover_file"] = True
+            MENU["dirty"] = True
         elif choice == "6":
             _toggle("no_backup")
         elif choice == "7":
@@ -4916,6 +5034,9 @@ def _menu_to_config() -> Dict[str, Any]:
         "renumber": MENU["renumber"],
         "only_missing": MENU["only_missing"],
         "write_cover_file": MENU["write_cover_file"],
+        "write_opf": MENU["write_opf"],
+        "write_desc_txt": MENU["write_desc_txt"],
+        "write_reader_txt": MENU["write_reader_txt"],
         "no_backup": MENU["no_backup"],
         "ask_asin": MENU["ask_asin"],
         "manual": MENU["manual"],
@@ -4968,6 +5089,9 @@ def _load_menu_defaults(cfg: Dict[str, Any]) -> None:
     for key, cfg_key in (("plex", "plex"), ("renumber", "renumber"),
                          ("only_missing", "only_missing"),
                          ("write_cover_file", "write_cover_file"),
+                         ("write_opf", "write_opf"),
+                         ("write_desc_txt", "write_desc_txt"),
+                         ("write_reader_txt", "write_reader_txt"),
                          ("no_backup", "no_backup"), ("ask_asin", "ask_asin"),
                          ("manual", "manual"), ("cover_mode", "cover_mode"),
                          ("overwrite_fields", "overwrite_fields"),
@@ -5196,6 +5320,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "doctor":
         return do_doctor(root, cfg, books, args.limit)
 
+    if getattr(args, "abs", False):
+        for k in ("write_opf", "write_desc_txt", "write_reader_txt", "write_cover_file"):
+            cfg[k] = True
     cover_mode = cover_mode_from_args(args)
     if cover_mode == "auto" and cfg.get("cover_mode") in COVER_MODES:
         cover_mode = str(cfg["cover_mode"])
