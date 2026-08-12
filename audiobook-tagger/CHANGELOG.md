@@ -6,6 +6,26 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.32.0] - 2026-08-12
+
+### Fixed
+- **`verify` marked fully-tagged books as `unknown`.** Any book with any issue
+  was bucketed as unidentified. Status is now three-way: `ok`, `issues`
+  (identified but something is missing), and `unknown` (could not identify the
+  book at all - no title/author and no ASIN).
+- **A single-file M4B with no embedded chapter markers was flagged "Missing
+  Chapters" as an issue.** It plays fine and is fully tagged, so it is now a
+  soft note ("no embedded chapter markers"), not a failure.
+- **Chapter files named `NN - Title` were re-scanned as separate one-file
+  books** (so one book appeared several times, each "Missing Chapters"). A
+  leading track number with a shared title is now correctly regrouped as one
+  book - this is exactly what the tool's own `rename` produces.
+
+### Added
+- `books issues` line in the run summary.
+
+---
+
 ## [1.31.0] - 2026-08-12
 
 ### Added
