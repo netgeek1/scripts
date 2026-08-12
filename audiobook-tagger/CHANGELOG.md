@@ -6,6 +6,16 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.31.0] - 2026-08-12
+
+### Added
+- Audiobookshelf sidecar output via `--abs` (or menu **N → A**): writes
+  `metadata.opf` (authors, narrators, series+index, ASIN/ISBN, description),
+  `desc.txt`, `reader.txt` and `cover.jpg` next to each book. `metadata.json`
+  is intentionally not written, since Audiobookshelf owns and regenerates it.
+
+---
+
 ## [1.30.0] - 2026-07-21
 
 ### Fixed
