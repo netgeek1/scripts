@@ -6,6 +6,42 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.30.0] - 2026-07-21
+
+### Fixed
+- **Critical: `organize` tried to move the library root itself** when several
+  loose single-file books shared it (`move C:\temp\books -> ...`), because it
+  only knew how to move whole folders and those books had no folder of their
+  own. It now moves such books file-by-file into new per-book folders and never
+  moves a directory shared by more than one book.
+- The organize base no longer climbs above the scan root (which once produced
+  `C:\`). It roots at the configured library or the scan root; only a single
+  dedicated book folder roots at its parent.
+
+### Added
+- `organize` lists books held back for uncertain metadata at the end of the run.
+- Destination collision guard on `organize`, matching `rename`.
+- `shutil`-based moves that create intermediate folders as needed.
+
+---
+
+## [1.29.0] - 2026-07-21
+
+### Fixed
+- **Critical: an author folder of loose single-file books was treated as one
+  multi-file book**, so `rename` renumbered them together and mapped several
+  distinct books onto the same filename (three books → `Book 1.m4b`), which on
+  a real run would destroy files. A directory is now split into separate books
+  when its files carry distinct whole-book volume numbers; chapters and parts
+  of one book still stay grouped.
+
+### Added
+- **Collision guard** on `rename` and `organize`: every operation is planned
+  first, and the whole run aborts (moving/renaming nothing) if two sources
+  would land on the same target. Clashing names are reported.
+
+---
+
 ## [1.28.0] - 2026-07-21
 
 ### Fixed
