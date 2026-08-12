@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.31.0
+audiobook-tagger 1.32.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.31.0"
+__version__ = "1.32.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -1018,6 +1018,17 @@ def split_distinct_books(files: Sequence[Path]) -> List[List[Path]]:
                    if re.search(r"\b(chapter|track|episode|section|prologue|"
                                 r"epilogue|credits|disc|disk)\b", st, re.I))
     if chaptery >= max(2, len(stems) * 0.5):
+        return [files]
+
+    # Leading track number with a SHARED remaining title ('01 - Title',
+    # '02 - Title', '003 Title') -> one book's chapters. This is what the
+    # tool's own rename produces, so re-scanning must regroup them.
+    lead_num = re.compile(r"^\s*\d{1,3}\s*[-.:_)\s]\s*(.+)$")
+    tails = []
+    for st in stems:
+        mt = lead_num.match(st)
+        tails.append(mt.group(1).strip().lower() if mt else None)
+    if all(tails) and len(set(tails)) == 1:
         return [files]
     # 'NN-NN' style (03-17) is a disc-track pattern -> one book
     if sum(1 for st in stems if re.search(r"\b\d{1,3}[-_]\d{1,3}\b", st)) \
@@ -3051,6 +3062,18 @@ REQUIRED = [
 ]
 
 
+def _verify_status(book: Book) -> str:
+    """ok  = no issues.
+    issues = identified, but something is missing (cover, a field, a file).
+    unknown = could not identify the book at all (no title/author and no ASIN).
+    """
+    if not book.issues:
+        return "ok"
+    m = book.final if any(getattr(book.final, f) for f in FIELDS) else book.existing
+    identified = bool((m.title and m.author) or m.asin)
+    return "issues" if identified else "unknown"
+
+
 def verify_book(book: Book) -> List[str]:
     """Return real problems. Track-sequence findings go to book.notes instead:
     no metadata provider supplies track numbers, so an unusual sequence is an
@@ -3099,11 +3122,14 @@ def verify_book(book: Book) -> List[str]:
             elif sorted(n for n in numbers if n) != list(range(1, len(numbers) + 1)):
                 book.notes.append(f"{label}track numbers are not 1..{len(numbers)}")
 
-    if len(book.files) == 1 and book.files[0].suffix.lower() in (".m4b",):
+    if len(book.files) == 1 and book.files[0].suffix.lower() in (".m4b", ".m4a"):
         try:
             audio = MP4(book.files[0])
             if not getattr(audio, "chapters", None):
-                issues.append("Missing Chapters")
+                # A single-file m4b with no embedded chapter markers still plays
+                # fine and is fully tagged; it just has no in-player chapter list.
+                # That is a soft observation, not a tagging failure.
+                book.notes.append("no embedded chapter markers")
         except Exception:  # noqa: BLE001
             pass
     return issues
@@ -3784,6 +3810,7 @@ def build_summary(books: Sequence[Book], dupes: Sequence[Sequence[Book]]) -> Dic
         "books_skipped": sum(1 for b in books if b.status == "skipped"),
         "books_failed": sum(1 for b in books if b.status == "failed"),
         "books_unknown": sum(1 for b in books if b.status == "unknown"),
+        "books_issues": sum(1 for b in books if b.status == "issues"),
         "books_with_issues": sum(1 for b in books if b.issues),
         "books_with_notes": sum(1 for b in books if b.notes),
         "books_below_100_match": sum(1 for b in books
@@ -3863,7 +3890,8 @@ def render_html(summary: Dict[str, Any], rows: List[Dict[str, Any]],
     thead = "".join(f"<th>{esc(c.replace('_', ' '))}</th>" for c in head_cols)
     body = []
     for r in rows:
-        cls = {"updated": "u", "failed": "f", "unknown": "w", "skipped": "s"}.get(r["status"], "o")
+        cls = {"updated": "u", "failed": "f", "unknown": "w", "issues": "w",
+               "skipped": "s"}.get(r["status"], "o")
         tds = "".join(f"<td>{esc(r.get(c))}</td>" for c in head_cols)
         body.append(f'<tr class="{cls}">{tds}</tr>')
 
@@ -5417,7 +5445,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             b.existing = read_book_tags(b)
             b.final = b.existing
             b.issues = verify_book(b)
-            b.status = "ok" if not b.issues else "unknown"
+            b.status = _verify_status(b)
             return b
         books = run_parallel(books, _verify, cfg["workers"])
     elif args.command == "report":
@@ -5460,9 +5488,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"\n{PROGRAM} {__version__} - {args.command}"
           f"{' (dry run)' if opts.dry_run else ''}")
     for k in ("books_processed", "books_updated", "books_ok", "books_skipped",
-              "books_unknown", "books_failed", "books_with_issues",
+              "books_issues", "books_unknown", "books_failed", "books_with_issues",
               "books_with_notes", "books_below_100_match", "duplicate_groups"):
-        print(f"  {k.replace('_', ' '):<20} {summary[k]}")
+        print(f"  {k.replace('_', ' '):<20} {summary.get(k, 0)}")
     print(f"  {'elapsed':<20} {elapsed:.1f}s")
     return 1 if summary["books_failed"] else 0
 
