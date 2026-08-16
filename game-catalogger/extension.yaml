@@ -1,6 +1,6 @@
 Id: LibraryInventoryExport
 Name: Library Inventory Export
 Author: netgeek1
-Version: 1.6.0
+Version: 1.6.1
 Module: LibraryExport.psm1
 Type: Script
