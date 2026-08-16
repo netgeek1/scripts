@@ -21,6 +21,12 @@ Two commands are added under Playnite's **Extensions** menu:
 - Per-card **Play** button (installed games — launches via `playnite://` so playtime keeps tracking) and **Store** button (opens the store page).
 - A footer reporting how many games have resolvable store links.
 
+**Export Library Gallery (g-export style)** — a deliberately minimal alternative to the main gallery, modeled on [g-export](https://github.com/gilleswaeber/g-export)'s look: a dense wall of cover art with no info cards, a single-line header, a **“show N without activity”** toggle that hides unplayed games by default, and small co-op / PvP overlays derived from each game's features. Covers link to their store page.
+
+**Export Library (Details view)** — a two-pane interface matching Playnite's own Details view: a filterable, sortable data grid (thumbnail, title, store, category icons for single-player / multiplayer / co-op / PvP, played hours, last played as relative time, and a star rating) on the left, with a cover + description detail panel on the right that updates as you select rows. Click column headers to sort; filter by title, store, category, or minimum rating. Stores are shown as coloured labels rather than trademarked logos.
+
+**Export Library Site (all views)** — the three views above bundled into a single page with a nav bar to switch between **Gallery**, **Cover Wall**, and **Details** instantly. One shared dataset, one `covers/` folder, no page reloads. This is the most convenient single export if you want everything in one place.
+
 Everything is read-only: the extension only reads the library and writes to a separate output folder. It never modifies your games.
 
 ---
@@ -62,6 +68,9 @@ Everything is written under `Documents\Playnite Exports\`:
 | --- | --- |
 | CSV + JSON | `playnite-library_<timestamp>.csv` and `.json` |
 | Gallery | `gallery_<timestamp>\index.html` (with a `covers\` folder of copied cover art) |
+| Gallery (g-export style) | `gexport_<timestamp>\index.html` (with its own `covers\` folder) |
+| Details view | `details_<timestamp>\index.html` (with its own `covers\` folder) |
+| Site (all views) | `site_<timestamp>\index.html` — Gallery + Cover Wall + Details in one page |
 
 Each run is timestamped, so re-exporting never overwrites a previous snapshot.
 
@@ -132,6 +141,10 @@ Editable variables sit at the top of each function in `LibraryExport.psm1`. Edit
 
 ## Changelog
 
+- **1.7.0** — Added *Site (all views)*: one bundled page with a nav bar to switch between the Gallery, Cover Wall, and Details views, sharing a single dataset and covers folder.
+- **1.6.1** — Details view: the detail panel updates on row hover (like g-export), not only on click.
+- **1.6.0** — Added a fourth export, *Details view*: a filterable, sortable data grid (thumbnail, title, store, category icons, played, relative last-played, star rating) with a cover + description side panel, matching Playnite's own Details view.
+- **1.5.0** — Added a third export, *g-export style*: a minimal cover wall with a one-line header, a “show N without activity” toggle (unplayed games hidden by default), and co-op / PvP overlays.
 - **1.4.0** — Metadata-rich gallery: cards show score / year / completion / favourite; clicking a card opens a detail panel with playtime, all scores, genres, features, tags, developers, publishers, series, platforms, age rating, description, and every link. Added score and release-year sorts and a *Played only* filter.
 - **1.3.1** — Fix: the gallery failed with a null-method error because Playnite does not expose top-level module variables to invoked functions; the HTML template is now returned by a function.
 - **1.3.0** — Cards carry **Play** (`playnite://` launch) and **Store** buttons.
