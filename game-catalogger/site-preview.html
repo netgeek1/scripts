@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Game Library</title>
+<style>
+:root{--bg:#12151b;--bg2:#0d1014;--surface:#1b1f28;--surface2:#232833;--line:#2b3340;--text:#e8ebf1;--muted:#98a2b3;--accent:#4cc2d6;--star:#e6b625;--radius:12px}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(180deg,var(--bg),var(--bg2));background-attachment:fixed;color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+.topnav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:16px;padding:10px 18px;background:rgba(14,17,22,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.brand{font-size:16px;font-weight:650;white-space:nowrap}
+.brand .sub{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin-left:6px}
+.tabs{display:flex;gap:4px}
+.tab{background:none;border:1px solid transparent;color:var(--muted);padding:6px 14px;border-radius:8px;font-size:13px;font-weight:560;cursor:pointer}
+.tab:hover{color:var(--text);background:var(--surface)}
+.tab.active{color:var(--text);background:var(--surface);border-color:var(--line)}
+.gstats{margin-left:auto;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.view.hidden{display:none}
+/* shared */
+.badge{padding:3px 8px;border-radius:6px;font-size:10.5px;font-weight:600;color:#0c0f14;letter-spacing:.02em}
+.tag{font-size:11.5px;padding:3px 9px;border-radius:999px;background:var(--surface2);border:1px solid var(--line);color:var(--text);text-decoration:none}
+.tag.lnk:hover{border-color:var(--accent)}
+.badges{display:flex;flex-wrap:wrap;gap:6px}
+.act{display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:7px 8px;border-radius:8px;font-size:12px;font-weight:600;text-decoration:none;border:1px solid var(--line);color:var(--text);background:var(--surface2)}
+.act:hover{border-color:var(--accent)}
+.act.play{background:color-mix(in srgb,var(--accent) 16%,var(--surface2));border-color:color-mix(in srgb,var(--accent) 42%,var(--line))}
+.switch{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--muted);user-select:none;cursor:pointer}
+.switch input{accent-color:var(--accent)}
+.st{color:#3a3a3a}.st.on{color:var(--star)}
+/* GALLERY */
+#v-gallery{padding:16px 20px}
+#v-gallery .g-controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+#v-gallery .g-search{flex:1 1 240px;min-width:180px;padding:9px 12px;border-radius:9px;background:var(--surface);border:1px solid var(--line);color:var(--text);font-size:14px}
+#v-gallery .g-search:focus{outline:none;border-color:var(--accent)}
+#v-gallery .g-sort{padding:9px 10px;border-radius:9px;background:var(--surface);border:1px solid var(--line);color:var(--text);font-size:13px}
+#v-gallery .g-count{color:var(--muted);font-size:12px;margin-left:auto}
+#v-gallery .g-chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+#v-gallery .chip{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;background:var(--surface);border:1px solid var(--line);color:var(--text);font-size:12.5px;cursor:pointer}
+#v-gallery .chip:hover{border-color:var(--c)}
+#v-gallery .chip.active{background:color-mix(in srgb,var(--c) 18%,var(--surface));border-color:var(--c)}
+#v-gallery .chip-dot{width:9px;height:9px;border-radius:50%;background:var(--c)}
+#v-gallery .chip-n{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--muted)}
+#v-gallery .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(158px,1fr))}
+#v-gallery .card{background:var(--surface);border:1px solid var(--line);border-top:3px solid var(--c);border-radius:var(--radius);overflow:hidden;display:flex;flex-direction:column;cursor:pointer;transition:transform .16s,box-shadow .16s}
+#v-gallery .card:hover{transform:translateY(-3px);box-shadow:0 10px 26px rgba(0,0,0,.4)}
+#v-gallery .media{position:relative;aspect-ratio:3/4;background:var(--surface2)}
+#v-gallery .cover{width:100%;height:100%;object-fit:cover;display:block}
+#v-gallery .cover.ph{display:flex;align-items:center;justify-content:center;font-size:34px;font-weight:700;color:var(--muted)}
+#v-gallery .badge{position:absolute;top:8px;left:8px;box-shadow:0 2px 6px rgba(0,0,0,.35)}
+#v-gallery .score{position:absolute;top:8px;right:8px;min-width:24px;height:22px;padding:0 6px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:rgba(12,15,20,.72);color:#eef1f6;font-size:11px;font-weight:700;font-family:ui-monospace,Consolas,monospace}
+#v-gallery .info{padding:10px 11px 12px;display:flex;flex-direction:column;gap:6px;flex:1}
+#v-gallery .title{margin:0;font-size:13.5px;font-weight:560;line-height:1.25;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+#v-gallery .subline{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#v-gallery .meta{display:flex;align-items:center;justify-content:space-between;margin-top:auto;font-size:11.5px;color:var(--muted)}
+#v-gallery .pt{font-family:ui-monospace,Consolas,monospace}
+#v-gallery .inst{display:inline-flex;align-items:center;gap:5px}
+#v-gallery .dot{width:8px;height:8px;border-radius:50%;border:1.5px solid var(--muted)}
+#v-gallery .dot.on{background:#3fbf58;border-color:#3fbf58}
+#v-gallery .comp{align-self:flex-start;font-size:10.5px;padding:2px 7px;border-radius:999px;background:var(--surface2);border:1px solid var(--line);color:var(--muted)}
+#v-gallery .actions{display:flex;gap:6px;margin-top:4px}
+#v-gallery .actions .act{flex:1}
+#v-gallery .g-empty{text-align:center;color:var(--muted);padding:50px 20px}
+/* WALL */
+#v-wall .w-head{padding:14px 20px;font-size:14px;color:var(--muted);border-bottom:1px solid var(--line);line-height:1.7}
+#v-wall .w-count{color:var(--text);font-weight:600}
+#v-wall .w-toggle{background:none;border:none;color:var(--accent);cursor:pointer;font:inherit;padding:0;text-decoration:underline}
+#v-wall .wall{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;padding:16px 20px}
+#v-wall .tile{position:relative;display:block;aspect-ratio:3/4;border-radius:6px;overflow:hidden;background:var(--surface2);text-decoration:none;color:inherit}
+#v-wall .tile img{width:100%;height:100%;object-fit:cover;display:block}
+#v-wall .tile .ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:700;color:#6b7280}
+#v-wall .ov{position:absolute;inset:auto 0 0 0;padding:20px 8px 7px;background:linear-gradient(transparent,rgba(6,8,11,.94));opacity:0;transition:opacity .14s}
+#v-wall .tile:hover .ov{opacity:1}
+#v-wall .nm{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;font-size:11.5px;font-weight:600;line-height:1.2}
+#v-wall .tg{display:block;color:#aeb4bd;font-size:10px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#v-wall .flags{position:absolute;top:6px;left:6px;display:flex;gap:4px}
+#v-wall .flag{font-size:9px;font-weight:700;letter-spacing:.04em;padding:2px 5px;border-radius:4px;background:rgba(6,8,11,.72)}
+#v-wall .flag.coop{color:#5bd68a}#v-wall .flag.pvp{color:#ff7a7a}
+#v-wall:not(.show-all) .tile.no-activity{display:none}
+/* DETAILS */
+#v-details .d-app{display:flex;height:calc(100vh - 53px)}
+#v-details .d-left{flex:1;min-width:0;display:flex;flex-direction:column;border-right:1px solid var(--line)}
+#v-details .d-bar{padding:8px 12px;border-bottom:1px solid var(--line);color:var(--muted);font-size:12px}
+#v-details .d-tablewrap{flex:1;overflow:auto}
+#v-details table{width:100%;border-collapse:collapse;font-size:13px}
+#v-details thead th{position:sticky;top:0;background:#101010;z-index:2;text-align:left;font-weight:600;color:#cfd3d7;padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap;font-size:12px}
+#v-details thead th[data-sort]{cursor:pointer;user-select:none}
+#v-details thead th[data-sort]:hover{color:#fff}
+#v-details .ind{color:var(--accent);font-size:10px;margin-left:3px}
+#v-details .frow th{position:sticky;top:31px;background:#141414;z-index:2;padding:5px 8px;border-bottom:1px solid var(--line)}
+#v-details .frow input,#v-details .frow select{width:100%;background:#0e0e0e;border:1px solid #333;color:var(--text);border-radius:4px;padding:4px 6px;font-size:12px}
+#v-details tbody td{padding:4px 8px;border-bottom:1px solid #202020;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#v-details tbody tr{cursor:pointer}
+#v-details tbody tr:nth-child(even){background:#181818}
+#v-details tbody tr:hover{background:#242424}
+#v-details tbody tr.sel{background:#2a2f38}
+#v-details .c-thumb{width:30px;padding:2px 4px 2px 8px}
+#v-details .c-thumb img,#v-details .c-thumb .ph{width:24px;height:24px;border-radius:3px;object-fit:cover;display:block;background:#2a2a2a}
+#v-details .c-thumb .ph{display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#777}
+#v-details .c-title{max-width:340px;font-weight:500}
+#v-details .store-chip{display:inline-block;padding:1px 7px;border-radius:4px;font-size:10.5px;font-weight:600;color:#0c0f14;background:var(--c,#888)}
+#v-details .c-cat{color:var(--muted)}
+#v-details .ci{display:inline-flex;vertical-align:middle;margin-right:5px}
+#v-details .c-played{text-align:right;font-variant-numeric:tabular-nums;color:#cfd3d7}
+#v-details .c-last{color:var(--muted)}
+#v-details .d-detail{width:340px;flex:0 0 340px;overflow:auto;background:var(--surface)}
+#v-details .d-empty{padding:40px 20px;color:var(--muted);text-align:center}
+#v-details .dp-cover{width:100%;display:block;background:#111}
+#v-details .dp-body{padding:16px 18px}
+#v-details .dp-title{margin:0 0 8px;font-size:20px;line-height:1.2}
+#v-details .dp-sub{display:flex;align-items:center;gap:9px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:12px}
+#v-details .dp-sub .store-chip{color:#0c0f14}
+#v-details .d-actions{display:flex;gap:7px;margin-bottom:14px}
+#v-details .d-actions .act{flex:1}
+#v-details .dp-desc{font-size:12.5px;line-height:1.55;color:#c4c8cc;margin:0 0 14px}
+#v-details .d-sec{margin-bottom:12px}
+#v-details .d-sec h4{margin:0 0 6px;font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted)}
+#v-details .kv{display:flex;justify-content:space-between;gap:10px;font-size:12px;padding:4px 0;border-bottom:1px solid #242424}
+#v-details .kv .k{color:var(--muted)}
+@media (max-width:720px){#v-details .d-detail{display:none}#v-details .d-left{border-right:none}}
+/* MODAL (shared by gallery) */
+.modal{position:fixed;inset:0;z-index:100;background:rgba(6,8,11,.72);backdrop-filter:blur(4px);display:flex;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto}
+.modal[hidden]{display:none}
+.modal-inner{position:relative;width:100%;max-width:720px;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:22px;box-shadow:0 30px 80px rgba(0,0,0,.6)}
+.m-close{position:absolute;top:10px;right:14px;background:none;border:none;color:var(--muted);font-size:26px;line-height:1;cursor:pointer}
+.m-close:hover{color:var(--text)}
+.m-head{display:flex;gap:18px;margin-bottom:14px}
+.m-cover{width:132px;flex:0 0 132px;aspect-ratio:3/4;object-fit:cover;border-radius:10px;background:var(--surface2)}
+.m-cover.ph{display:flex;align-items:center;justify-content:center;font-size:38px;font-weight:700;color:var(--muted)}
+.m-meta h2{margin:0 0 8px;font-size:22px;line-height:1.15}
+.m-sub{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;color:var(--muted);font-size:12.5px}
+.m-actions{max-width:280px}.m-actions .act{flex:1}
+.m-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:0 22px;margin:4px 0 8px}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.kv .k{color:var(--muted);white-space:nowrap}.kv .v{text-align:right}
+.m-sec{margin-top:16px}
+.m-sec h4{margin:0 0 8px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.m-desc{font-size:13px;line-height:1.55;color:#c8cdd6;margin:0}
+@media (max-width:520px){.m-grid{grid-template-columns:1fr}.m-head{flex-direction:column}.m-cover{width:110px}#v-gallery .grid{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}}
+@media (prefers-reduced-motion:reduce){*{transition:none !important}}
+</style>
+</head>
+<body>
+<header class="topnav">
+  <div class="brand">Game Library<span class="sub">Playnite</span></div>
+  <nav class="tabs">
+    <button class="tab active" data-view="gallery">Gallery</button>
+    <button class="tab" data-view="wall">Cover Wall</button>
+    <button class="tab" data-view="details">Details</button>
+  </nav>
+  <div class="gstats">8 games &middot; 5 installed &middot; 6 stores &middot; 2026-08-15 09:30</div>
+</header>
+<main>
+  <section id="v-gallery" class="view">
+    <div class="g-controls">
+      <input class="g-search" type="search" placeholder="Search games..." autocomplete="off">
+      <select class="g-sort"><option value="name">Sort: Name</option><option value="playtime">Sort: Most played</option><option value="recent">Sort: Recently played</option><option value="score">Sort: Highest score</option><option value="year">Sort: Newest release</option></select>
+      <label class="switch"><input class="g-inst" type="checkbox"> Installed only</label>
+      <label class="switch"><input class="g-played" type="checkbox"> Played only</label>
+      <span class="g-count"></span>
+    </div>
+    <div class="g-chips"></div>
+    <div class="grid"></div>
+    <p class="g-empty" hidden>No games match your filters.</p>
+  </section>
+  <section id="v-wall" class="view hidden">
+    <div class="w-head"><span class="w-count"></span> &ndash; game list exported from Playnite &ndash; <button class="w-toggle"></button></div>
+    <div class="wall"></div>
+  </section>
+  <section id="v-details" class="view hidden">
+    <div class="d-app">
+      <div class="d-left">
+        <div class="d-bar"><span class="d-count"></span></div>
+        <div class="d-tablewrap">
+          <table>
+            <thead>
+              <tr><th></th><th data-sort="name">Title <span class="ind" data-for="name"></span></th><th>Platforms</th><th>Categories</th><th data-sort="playtime">Played <span class="ind" data-for="playtime"></span></th><th data-sort="lastPlayed">Last Played <span class="ind" data-for="lastPlayed"></span></th><th data-sort="rating">Rating <span class="ind" data-for="rating"></span></th></tr>
+              <tr class="frow"><th></th><th><input class="df-title" type="search" placeholder="Filter..." autocomplete="off"></th><th><select class="df-store"><option value="">All</option></select></th><th><select class="df-cat"><option value="">All</option><option value="single">Single-player</option><option value="multi">Multiplayer</option><option value="coop">Co-op</option><option value="pvp">PvP</option></select></th><th></th><th></th><th><select class="df-rating"><option value="">All</option><option value="5">5 stars</option><option value="4">4+ stars</option><option value="3">3+ stars</option><option value="2">2+ stars</option><option value="1">1+ stars</option></select></th></tr>
+            </thead>
+            <tbody class="d-rows"></tbody>
+          </table>
+        </div>
+      </div>
+      <aside class="d-detail"><div class="d-empty">Hover a game to see details.</div></aside>
+    </div>
+  </section>
+</main>
+<div id="modal" class="modal" hidden><div class="modal-inner"><button class="m-close" aria-label="Close">&times;</button><div id="modal-body"></div></div></div>
+<script id="data" type="application/json">[{"name":"Hades","cover":"","store":"Steam","color":"#66c0f4","storeUrl":"https://store.steampowered.com/app/1145360/","playUri":"playnite://playnite/start/g0","installed":true,"playtime":31.6,"lastPlayed":"2025-03-05","added":"2020-01-01","released":"2020-01-01","year":"2020","rating":93,"community":93,"critic":93,"user":95,"favorite":false,"completion":"Playing","genres":["Roguelike","Action"],"features":["Single Player"],"tags":["Roguelike"],"developers":["Supergiant"],"publishers":["Supergiant"],"series":"","platforms":["PC (Windows)"],"version":"","description":"Defy the god of the dead.","links":[{"name":"Store","url":"https://store.steampowered.com/app/1145360/"}]},{"name":"It Takes Two","cover":"","store":"EA app","color":"#ff5c5c","storeUrl":"","playUri":"playnite://playnite/start/g1","installed":true,"playtime":14.0,"lastPlayed":"2023-08-19","added":"2020-01-01","released":"2021-01-01","year":"2021","rating":89,"community":88,"critic":89,"user":null,"favorite":false,"completion":"Playing","genres":["Platformer"],"features":["Co-Op","Local Multiplayer"],"tags":["Co-op"],"developers":["Hazelight"],"publishers":["EA"],"series":"","platforms":["PC (Windows)"],"version":"","description":"A co-op only platform adventure.","links":[]},{"name":"Overwatch 2","cover":"","store":"Battle.net","color":"#3aa0ff","storeUrl":"","playUri":"playnite://playnite/start/g2","installed":false,"playtime":9.3,"lastPlayed":"2024-02-01","added":"2020-01-01","released":"2022-01-01","year":"2022","rating":79,"community":null,"critic":79,"user":60,"favorite":false,"completion":"Playing","genres":["Shooter"],"features":["Multiplayer","PvP"],"tags":["Hero Shooter"],"developers":["Blizzard"],"publishers":["Blizzard"],"series":"","platforms":["PC (Windows)"],"version":"","description":"A team-based hero shooter.","links":[]},{"name":"Cyberpunk 2077","cover":"","store":"GOG","color":"#a970ff","storeUrl":"https://www.gog.com/game/cyberpunk_2077","playUri":"playnite://playnite/start/g3","installed":true,"playtime":120.5,"lastPlayed":"2025-01-10","added":"2020-01-01","released":"2020-01-01","year":"2020","rating":86,"community":78,"critic":86,"user":85,"favorite":false,"completion":"Playing","genres":["RPG"],"features":["Single Player"],"tags":["Open World"],"developers":["CD Projekt Red"],"publishers":["CD Projekt"],"series":"","platforms":["PC (Windows)"],"version":"","description":"An open-world RPG in Night City.","links":[{"name":"Store","url":"https://www.gog.com/game/cyberpunk_2077"}]},{"name":"Alan Wake 2","cover":"","store":"Epic","color":"#dcdcdc","storeUrl":"https://store.epicgames.com/p/alan-wake-2","playUri":"playnite://playnite/start/g4","installed":false,"playtime":0,"lastPlayed":"","added":"2020-01-01","released":"2023-01-01","year":"2023","rating":89,"community":89,"critic":88,"user":null,"favorite":false,"completion":"Not Played","genres":["Survival Horror"],"features":["Single Player"],"tags":["Horror"],"developers":["Remedy"],"publishers":["Epic"],"series":"","platforms":["PC (Windows)"],"version":"","description":"A survival horror sequel.","links":[{"name":"Store","url":"https://store.epicgames.com/p/alan-wake-2"}]},{"name":"Forza Horizon 5","cover":"","store":"Xbox","color":"#5bc236","storeUrl":"","playUri":"playnite://playnite/start/g5","installed":true,"playtime":44.7,"lastPlayed":"2024-12-30","added":"2020-01-01","released":"2021-01-01","year":"2021","rating":92,"community":92,"critic":92,"user":null,"favorite":false,"completion":"Playing","genres":["Racing"],"features":["Multiplayer","PvP","Co-Op"],"tags":["Open World"],"developers":["Playground"],"publishers":["Xbox"],"series":"","platforms":["PC (Windows)"],"version":"","description":"Open-world racing in Mexico.","links":[]},{"name":"Disco Elysium","cover":"","store":"GOG","color":"#a970ff","storeUrl":"https://www.gog.com/game/disco_elysium","playUri":"playnite://playnite/start/g6","installed":false,"playtime":0,"lastPlayed":"","added":"2020-01-01","released":"2019-01-01","year":"2019","rating":97,"community":97,"critic":96,"user":null,"favorite":true,"completion":"Not Played","genres":["RPG"],"features":["Single Player"],"tags":["Story Rich"],"developers":["ZA/UM"],"publishers":["ZA/UM"],"series":"","platforms":["PC (Windows)"],"version":"","description":"A groundbreaking detective RPG. <\/script> test.","links":[{"name":"Store","url":"https://www.gog.com/game/disco_elysium"}]},{"name":"Half-Life 2","cover":"","store":"Steam","color":"#66c0f4","storeUrl":"https://store.steampowered.com/app/220/","playUri":"playnite://playnite/start/g7","installed":true,"playtime":58.2,"lastPlayed":"2024-11-02","added":"2020-01-01","released":"2004-01-01","year":"2004","rating":96,"community":96,"critic":null,"user":90,"favorite":true,"completion":"Playing","genres":["Shooter"],"features":["Single Player"],"tags":["FPS"],"developers":["Valve"],"publishers":["Valve"],"series":"","platforms":["PC (Windows)"],"version":"","description":"Gordon Freeman vs the Combine.","links":[{"name":"Store","url":"https://store.steampowered.com/app/220/"}]}]</script>
+<script>
+(function(){
+  var DATA=JSON.parse(document.getElementById('data').textContent||'[]');
+  DATA.forEach(function(g,i){g._i=i;});
+  var STORECOLOR={};DATA.forEach(function(g){if(g.store)STORECOLOR[g.store]=g.color;});
+  function esc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+  function starN(r){if(r==null||r==='')return -1;var n=Math.round(r/20);return n<0?0:(n>5?5:n);}
+  function starsHtml(r){var n=starN(r);if(n<0)return '';var s='';for(var i=0;i<5;i++){s+='<span class="st'+(i<n?' on':'')+'">\u2605</span>';}return s;}
+  function rel(iso){if(!iso)return '';var d=new Date(iso+'T00:00:00');if(isNaN(d))return iso;var days=Math.floor((Date.now()-d.getTime())/86400000);if(days<1)return 'today';if(days<2)return 'yesterday';if(days<30)return days+' days ago';var m=Math.floor(days/30.44);if(m<12)return m+(m===1?' month ago':' months ago');var y=Math.floor(days/365.25);return y+(y===1?' year ago':' years ago');}
+  var IC={single:'<svg viewBox="0 0 14 14" width="13" height="13" fill="currentColor"><circle cx="7" cy="4" r="2.6"/><path d="M1.6 13c0-3 2.4-5 5.4-5s5.4 2 5.4 5z"/></svg>',multi:'<svg viewBox="0 0 20 14" width="19" height="13" fill="currentColor"><circle cx="6" cy="4" r="2.3"/><path d="M1 13c0-2.7 2.2-4.4 5-4.4s5 1.7 5 4.4z"/><circle cx="14.5" cy="4.6" r="2.1"/><path d="M10 13c0-2.5 2-4 4.5-4s4.5 1.5 4.5 4z"/></svg>',coop:'<svg viewBox="0 0 26 14" width="25" height="13" fill="currentColor"><circle cx="5" cy="4" r="2.1"/><path d="M0.6 13c0-2.5 2-4 4.4-4s4.4 1.5 4.4 4z"/><circle cx="13" cy="4.3" r="2"/><path d="M8.8 13c0-2.4 1.9-3.8 4.2-3.8s4.2 1.4 4.2 3.8z"/><circle cx="21" cy="4" r="2.1"/><path d="M16.6 13c0-2.5 2-4 4.4-4s4.4 1.5 4.4 4z"/></svg>',pvp:'<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13L11 5"/><path d="M13 13L5 5"/><path d="M10.5 3.5H13V6"/><path d="M5.5 3.5H3V6"/></svg>'};
+  function catKey(features){var f=(features||[]).map(function(x){return String(x).toLowerCase();});function has(re){return f.some(function(x){return re.test(x);});}return {single:has(/single/),multi:has(/multiplayer|multi-player/),coop:has(/co-?op/),pvp:has(/pvp|versus/)};}
+  function catIcons(features){var k=catKey(features);var o='';if(k.single)o+='<span class="ci" title="Single-player">'+IC.single+'</span>';if(k.multi)o+='<span class="ci" title="Multiplayer">'+IC.multi+'</span>';if(k.coop)o+='<span class="ci" title="Co-op">'+IC.coop+'</span>';if(k.pvp)o+='<span class="ci" title="PvP">'+IC.pvp+'</span>';return o;}
+
+  // ---- shared modal (gallery) ----
+  var modal=document.getElementById('modal'),mbody=document.getElementById('modal-body');
+  function chipsB(arr){if(!arr||!arr.length)return '';return '<div class="badges">'+arr.map(function(x){return '<span class="tag">'+esc(x)+'</span>';}).join('')+'</div>';}
+  function mrow(l,v){if(v==null||v==='')return '';return '<div class="kv"><span class="k">'+esc(l)+'</span><span class="v">'+esc(v)+'</span></div>';}
+  function openModal(i){var g=DATA[i];if(!g)return;var cov=g.cover?'<img class="m-cover" src="'+esc(g.cover)+'" alt="">':'<div class="m-cover ph">'+esc((g.name||'?').slice(0,2).toUpperCase())+'</div>';var scores=[];if(g.community!=null)scores.push('Community '+g.community);if(g.critic!=null)scores.push('Critic '+g.critic);if(g.user!=null)scores.push('You '+g.user);var acts='';if(g.installed&&g.playUri)acts+='<a class="act play" href="'+esc(g.playUri)+'">\u25b6 Play</a>';if(g.storeUrl)acts+='<a class="act" href="'+esc(g.storeUrl)+'" target="_blank" rel="noopener noreferrer">Store \u2197</a>';var links=g.links&&g.links.length?'<div class="m-sec"><h4>Links</h4><div class="badges">'+g.links.map(function(l){return '<a class="tag lnk" href="'+esc(l.url)+'" target="_blank" rel="noopener noreferrer">'+esc(l.name||l.url)+' \u2197</a>';}).join('')+'</div></div>':'';mbody.innerHTML='<div class="m-head">'+cov+'<div class="m-meta"><h2>'+(g.favorite?'\u2605 ':'')+esc(g.name)+'</h2><div class="m-sub"><span class="badge" style="background:'+esc(g.color)+'">'+esc(g.store)+'</span>'+(g.year?'<span>'+esc(g.year)+'</span>':'')+(scores.length?'<span>'+esc(scores.join(' \u00b7 '))+'</span>':'')+'</div>'+(acts?'<div class="actions m-actions">'+acts+'</div>':'')+'</div></div><div class="m-grid">'+mrow('Playtime',g.playtime?g.playtime+' h':'\u2014')+mrow('Status',g.completion)+mrow('Installed',g.installed?'Yes':'No')+mrow('Last played',rel(g.lastPlayed))+mrow('Added',g.added)+mrow('Released',g.released)+mrow('Platforms',(g.platforms||[]).join(', '))+mrow('Developers',(g.developers||[]).join(', '))+mrow('Publishers',(g.publishers||[]).join(', '))+mrow('Series',g.series)+mrow('Version',g.version)+'</div>'+(g.genres&&g.genres.length?'<div class="m-sec"><h4>Genres</h4>'+chipsB(g.genres)+'</div>':'')+(g.features&&g.features.length?'<div class="m-sec"><h4>Features</h4>'+chipsB(g.features)+'</div>':'')+(g.tags&&g.tags.length?'<div class="m-sec"><h4>Tags</h4>'+chipsB(g.tags)+'</div>':'')+(g.description?'<div class="m-sec"><h4>Description</h4><p class="m-desc">'+esc(g.description)+'</p></div>':'')+links;modal.hidden=false;document.body.style.overflow='hidden';}
+  function closeModal(){modal.hidden=true;document.body.style.overflow='';}
+  modal.addEventListener('click',function(e){if(e.target===modal||e.target.classList.contains('m-close'))closeModal();});
+  document.addEventListener('keydown',function(e){if(e.key==='Escape')closeModal();});
+
+  // ---- GALLERY ----
+  function galleryCard(g){var cover=g.cover?'<img class="cover" loading="lazy" src="'+esc(g.cover)+'" alt="'+esc(g.name)+'">':'<div class="cover ph">'+esc((g.name||'?').slice(0,2).toUpperCase())+'</div>';var sc=(g.rating!=null&&g.rating!=='')?g.rating:'';var score=sc!==''?'<span class="score">'+sc+'</span>':'';var fav=g.favorite?'\u2605 ':'';var sub=[];if(g.year)sub.push(esc(g.year));if(g.genres&&g.genres.length)sub.push(esc(g.genres[0]));var subline=sub.length?'<div class="subline">'+sub.join(' \u00b7 ')+'</div>':'';var comp=g.completion?'<span class="comp">'+esc(g.completion)+'</span>':'';var inst=g.installed?'<span class="dot on"></span>Installed':'<span class="dot"></span>Not installed';var pl=g.playtime>0?g.playtime+' h':'\u2014';var acts='';if(g.installed&&g.playUri)acts+='<a class="act play" href="'+esc(g.playUri)+'">\u25b6 Play</a>';if(g.storeUrl)acts+='<a class="act" href="'+esc(g.storeUrl)+'" target="_blank" rel="noopener noreferrer">Store \u2197</a>';var actions=acts?'<div class="actions">'+acts+'</div>':'';return '<article class="card" data-i="'+g._i+'" data-name="'+esc(String(g.name||'').toLowerCase())+'" data-store="'+esc(g.store)+'" data-installed="'+(g.installed?1:0)+'" data-playtime="'+(g.playtime||0)+'" data-last="'+esc(g.lastPlayed||'')+'" data-score="'+sc+'" data-year="'+esc(g.year||'')+'" style="--c:'+esc(g.color)+'"><div class="media">'+cover+'<span class="badge" style="background:'+esc(g.color)+'">'+esc(g.store)+'</span>'+score+'</div><div class="info"><h3 class="title" title="'+esc(g.name)+'">'+fav+esc(g.name)+'</h3>'+subline+'<div class="meta"><span class="pt">'+pl+'</span><span class="inst">'+inst+'</span></div>'+comp+actions+'</div></article>';}
+  function renderGallery(){var root=document.getElementById('v-gallery');var grid=root.querySelector('.grid'),empty=root.querySelector('.g-empty'),search=root.querySelector('.g-search'),sortSel=root.querySelector('.g-sort'),inst=root.querySelector('.g-inst'),played=root.querySelector('.g-played'),chipsBox=root.querySelector('.g-chips'),countEl=root.querySelector('.g-count');grid.innerHTML=DATA.map(galleryCard).join('');var cards=[].slice.call(grid.querySelectorAll('.card'));var seen={};DATA.forEach(function(g){if(g.store)seen[g.store]=(seen[g.store]||0)+1;});chipsBox.innerHTML=Object.keys(seen).sort().map(function(s){return '<button class="chip" data-store="'+esc(s)+'" style="--c:'+esc(STORECOLOR[s]||'#888')+'"><span class="chip-dot"></span>'+esc(s)+' <span class="chip-n">'+seen[s]+'</span></button>';}).join('');var chips=[].slice.call(chipsBox.querySelectorAll('.chip'));var active={};function apply(){var q=(search.value||'').trim().toLowerCase();var anyStore=Object.keys(active).length>0;var io=inst.checked,po=played.checked;var vis=0;cards.forEach(function(c){var ok=(!q||c.getAttribute('data-name').indexOf(q)!==-1)&&(!anyStore||active[c.getAttribute('data-store')])&&(!io||c.getAttribute('data-installed')==='1')&&(!po||parseFloat(c.getAttribute('data-playtime'))>0);c.style.display=ok?'':'none';if(ok)vis++;});countEl.textContent=vis+' shown';empty.hidden=vis!==0;}function sortCards(){var m=sortSel.value;cards.slice().sort(function(a,b){if(m==='playtime')return parseFloat(b.getAttribute('data-playtime'))-parseFloat(a.getAttribute('data-playtime'));if(m==='recent')return (b.getAttribute('data-last')||'').localeCompare(a.getAttribute('data-last')||'');if(m==='score')return (parseFloat(b.getAttribute('data-score'))||-1)-(parseFloat(a.getAttribute('data-score'))||-1);if(m==='year')return (parseInt(b.getAttribute('data-year'),10)||0)-(parseInt(a.getAttribute('data-year'),10)||0);return a.getAttribute('data-name').localeCompare(b.getAttribute('data-name'));}).forEach(function(c){grid.appendChild(c);});}search.addEventListener('input',apply);inst.addEventListener('change',apply);played.addEventListener('change',apply);sortSel.addEventListener('change',sortCards);chips.forEach(function(ch){ch.addEventListener('click',function(){var s=ch.getAttribute('data-store');if(active[s]){delete active[s];ch.classList.remove('active');}else{active[s]=true;ch.classList.add('active');}apply();});});grid.addEventListener('click',function(e){if(e.target.closest('.actions'))return;var c=e.target.closest('.card');if(c)openModal(parseInt(c.getAttribute('data-i'),10));});apply();}
+
+  // ---- COVER WALL ----
+  function wallTile(g){var act=g.playtime>0?1:0;var cover=g.cover?'<img loading="lazy" src="'+esc(g.cover)+'" alt="'+esc(g.name)+'">':'<div class="ph">'+esc((g.name||'?').slice(0,2).toUpperCase())+'</div>';var k=catKey(g.features);var flags='';if(k.coop)flags+='<span class="flag coop">CO-OP</span>';if(k.pvp)flags+='<span class="flag pvp">PVP</span>';var fh=flags?'<div class="flags">'+flags+'</div>':'';var tags=(g.tags&&g.tags.length)?'<span class="tg">'+esc(g.tags.slice(0,2).join(', '))+'</span>':'';var ov='<div class="ov"><span class="nm">'+esc(g.name)+'</span>'+tags+'</div>';var na=act===0?' no-activity':'';if(g.storeUrl)return '<a class="tile'+na+'" href="'+esc(g.storeUrl)+'" target="_blank" rel="noopener noreferrer" title="'+esc(g.name)+'" data-activity="'+act+'">'+cover+fh+ov+'</a>';return '<div class="tile'+na+'" title="'+esc(g.name)+'" data-activity="'+act+'">'+cover+fh+ov+'</div>';}
+  function renderWall(){var root=document.getElementById('v-wall');var wall=root.querySelector('.wall'),toggle=root.querySelector('.w-toggle'),count=root.querySelector('.w-count');var arr=DATA.slice().sort(function(a,b){return (b.playtime||0)-(a.playtime||0)||String(a.name||'').localeCompare(String(b.name||''));});var wact=0;wall.innerHTML=arr.map(function(g){if(g.playtime>0)wact++;return wallTile(g);}).join('');var noact=arr.length-wact;count.textContent=wact+' games';toggle.textContent='show '+noact+' without activity';toggle.addEventListener('click',function(){root.classList.toggle('show-all');var on=root.classList.contains('show-all');toggle.textContent=(on?'hide ':'show ')+noact+' without activity';});}
+
+  // ---- DETAILS ----
+  function renderDetails(){var root=document.getElementById('v-details');var rowsEl=root.querySelector('.d-rows'),detailEl=root.querySelector('.d-detail'),countEl=root.querySelector('.d-count');var fTitle=root.querySelector('.df-title'),fStore=root.querySelector('.df-store'),fCat=root.querySelector('.df-cat'),fRating=root.querySelector('.df-rating');var sortKey='name',sortDir=1,selected=null,lastHover=null;var seen={};DATA.forEach(function(g){if(g.store)seen[g.store]=1;});Object.keys(seen).sort().forEach(function(s){var o=document.createElement('option');o.value=s;o.textContent=s;fStore.appendChild(o);});function passes(g){var q=(fTitle.value||'').trim().toLowerCase();if(q&&String(g.name||'').toLowerCase().indexOf(q)===-1)return false;if(fStore.value&&g.store!==fStore.value)return false;if(fCat.value){var k=catKey(g.features);if(!k[fCat.value])return false;}if(fRating.value){if(starN(g.rating)<parseInt(fRating.value,10))return false;}return true;}function cmp(a,b){var v;if(sortKey==='name')v=String(a.name||'').localeCompare(String(b.name||''));else if(sortKey==='playtime')v=(a.playtime||0)-(b.playtime||0);else if(sortKey==='lastPlayed')v=String(a.lastPlayed||'').localeCompare(String(b.lastPlayed||''));else if(sortKey==='rating')v=starN(a.rating)-starN(b.rating);return v*sortDir;}function kvRow(k,v){if(v==null||v==='')return '';return '<div class="kv"><span class="k">'+esc(k)+'</span><span>'+esc(v)+'</span></div>';}function bset(t,arr){if(!arr||!arr.length)return '';return '<div class="d-sec"><h4>'+esc(t)+'</h4><div class="badges">'+arr.map(function(x){return '<span class="tag">'+esc(x)+'</span>';}).join('')+'</div></div>';}function sel(i){selected=i;root.querySelectorAll('.d-rows tr').forEach(function(tr){tr.classList.toggle('sel',parseInt(tr.getAttribute('data-i'),10)===i);});var g=DATA[i];if(!g){detailEl.innerHTML='<div class="d-empty">Select a game.</div>';return;}var cover=g.cover?'<img class="dp-cover" src="'+esc(g.cover)+'" alt="">':'';var acts='';if(g.installed&&g.playUri)acts+='<a class="act play" href="'+esc(g.playUri)+'">\u25b6 Play</a>';if(g.storeUrl)acts+='<a class="act" href="'+esc(g.storeUrl)+'" target="_blank" rel="noopener noreferrer">Store \u2197</a>';var links=g.links&&g.links.length?'<div class="d-sec"><h4>Links</h4><div class="badges">'+g.links.map(function(l){return '<a class="tag lnk" href="'+esc(l.url)+'" target="_blank" rel="noopener noreferrer">'+esc(l.name||l.url)+' \u2197</a>';}).join('')+'</div></div>':'';detailEl.innerHTML=cover+'<div class="dp-body"><h2 class="dp-title">'+(g.favorite?'\u2605 ':'')+esc(g.name)+'</h2><div class="dp-sub">'+(g.store?'<span class="store-chip" style="background:'+esc(g.color)+'">'+esc(g.store)+'</span>':'')+(g.year?'<span>'+esc(g.year)+'</span>':'')+(g.playtime>0?'<span>'+g.playtime+' h</span>':'')+(starN(g.rating)>=0?'<span>'+starsHtml(g.rating)+'</span>':'')+'</div>'+(acts?'<div class="d-actions">'+acts+'</div>':'')+(g.description?'<p class="dp-desc">'+esc(g.description)+'</p>':'')+bset('Genres',g.genres)+bset('Features',g.features)+bset('Tags',g.tags)+'<div class="d-sec">'+kvRow('Completion',g.completion)+kvRow('Last played',rel(g.lastPlayed))+kvRow('Released',g.released)+kvRow('Platforms',(g.platforms||[]).join(', '))+kvRow('Developers',(g.developers||[]).join(', '))+kvRow('Publishers',(g.publishers||[]).join(', '))+kvRow('Series',g.series)+'</div>'+links+'</div>';}function draw(){var list=DATA.filter(passes).slice().sort(cmp);rowsEl.innerHTML=list.map(function(g){var thumb=g.cover?'<img loading="lazy" src="'+esc(g.cover)+'">':'<div class="ph">'+esc((g.name||'?').slice(0,2).toUpperCase())+'</div>';var chip=g.store?'<span class="store-chip" style="--c:'+esc(g.color)+'">'+esc(g.store)+'</span>':'';return '<tr class="'+(selected===g._i?'sel':'')+'" data-i="'+g._i+'"><td class="c-thumb">'+thumb+'</td><td class="c-title" title="'+esc(g.name)+'">'+esc(g.name)+'</td><td class="c-plat">'+chip+'</td><td class="c-cat">'+catIcons(g.features)+'</td><td class="c-played">'+(g.playtime>0?g.playtime+' h':'')+'</td><td class="c-last">'+rel(g.lastPlayed)+'</td><td class="c-rating">'+starsHtml(g.rating)+'</td></tr>';}).join('');countEl.textContent=list.length+(list.length===1?' game':' games');root.querySelectorAll('.ind').forEach(function(e){e.textContent=(e.getAttribute('data-for')===sortKey)?(sortDir>0?'\u25b2':'\u25bc'):'';});if(selected==null&&list.length)sel(list[0]._i);}rowsEl.addEventListener('click',function(e){var tr=e.target.closest('tr');if(tr)sel(parseInt(tr.getAttribute('data-i'),10));});rowsEl.addEventListener('mouseover',function(e){var tr=e.target.closest('tr');if(!tr)return;var i=parseInt(tr.getAttribute('data-i'),10);if(i===lastHover)return;lastHover=i;sel(i);});root.querySelectorAll('th[data-sort]').forEach(function(th){th.addEventListener('click',function(){var k=th.getAttribute('data-sort');if(sortKey===k)sortDir=-sortDir;else{sortKey=k;sortDir=1;}draw();});});[fTitle,fStore,fCat,fRating].forEach(function(el){el.addEventListener('input',draw);el.addEventListener('change',draw);});draw();}
+
+  // ---- nav / lazy render ----
+  var rendered={};
+  function showView(v){['gallery','wall','details'].forEach(function(x){document.getElementById('v-'+x).classList.toggle('hidden',x!==v);});document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('active',t.getAttribute('data-view')===v);});if(!rendered[v]){if(v==='gallery')renderGallery();else if(v==='wall')renderWall();else renderDetails();rendered[v]=true;}window.scrollTo(0,0);}
+  document.querySelectorAll('.tab').forEach(function(t){t.addEventListener('click',function(){showView(t.getAttribute('data-view'));});});
+  showView('gallery');
+})();
+</script>
+</body>
+</html>
