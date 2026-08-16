@@ -1,6 +1,6 @@
 # =====================================================================
 #  Library Inventory Export  -  Playnite script extension
-#  Version: 1.4.0
+#  Version: 1.5.0
 #
 #  Adds two items under Playnite's Extensions menu:
 #    1. Export Library Inventory (CSV + JSON)  - full tabular export
@@ -10,6 +10,10 @@
 #  never touches the underlying database files directly.
 #
 #  Changelog:
+#    1.5.0 - Added a third export: "g-export style" - a minimal, dense
+#            cover wall with a one-line header, a "show N without
+#            activity" toggle (unplayed games hidden by default) and
+#            co-op / PvP overlays, styled to match g-export's approach.
 #    1.4.0 - Gallery is now metadata-rich: cards show score / year /
 #            completion / favourite, and clicking a card opens a detail
 #            panel with playtime, all scores, genres, features, tags,
@@ -43,6 +47,12 @@ function GetMainMenuItems
     $html.FunctionName = "Invoke-LibraryGalleryExport"
     $html.MenuSection  = "@"
     $items += $html
+
+    $gx = New-Object Playnite.SDK.Plugins.ScriptMainMenuItem
+    $gx.Description  = "Export Library Gallery (g-export style)"
+    $gx.FunctionName = "Invoke-LibraryGexportStyleExport"
+    $gx.MenuSection  = "@"
+    $items += $gx
 
     return $items
 }
@@ -675,3 +685,160 @@ function Invoke-LibraryGalleryExport
         $PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.Message, "Library Gallery Export - Failed")
     }
 }
+
+
+# --- g-export style shell (minimal cover wall) ----------------------
+function Get-GexportHtmlShell
+{
+    return @'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My Games</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0; background:#101216; color:#e8eaed; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; -webkit-font-smoothing:antialiased}
+header{padding:16px 20px; font-size:14px; color:#aeb4bd; border-bottom:1px solid #262b33; line-height:1.7}
+header .count{color:#e8eaed; font-weight:600}
+header time{color:#cfd4db}
+#toggle{background:none; border:none; color:#5ad1e6; cursor:pointer; font:inherit; padding:0; text-decoration:underline}
+#toggle:hover{color:#8fe3f1}
+.wall{display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:10px; padding:16px 20px}
+.tile{position:relative; display:block; aspect-ratio:3/4; border-radius:6px; overflow:hidden; background:#1b1f27; text-decoration:none; color:inherit}
+.tile img{width:100%; height:100%; object-fit:cover; display:block}
+.tile .ph{width:100%; height:100%; display:flex; align-items:center; justify-content:center; font-size:26px; font-weight:700; color:#6b7280}
+.tile .ov{position:absolute; inset:auto 0 0 0; padding:20px 8px 7px; background:linear-gradient(transparent,rgba(6,8,11,.94)); opacity:0; transition:opacity .14s}
+.tile:hover .ov{opacity:1}
+.tile .nm{display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; font-size:11.5px; font-weight:600; line-height:1.2}
+.tile .tg{display:block; color:#aeb4bd; font-size:10px; margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.flags{position:absolute; top:6px; left:6px; display:flex; gap:4px}
+.flag{font-size:9px; font-weight:700; letter-spacing:.04em; padding:2px 5px; border-radius:4px; background:rgba(6,8,11,.72)}
+.flag.coop{color:#5bd68a}
+.flag.pvp{color:#ff7a7a}
+body:not(.show-all) .tile.no-activity{display:none}
+.foot{padding:14px 20px 40px; color:#6b7280; font-size:12px; border-top:1px solid #262b33}
+@media (max-width:520px){ .wall{grid-template-columns:repeat(auto-fill,minmax(96px,1fr)); gap:8px; padding:12px} }
+@media (prefers-reduced-motion:reduce){ *{transition:none !important} }
+</style>
+</head>
+<body>
+<header>
+  <span class="count">{{WITHACT}} games</span> &ndash; game list exported from Playnite using Library Inventory Export &ndash; <time>{{GENERATED}}</time> &ndash; <button id="toggle" data-n="{{NOACT}}">show {{NOACT}} without activity</button>
+</header>
+<main class="wall">{{TILES}}</main>
+<footer class="foot">{{TOTAL}} games total.</footer>
+<script>
+(function(){
+  var t=document.getElementById('toggle');
+  if(!t) return;
+  t.addEventListener('click',function(){
+    document.body.classList.toggle('show-all');
+    var on=document.body.classList.contains('show-all');
+    t.textContent=(on?'hide ':'show ')+t.getAttribute('data-n')+' without activity';
+  });
+})();
+</script>
+</body>
+</html>
+'@
+}
+
+# --- g-export style export ------------------------------------------
+function Invoke-LibraryGexportStyleExport
+{
+    param($scriptMainMenuItemActionArgs)
+
+    # ---- Configuration ----------------------------------------------
+    $exportRoot    = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Playnite Exports'
+    $includeHidden = $false
+    $autoOpen      = $true
+    # -----------------------------------------------------------------
+
+    try
+    {
+        $stamp     = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+        $outDir    = Join-Path $exportRoot "gexport_$stamp"
+        $coversDir = Join-Path $outDir 'covers'
+        New-Item -ItemType Directory -Path $coversDir -Force | Out-Null
+
+        $tiles        = New-Object System.Collections.Generic.List[string]
+        $total        = 0
+        $withActivity = 0
+
+        # Most-played first (activity-forward, like g-export).
+        $games = $PlayniteApi.Database.Games | Sort-Object { -([double]$_.Playtime) }, Name
+
+        foreach ($game in $games)
+        {
+            if (-not $includeHidden -and $game.Hidden) { continue }
+            $total++
+
+            $playHours = if ($game.Playtime) { [math]::Round($game.Playtime / 3600, 1) } else { 0 }
+            $activity  = if ($playHours -gt 0) { 1 } else { 0 }
+            if ($activity -eq 1) { $withActivity++ }
+
+            $store = if ($null -ne $game.Source) { $game.Source.Name } else { 'None' }
+
+            $coverRel = ''
+            if ($game.CoverImage) {
+                $src = $PlayniteApi.Database.GetFullFilePath($game.CoverImage)
+                if ($src -and (Test-Path -LiteralPath $src)) {
+                    $ext = [System.IO.Path]::GetExtension($src)
+                    if ([string]::IsNullOrEmpty($ext)) { $ext = '.jpg' }
+                    $destName = "$($game.Id)$ext"
+                    try { Copy-Item -LiteralPath $src -Destination (Join-Path $coversDir $destName) -Force; $coverRel = "covers/$destName" } catch { $coverRel = '' }
+                }
+            }
+
+            $url     = Get-StoreUrl $game $store
+            $nameEsc = Escape-Html $game.Name
+
+            if ($coverRel) {
+                $img = "<img loading=""lazy"" src=""$coverRel"" alt=""$nameEsc"">"
+            } else {
+                $rawName = [string]$game.Name
+                $init    = Escape-Html ($rawName.Substring(0,[Math]::Min(2,$rawName.Length)).ToUpper())
+                $img     = "<div class=""ph"">$init</div>"
+            }
+
+            $features = @(Get-NameArray $game.Features)
+            $flags = ''
+            if ($features -match '(?i)co-?op') { $flags += "<span class=""flag coop"">CO-OP</span>" }
+            if ($features -match '(?i)pvp')     { $flags += "<span class=""flag pvp"">PVP</span>" }
+            $flagsHtml = if ($flags) { "<div class=""flags"">$flags</div>" } else { "" }
+
+            $tagArr  = @(Get-NameArray $game.Tags)
+            $tagLine = if ($tagArr.Count -gt 0) { "<span class=""tg"">" + (Escape-Html (($tagArr | Select-Object -First 2) -join ', ')) + "</span>" } else { "" }
+
+            $ov      = "<div class=""ov""><span class=""nm"">$nameEsc</span>$tagLine</div>"
+            $naClass = if ($activity -eq 0) { " no-activity" } else { "" }
+
+            if ($url) {
+                $urlEsc = Escape-Html $url
+                $tile = "<a class=""tile$naClass"" href=""$urlEsc"" target=""_blank"" rel=""noopener noreferrer"" title=""$nameEsc"" data-activity=""$activity"">$img$flagsHtml$ov</a>"
+            } else {
+                $tile = "<div class=""tile$naClass"" title=""$nameEsc"" data-activity=""$activity"">$img$flagsHtml$ov</div>"
+            }
+            $tiles.Add($tile)
+        }
+
+        $noActivity = $total - $withActivity
+        $generated  = Get-Date -Format 'yyyy-MM-dd HH:mm'
+        $tilesHtml  = ($tiles -join "`n")
+
+        $html = (Get-GexportHtmlShell).Replace('{{TILES}}', $tilesHtml).Replace('{{WITHACT}}', [string]$withActivity).Replace('{{NOACT}}', [string]$noActivity).Replace('{{TOTAL}}', [string]$total).Replace('{{GENERATED}}', $generated)
+
+        $indexPath = Join-Path $outDir 'index.html'
+        $html | Out-File -LiteralPath $indexPath -Encoding UTF8
+
+        $PlayniteApi.Dialogs.ShowMessage("g-export style gallery: $total games ($withActivity with activity, $noActivity without).`n`n$indexPath", "Library Gallery (g-export style)")
+        if ($autoOpen) { try { Start-Process $indexPath } catch {} }
+    }
+    catch
+    {
+        $PlayniteApi.Dialogs.ShowErrorMessage($_.Exception.Message, "Library Gallery (g-export style) - Failed")
+    }
+}
+
