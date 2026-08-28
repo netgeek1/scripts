@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.32.0
+audiobook-tagger 1.33.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.32.0"
+__version__ = "1.33.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -944,7 +944,7 @@ def scan_library(root: Path, cfg: Dict[str, Any]) -> List[Book]:
     for path, files in sorted(groups.items()):
         rel = path.relative_to(root).parts if path != root else ()
         files = sorted(files, key=natural_key)
-        for sub in split_distinct_books(files):
+        for sub in split_books_in_dir(files):
             books.append(Book(path=path, files=sub, root=root, rel_parts=list(rel)))
     log.info("scanned %s: %d book(s), %d file(s)",
              root, len(books), sum(len(b.files) for b in books))
@@ -990,6 +990,69 @@ def _looks_multipart(names: Sequence[str]) -> bool:
         if all(re.match(r"^[\s._-]*\d", t) for t in tails):
             return True
     return False
+
+
+def _album_key(path: Path) -> Optional[str]:
+    """The embedded album (or title) for one file - the 'which book' identity.
+
+    Read cheaply and defensively; return None if unreadable or absent so the
+    caller can fall back to filename heuristics.
+    """
+    try:
+        ext = path.suffix.lower()
+        if ext == ".mp3":
+            try:
+                tags = ID3(path)
+            except ID3NoHeaderError:
+                return None
+            val = tags.get("TALB") or tags.get("TIT2")
+            text = str(val.text[0]).strip() if val and val.text else ""
+        elif ext in (".m4b", ".m4a", ".mp4"):
+            tags = MP4(path).tags or {}
+            val = tags.get("\xa9alb") or tags.get("\xa9nam")
+            text = str(val[0]).strip() if val else ""
+        elif ext in (".flac", ".ogg", ".opus"):
+            audio = FLAC(path) if ext == ".flac" else OggVorbis(path)
+            val = audio.get("album") or audio.get("title")
+            text = str(val[0]).strip() if val else ""
+        else:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    text = re.sub(r"\s*\(unabridged\)\s*$", "", text, flags=re.I).strip()
+    return text.lower() or None
+
+
+def split_books_in_dir(files: Sequence[Path]) -> List[List[Path]]:
+    """Divide files in one directory into books.
+
+    The embedded ALBUM tag is the authoritative 'which book' signal: chapters
+    of one book share an album, distinct books do not. This is checked first,
+    because renaming can strip the volume tokens the filename heuristic relies
+    on (three tagged books renamed to bare titles look identical to one book by
+    filename alone). Falls back to the filename heuristic when albums are
+    missing or all identical.
+    """
+    files = list(files)
+    if len(files) < 2:
+        return [files]
+
+    keys = [_album_key(f) for f in files]
+    known = [k for k in keys if k]
+    # only trust the tags if most files actually carry an album
+    if len(known) >= max(2, len(files) * 0.6):
+        distinct = set(known)
+        if len(distinct) >= 2:
+            groups: Dict[str, List[Path]] = {}
+            for f, k in zip(files, keys):
+                groups.setdefault(k or f.name.lower(), []).append(f)
+            return [sorted(g, key=natural_key)
+                    for _, g in sorted(groups.items())]
+        # all one album -> one book, regardless of filenames
+        return [files]
+
+    # no reliable album tags: fall back to filename-based heuristics
+    return split_distinct_books(files)
 
 
 def split_distinct_books(files: Sequence[Path]) -> List[List[Path]]:
