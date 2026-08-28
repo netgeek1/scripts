@@ -1,604 +1,481 @@
-# audiobook-tagger
+# Changelog
 
-Scan, identify, tag, verify and report on an audiobook library, writing
-Plex- and Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
-
-Metadata comes from Audible's public catalog by default — no account, no API
-key. Every write is snapshotted first, so any run can be undone.
+All notable changes to audiobook-tagger. Format loosely follows
+[Keep a Changelog](https://keepachangelog.com/); versioning is
+[semantic](https://semver.org/).
 
 ---
 
-## Install
+## [1.33.0] - 2026-08-28
 
-```
-py -m pip install mutagen certifi rapidfuzz PyYAML Pillow
-```
-
-Only `mutagen` is strictly required. The rest are strongly recommended:
-
-| Package | Without it |
-|---|---|
-| `mutagen` | nothing works — hard requirement |
-| `certifi` | `CERTIFICATE_VERIFY_FAILED` on Windows when reaching Audible |
-| `rapidfuzz` | matching falls back to `difflib`, noticeably worse |
-| `PyYAML` | config must be JSON instead of YAML |
-| `Pillow` | covers are embedded at whatever size they arrive |
-
-Python 3.8+. Use `py` rather than `python` on Windows — the launcher works
-regardless of PATH.
+### Fixed
+- **Distinct books sharing a folder collapsed into one after `rename`.** Three
+  separate books in one folder were tagged correctly (scan saw 3), but once
+  `rename` replaced their filenames with bare titles the filename-based grouping
+  could no longer tell them apart, so a later `organize` saw 1 book and moved
+  all three into a single `Book NN` folder. Grouping now uses the embedded
+  **album tag** as the authoritative per-book identity - files that share an
+  album are one book's chapters, files with different albums are different
+  books - and falls back to the filename heuristic only when albums are absent.
 
 ---
 
-## Quick start
+## [1.32.0] - 2026-08-12
 
-Run it with no arguments for the menu (or `py audiobook_tagger.py menu`):
+### Fixed
+- **`verify` marked fully-tagged books as `unknown`.** Any book with any issue
+  was bucketed as unidentified. Status is now three-way: `ok`, `issues`
+  (identified but something is missing), and `unknown` (could not identify the
+  book at all - no title/author and no ASIN).
+- **A single-file M4B with no embedded chapter markers was flagged "Missing
+  Chapters" as an issue.** It plays fine and is fully tagged, so it is now a
+  soft note ("no embedded chapter markers"), not a failure.
+- **Chapter files named `NN - Title` were re-scanned as separate one-file
+  books** (so one book appeared several times, each "Missing Chapters"). A
+  leading track number with a shared title is now correctly regrouped as one
+  book - this is exactly what the tool's own `rename` produces.
 
-```
-py audiobook_tagger.py
-```
-
-```
-==========================================================================
-  audiobook-tagger
-==========================================================================
-  library   : C:\Users\Administrator\OpenAudible\books
-  providers : audible, openaudible, existing, folder
-  tag flags : --plex --ask-asin --report html,csv,json
-  dry run   : NOT yet run
-
-  ACTIONS
-   1. Doctor        - config, providers, TLS, per-book matching (no writes)
-   2. Tag DRY RUN   - show exactly what would change
-   3. Tag WRITE     - apply tags
-   4. Tag MANUAL    - prompt on every book, then write
-   5. Verify        - report gaps in current tags
-   6. Report        - inventory, no lookups
-   7. Match         - show matches only, never writes
-   8. Cover         - fetch and embed covers only
-   9. Normalize     - rewrite existing tags consistently, no lookups
-  10. Organize      - move folders into Author/Series/Book NN - Title
-  11. Rename        - rename track files consistently
-  12. Rollback      - restore tags from a snapshot
-  13. Find library JSON files on disk
-
-  SETTINGS
-   L. Library path        T. Tag options        M. Matching and prompts
-   P. Providers           N. Network and output C. Config file
-   Q. Quit
-```
-
-Every command and every flag is reachable from here — nothing is
-command-line only. The settings screens cover:
-
-- **T — Tag options**: Plex mapping, `--force`, `--renumber`, `--only-missing`,
-  cover-file writing, snapshots on/off, cover mode (auto/replace/keep/remove),
-  genre, cover size, Audible genre.
-- **M — Matching and prompts**: `--ask-asin`, `--manual`, `--yes`, and the
-  `ask_below` / `match_threshold` / `title_only_threshold` values.
-- **P — Providers**: add, remove, reorder, or apply a preset.
-- **N — Network and output**: network on/off, debug dumping, verbosity,
-  workers, Audible region, report formats.
-- **C — Config file**: choose one, clear the override, write a fresh default,
-  or print the current settings as config keys to paste in.
-
-Each action prints the exact command line it is about to run, so the menu
-doubles as a way to learn the CLI.
-
-Option 3 refuses to write until a dry run has been done with the same
-settings, unless you type `WRITE` to override.
-
-The recommended first sequence is **1 → 2 → 3**: confirm the providers are
-reachable, read the dry-run report, then commit.
+### Added
+- `books issues` line in the run summary.
 
 ---
 
-## Command line
+## [1.31.0] - 2026-08-12
 
-```
-py audiobook_tagger.py [global options] <command> [library] [command options]
-```
-
-| Command | Does |
-|---|---|
-| `doctor` | Diagnose config, providers, TLS and per-book matching. Writes nothing. |
-| `tag` | Identify and write tags. The main command. |
-| `verify` | Check the library as it stands, report gaps. |
-| `report` | Inventory without any lookups. |
-| `cover` | Fetch and embed covers only. |
-| `match` | Show what would be matched; forced dry run. |
-| `normalize` | Rewrite existing tags consistently, no lookups. |
-| `organize` | Move folders into `Author/Series/Book NN - Title`. |
-| `rename` | Rename track files consistently. |
-| `rollback` | Restore tags from a backup snapshot. |
-| `menu` | Interactive menu; also the default with no arguments. |
-| `inspect` | Dump every raw tag frame in a file or folder, plus how the tool reads them. |
-
-Global options: `-c CONFIG`, `-v`, `-q`, `-j WORKERS`, `-p/--providers LIST`,
-`-y/--yes`, `--no-network`, `--debug-data`, and `-o/--option KEY=VALUE` to
-override any config key without editing the file:
-
-```
-py audiobook_tagger.py -o ask_below=95 -o audible_region=uk tag D:\Audiobooks
-```
-
-`tag` options: `--plex`, `--force`, `--renumber`, `--only-missing`,
-`--ask-asin`, `--manual`, `--dry-run`, `--replace-cover`, `--keep-cover`,
-`--remove-cover`, `--write-cover-file`, `--no-backup`, `--report FORMATS`.
-
-Typical run:
-
-```
-py audiobook_tagger.py -c config.yaml tag --plex --force --renumber --dry-run
-py audiobook_tagger.py -c config.yaml tag --plex --force --renumber
-```
-
-### Series sorting in Plex
-
-The album tag stays the book title. The **album-sort** tag carries the series:
-
-```
-album (TALB / ©alb / ALBUM)          The Last Hope
-sort  (TSOA / soal / ALBUMSORT)      Omen of the Stars 06 - The Last Hope
-```
-
-Set the Plex library to **Album sorting: By Name** and the series groups in
-reading order under the author, while each book keeps its own cover, summary
-and progress. Zero-padding means book 10 does not sort before book 2; a series
-without a number gets `Series - Title`.
-
-If you would rather see the series in the album tag itself:
-
-```yaml
-album_template: "{series} {index2} - {title}"     # default is "{title}"
-```
-
-Fields: `{title}` `{series}` `{index}` `{index2}` `{author}` `{year}`
-`{narrator}`. Books with no series fall back to the title alone.
-
-### Chapter names (multi-file books)
-
-Plex shows the TITLE tag as the chapter name. By default every file in a book
-carries the book title, so a 30-file book shows 30 identically named tracks.
-`chapter_title_template` fixes that without depending on filenames:
-
-```yaml
-chapter_title_template: "Chapter {track}"        # Chapter 1, Chapter 2, ...
-# or "{title} - Part {track2}"                   # Six of Crows - Part 01
-# or "{title} ({track}/{total})"                 # Six of Crows (1/5)
-```
-
-Fields: `{track}` `{track2}` `{total}` `{title}` `{series}` `{index}`
-`{index2}` `{author}` `{narrator}` `{year}`. Single-file books (a chaptered
-M4B) always keep the book title — the template only applies where a book is
-split across files. A template without `{track}` or `{track2}` warns, since
-every file would end up identically named.
-
-Menu **T → 15**. The TITLE tag counts as the `title` field, so an existing
-title needs `--overwrite-fields title` (or `--force`) to be replaced.
-
-`--chapter-titles` is the older behaviour: derive each file's title from its
-filename. Only useful after `rename` has normalised them.
-
-### Overwriting selectively
-
-By default nothing already populated is touched, which is safe but leaves
-inconsistent tags in place. `--force` overwrites everything.
-`--overwrite-fields` sits between the two.
-
-**They are alternatives, not partners.** `--force` overwrites every field, so
-combining it with `--overwrite-fields` makes the list meaningless — the run
-warns when both are set. In the menu that means turning **T → 2** (force) off
-before **T → 11** (field list) does anything.
-
-```
-py audiobook_tagger.py tag D:\Audiobooks --plex --overwrite-fields title,comment
-```
-
-Run `py audiobook_tagger.py fields` for the full field-to-tag mapping. Two
-that catch people out:
-
-- **`author` is the Artist tag (TPE1); `albumartist` is Album Artist (TPE2).**
-  They are separate tags with separate field names. `--plex` sets both to the
-  author, but listing only `author` leaves the Album Artist tag alone — which
-  matters, since rippers often park the narrator there. List both.
-- **`track` is driven by `--renumber`**, not by a provider, and `--renumber`
-  rewrites track numbers 1..N in file order regardless of the overwrite
-  settings. Leave it off to keep existing track numbers.
-
-`track` and `disc` work here too; `--renumber` is the shorthand for rewriting
-track numbers 1..N in file order.
-
-### Series
-
-Series is written to two places, because readers disagree on where to look:
-
-| | Series name | Number |
-|---|---|---|
-| ID3 (MP3) | `MVNM` + `TXXX:SERIES` | `MVIN` + `TXXX:SERIES-PART` |
-| MP4 (M4B/M4A) | `©mvn` + `SERIES` freeform | `©mvi` + `SERIES-PART` freeform |
-| Vorbis | `MOVEMENTNAME` + `SERIES` | `MOVEMENT` + `SERIES-PART` |
-
-**Use the movement frames** (`MVNM`/`MVIN`, `©mvn`/`©mvi`) if you have to pick
-one. They are the iTunes "Album Movement" fields, they are what Audiobookshelf
-and most audiobook players read, and unlike `TXXX` they survive editors that
-drop unknown user frames. `TXXX:SERIES` is written alongside for tools that
-expect it. Control this with `series_frames: txxx | movement | both`
-(default `both`). The sort field `TSOA` still gets `Series NN - Title` so a
-series sorts in reading order in Plex.
-
-### Organize and rename
-
-Both use the resolved metadata — the same provider chain as `tag`, not the raw
-folder names — and both are template-driven:
-
-```yaml
-organize_template: "{author}/{series}/Book {index2} - {title}"
-organize_template_no_series: "{author}/{title}"
-rename_template: "{track2} - {title}"
-```
-
-Available fields: `{author}` `{title}` `{series}` `{index}` `{index2}`
-`{narrator}` `{year}` `{asin}` `{track}` `{track2}` `{total}`. `index2` and
-`track2` are zero-padded. Empty fields collapse rather than leaving stray
-separators.
-
-`organize` refuses to move a book that matched below 100% and has no ASIN —
-moving folders on a guess is not recoverable the way a tag write is. Tag first,
-then organize.
-
-**Point `organize` at the library root.** It builds
-`Author/Series/Book NN - Title` under that root.
-
-- A book that has its **own dedicated folder** is moved as a folder.
-- Books that live **loose in a shared folder** (several single-file books in
-  one directory) have their files moved into new per-book folders — the shared
-  directory itself is never moved. This is what stops a stray
-  `move C:\temp\books -> ...` that would drag the whole library.
-- Pointed at a single dedicated book folder, the tree roots at that folder's
-  parent so it does not nest inside itself.
-- Books that matched below 100% with no ASIN are held back and listed at the
-  end, so you can tag them first and organize again.
-
-`rename` handles single-file books too, using `rename_template_single`
-(default `{title}`, no track number). A file already named correctly is left
-alone.
-
-**Multiple books in one folder are detected and kept separate.** An author
-folder holding several complete single-file books (`Series 1.m4b`,
-`Series 2.m4b`, ...) is split into one book per volume rather than being
-treated as a single multi-file book and renumbered together. Files that look
-like chapters or parts of one book (Chapter/Part/CD wording, or a shared title
-with a running number) stay grouped.
-
-**Collision guard.** `rename` and `organize` plan every operation first and
-abort the entire run if two sources would land on the same target — renaming
-three books onto `Book 1.m4b` would destroy two of them. Nothing is moved or
-renamed when a collision is detected; the clashing names are listed so you can
-fix the grouping (usually by giving each book its own subfolder).
-
-### Placeholder tags
-
-Ripper placeholders are ignored rather than treated as real metadata:
-`Unknown Album`, `Unknown Artist`, `Untitled`, `Track 3`, `<unknown>`, and
-Windows Media Player's dated form `Unknown Album (4/6/2009 11:31:23 AM)`.
-Without this they propagate into search queries, folder names and filenames.
-Genuine titles that merely start with the word are unaffected —
-`Unknown Soldier` is kept.
-
-Shelf shorthand at the front of a title is also stripped before searching, so
-`SoS1 - The Shadow of Saganami` is looked up as `The Shadow of Saganami`.
-
-### File timestamps
-
-Writing a tag rewrites the file, which normally resets its modified date and
-loses the library's chronology. `preserve_mtime` (on by default) captures each
-file's access and modified times before the write and restores them after. On
-Windows the NTFS creation time is restored too, via `SetFileTime`.
-
-Turn it off with `--no-preserve-mtime`, or menu **T → 13**, if you would rather
-see which files a run actually touched.
-
-`rollback` preserves timestamps the same way, so undoing a run does not stamp
-every file with the current time either.
-
-### Comments
-
-Audible has no comment field, so `comment_source` decides what a comment
-should contain:
-
-| Value | Comment becomes |
-|---|---|
-| `summary` *(default)* | the book description from Audible |
-| `series` | `Series, Book N` (or just the series when there's no number) |
-| `both` | series line, blank line, then the description |
-| `none` | comments are left alone entirely |
-
-**`provider_order` needs `existing` and `folder`.** Dropping them is a common
-mistake: with only `audible` in the chain, any field Audible does not supply
-(comments, for instance — Audible has no comment field) is empty, and empty
-fields are never written, so the old value stays on disk. The tool warns when
-either is missing. A good default is `[audible, existing, folder]`.
-
-`--force` is needed to correct tags that are already populated but wrong
-(a series-prefixed album, for instance). Without it, nothing populated is
-touched.
+### Added
+- Audiobookshelf sidecar output via `--abs` (or menu **N → A**): writes
+  `metadata.opf` (authors, narrators, series+index, ASIN/ISBN, description),
+  `desc.txt`, `reader.txt` and `cover.jpg` next to each book. `metadata.json`
+  is intentionally not written, since Audiobookshelf owns and regenerates it.
 
 ---
 
-## Configuration
+## [1.30.0] - 2026-07-21
 
-If no config file is found, one is written next to the script as
-`audiobook-tagger.yaml`, fully commented, with any discoverable OpenAudible
-paths pre-filled. Edit `library` and re-run.
+### Fixed
+- **Critical: `organize` tried to move the library root itself** when several
+  loose single-file books shared it (`move C:\temp\books -> ...`), because it
+  only knew how to move whole folders and those books had no folder of their
+  own. It now moves such books file-by-file into new per-book folders and never
+  moves a directory shared by more than one book.
+- The organize base no longer climbs above the scan root (which once produced
+  `C:\`). It roots at the configured library or the scan root; only a single
+  dedicated book folder roots at its parent.
 
-Discovery order: `-c` if given, then `audiobook-tagger.{yaml,yml,json}` in the
-working directory, then the same names next to the script.
-
-The menu persists its settings. Changing anything marks the session dirty,
-quitting offers to save, and **C → 1** saves on demand. Saving re-renders the
-commented file with your values, so the explanatory comments survive.
-Everything the menu toggles has a config key, so the settings you save become
-the defaults for plain command-line runs too.
-
-Keys that matter most:
-
-```yaml
-library: "C:/Users/Administrator/OpenAudible/books"
-provider_order: [audible, openaudible, existing, folder]
-audible_region: us
-genre: "Audiobook"
-match_threshold: 82
-title_only_threshold: 90
-ask_below: 100
-```
-
-**`provider_order` is precedence.** The first provider to supply a field wins;
-later ones only fill gaps. Put the source you trust most first. `folder`
-(inference from the directory layout) should stay last.
-
-Available providers: `audible`, `openaudible`, `existing`, `openlibrary`,
-`google`, `musicbrainz`, `folder`.
-
-Override without editing the file:
-
-```
-py audiobook_tagger.py -p audible,existing,folder tag D:\Audiobooks
-```
+### Added
+- `organize` lists books held back for uncertain metadata at the end of the run.
+- Destination collision guard on `organize`, matching `rename`.
+- `shutil`-based moves that create intermediate folders as needed.
 
 ---
 
-## What gets written
+## [1.29.0] - 2026-07-21
 
-Plex reads the standard frames; the `TXXX` frames are what Audiobookshelf and
-similar servers pick up.
+### Fixed
+- **Critical: an author folder of loose single-file books was treated as one
+  multi-file book**, so `rename` renumbered them together and mapped several
+  distinct books onto the same filename (three books → `Book 1.m4b`), which on
+  a real run would destroy files. A directory is now split into separate books
+  when its files carry distinct whole-book volume numbers; chapters and parts
+  of one book still stay grouped.
 
-| Field | ID3 | MP4 | Vorbis |
-|---|---|---|---|
-| Book title | `TALB` | `©alb` | `ALBUM` |
-| Author | `TPE1` / `TPE2` | `©ART` / `aART` | `ARTIST` / `ALBUMARTIST` |
-| Narrator | `TCOM` | `©wrt` | `COMPOSER` + `NARRATOR` |
-| Track | `TRCK` as `n/total` | `trkn` | `TRACKNUMBER` + `TRACKTOTAL` |
-| Publisher | `TPUB` | `©pub` | `PUBLISHER` |
-| Year | `TDRC` | `©day` | `DATE` |
-| Language | `TLAN` (ISO-639-2) | freeform | `LANGUAGE` |
-| Description | `COMM:description` | `desc` / `ldes` | `DESCRIPTION` |
-| Series / index | `TXXX:SERIES` / `SERIES-PART` | freeform | `SERIES` / `SERIES-PART` |
-| ASIN | `TXXX:ASIN` | freeform | `ASIN` |
-| Book page | `TXXX:AUDIBLE_URL` | freeform | `AUDIBLE_URL` |
-| Author page | `TXXX:AUTHOR_URL` | freeform | `AUTHOR_URL` |
-| Sort fields | `TSOA` / `TSO2` / `TSOP` | `soal` / `soaa` | — |
-
-`TSOA` is built as `Series NN - Title` so a series sorts in reading order in
-Plex while the album keeps its real title.
+### Added
+- **Collision guard** on `rename` and `organize`: every operation is planned
+  first, and the whole run aborts (moving/renaming nothing) if two sources
+  would land on the same target. Clashing names are reported.
 
 ---
 
-## Matching
+## [1.28.0] - 2026-07-21
 
-1. **ASIN** — from an existing tag, or found in a folder name or filename
-   (`Foundation [B005T6ZETM]`). Exact, always preferred.
-2. **Folder path** — OpenAudible records each book's path; an exact match beats
-   any fuzzy guess.
-3. **Title + author** — scored, and held to the higher `title_only_threshold`,
-   because title-only matching is the weakest evidence available.
+### Fixed
+- `rename` skipped single-file books entirely (the `total < 2` guard), so a
+  lone `Book.m4b` was never renamed. Single-file books now use
+  `rename_template_single` (default `{title}`).
+- `organize` built its `Author/Series/Book` tree under whatever path it was
+  given, so pointing it at one book folder nested the destination inside the
+  source (`Cannot move a directory into itself`). It now roots the tree at the
+  configured library, or climbs to a safe base, and skips any move whose
+  destination is inside its source.
+- Series titles that reduce to a generic marketing subtitle
+  (`He Who Fights with Monsters 9: A LitRPG Adventure`) no longer lose their
+  real name — the `Series N` form is kept instead of `A LitRPG Adventure`.
 
-Scoring blends token-set with sequence similarity. Pure token-set rates
-"Foundation and Earth" against "Foundation" at 100, which silently tags the
-wrong book; the blend scores it 78.
-
-**Search is keyword-first.** Audible's `title` parameter matches the full
-product title, and series entries are named
-`Warriors: Omen of the Stars #6: The Last Hope` — so `title=The Last Hope`
-returns nothing, exactly as it would on the website. Queries are tried as
-`keywords+author`, `keywords`, `title+author`, `title`, stopping at the first
-that returns results.
-
-Candidate titles are also compared against their trailing segment, so
-`The Last Hope` scores 100 against that full product name instead of 58. The
-series prefix is then stripped from the title that gets written
-(`strip_series_from_title`, on by default), so the album tag reads
-`The Last Hope` while the series fields carry `Omen of the Stars #6`.
-
-Use the `search` command to see exactly what Audible returns for a phrase:
-
-```
-py audiobook_tagger.py search "The Last Hope" --author "Erin Hunter"
-```
-
-It prints each strategy, the parameters sent, how many results came back, and
-each candidate's score against the acceptance floor. Menu option 15.
-
-Several search terms are tried before a book is given up on. An album tag that
-matches the parent folder is a series or box-set name, not a title
-("Warriors 1: The Prophecies Begin"), so the book's own folder name is used
-instead and the album becomes the series. If the first query returns nothing,
-the folder-derived title is tried next.
-
-When a book matches below `ask_below` and `--ask-asin` is set, you get scored
-candidates and a prompt:
-
-```
-  UNCERTAIN MATCH  (no match)
-  folder : ...\Foundation Series\2 - Forward
-  best   : 'Forward' by 'Isaac Asimov'
-
-  Audible candidates:
-    1. [ 76.5] Forward the Foundation | Isaac Asimov | Larry McKeever | 2011-10-19 | Foundation #2 | B005WWT30E
-
-  Enter a number, paste an ASIN (B0XXXXXXXX), 's' to skip this book,
-  or press Enter to accept the best match as-is.
-```
-
-Typing anything that is not a number, ASIN, ID or URL runs a fresh Audible
-search for that text and redraws the candidate list, so a book the automatic
-queries could not find can be located by hand without leaving the run.
-
-`--manual` prompts on every book regardless of score. `--yes` never prompts —
-use it for scheduled tasks so they cannot hang waiting for input.
-
-Prompting forces single-threaded operation so the output stays readable.
+### Added
+- `rename_template_single` for single-file books.
 
 ---
 
-## Undo
+## [1.27.0] - 2026-07-21
 
-Every file touched is snapshotted **before** it is written, cover art
-included. Each entry is appended to `snapshot.jsonl` and flushed to disk
-immediately, so a crash, a kill, or Ctrl-C still leaves a complete record of
-everything already changed. `snapshot.json` is written at the end as a
-convenience; rollback reads whichever exists.
+### Fixed
+- `album_template` was rendered before the `--plex` field mapping, which then
+  overwrote it. It is now applied last.
+- Album-sort no longer doubles the series prefix when `album_template` already
+  contains it (`Series 06 - Series 06 - Title`). The sort string is built from
+  the title rather than the rendered album.
 
-```
-py audiobook_tagger.py rollback --list       # what is available
-py audiobook_tagger.py rollback              # most recent snapshot
-py audiobook_tagger.py rollback 20260720-180720
-py audiobook_tagger.py rollback -n           # preview
-```
-
-`--list` marks any snapshot whose run did not finish:
-
-```
-  snapshots under C:\audiobook-tagger\backups
-    20260721-191702      4 file(s)  INTERRUPTED - partial run
-```
-
-Ctrl-C during a run stops cleanly rather than aborting mid-file, and prints the
-rollback command for that run.
-
-Rollback restores the fields this tool manages. It does not restore foreign
-frames it never read.
-
-Backup directories are relative to the working directory by default — set
-`backup_dir` to an absolute path if you run from more than one place, or
-rollback won't find the snapshot.
+### Added
+- `album_template` exposed in the config file and menu (**T → 16**).
 
 ---
 
-## Reports
+## [1.26.0] - 2026-07-21
 
-Written to `reports/` as HTML, CSV and JSON. Columns worth watching:
+### Fixed
+- **Album-sort was only correct for MP3.** MP4 wrote `soal` as the bare book
+  title and Vorbis wrote no sort tag at all, so series did not group in Plex
+  for M4B/M4A libraries. All three formats now share one builder producing
+  `Series 06 - Title`, zero-padded, falling back to `Series - Title` when the
+  volume has no number.
 
-- **providers** — which sources actually contributed. If `audible` is absent,
-  it isn't being consulted.
-- **score** — match confidence. Anything under 100 deserves a look.
-- **issues** — real problems (missing author, cover, publisher…).
-- **notes** — informational only, e.g. unusual track numbering. No provider
-  supplies track numbers, so this never counts as a failure.
-
----
-
-## Troubleshooting
-
-**`CERTIFICATE_VERIFY_FAILED` / `unable to get local issuer certificate`**
-Python has no usable CA bundle. `py -m pip install certifi` fixes most cases.
-Behind a TLS-inspecting proxy or AV, export its root to PEM and set
-`ca_bundle: "C:/path/root.pem"`. Last resort: `ssl_verify: false`.
-
-**`SyntaxError: Non-UTF-8 code starting with '\x96'`**
-The file was saved as ANSI. The source is pure ASCII as shipped — re-download
-rather than re-saving from an editor set to ANSI.
-
-**`'python' is not recognized`**
-Use `py`.
-
-**A provider contributes nothing**
-Run `doctor`. It shows which config was loaded, every path checked for
-OpenAudible's JSON, per-field coverage of what that JSON can supply, a live
-Audible probe, and per-book match results for both providers.
-
-**Wrong metadata got written**
-`rollback`, then raise `title_only_threshold`, or re-run with `--ask-asin`.
-
-**M4A/M4B tracks show as a bare number, not `n/total`**
-That is a storage difference, not a bug. ID3 keeps `TRCK` as one string
-(`"1/30"`); MP4 keeps `trkn` as a pair, and most tag editors show only the
-first half in a Track column. Run `inspect` to see the real pair, e.g.
-`trkn [(1, 2)]`. If the total is genuinely `0`, `verify` reports
-`track total missing (n of 0)` and `--renumber` fixes it.
-
-**Tags don't look right**
-`py audiobook_tagger.py inspect "D:\Audiobooks\Author\Book"` prints every raw
-frame in every file plus the parsed interpretation, so you can see exactly what
-is on disk rather than trusting a tag editor's column layout.
-
-**Everything, in detail**
-`--debug-data` logs every provider response and dumps the raw JSON under
-`logs/payloads/<date>/`, numbered in call order, alongside the parsed result
-for each book.
+### Added
+- `album_template` (default `{title}`) for putting the series in the visible
+  album tag instead of relying on sort order.
 
 ---
 
-## Notes and limits
+## [1.25.0] - 2026-07-21
 
-- Audible's catalog endpoint is public but undocumented. Field names can
-  change and heavy use may be rate-limited; every call fails soft and the
-  chain continues to the next provider.
-- Roughly two HTTP calls per book (search plus cover) at about one per
-  second. Once ASINs are written, later runs match by ASIN directly — faster
-  and exact.
-- OpenAudible's internal `books.json` is often far sparser than its
-  File → Export dump. `doctor --find-json` finds every library JSON on disk
-  and reports which fields each one actually carries.
-- `--dry-run` changes nothing and still produces a full report.
+### Added
+- `chapter_title_template` for the TITLE tag on multi-file books, which Plex
+  displays as the chapter name — e.g. `Chapter {track}`,
+  `{title} - Part {track2}`. Single-file books keep the book title. Warns if
+  the template contains no `{track}`/`{track2}`, since every file would then
+  be named identically.
 
 ---
 
-## Version history
+## [1.24.0] - 2026-07-21
 
-See [CHANGELOG.md](CHANGELOG.md).
+### Changed
+- **Backups are now incremental.** Each entry is appended to `snapshot.jsonl`
+  and fsync'd *before* its file is written, so a crash, kill or Ctrl-C still
+  leaves a complete record of everything already changed. `snapshot.json` is
+  still written at the end; rollback reads either. Truncated final lines are
+  skipped with a warning.
+- Ctrl-C stops cleanly, cancels pending work, finalises the snapshot and prints
+  the exact rollback command.
 
-## Plex and Audiobookshelf
+### Added
+- `rollback --list`, marking runs that did not finish as `INTERRUPTED`.
+- `rollback` accepts a bare snapshot name as well as a path.
 
-**Plex** reads embedded tags, so a normal `--plex` tag run needs nothing extra.
-Set the library to **Album sorting: By Name** for series grouping, and
-`--write-cover-file` if you want a `cover.jpg` in each folder as well as the
-embedded art.
+---
 
-**Audiobookshelf** trusts sidecar files above embedded tags, so `--abs` also
-writes, next to each book:
+## [1.23.0] - 2026-07-21
 
-- `metadata.opf` — title, authors (`opf:role="aut"`), narrators
-  (`opf:role="nrt"`), publisher, date, language, description, ASIN, ISBN,
-  genre, and Calibre-style `series` / `series_index`. Set the OPF above Folder
-  Structure in the ABS library's metadata precedence so folder names can't
-  override it.
-- `desc.txt` — the description.
-- `reader.txt` — the narrator.
-- `cover.jpg`.
+### Added
+- `fields` command listing every field name and the tag it writes per format.
+- Warning when `--overwrite-fields` includes `author` but not `albumartist` —
+  they are different tags (TPE1 vs TPE2), and rippers often park the narrator
+  in Album Artist.
+- Menu validates field names when entering an overwrite list.
 
-`metadata.json` is deliberately **not** written: Audiobookshelf owns that file
-and regenerates it, so producing your own would fight the app. After moving or
-tagging files, trigger a library scan in ABS so it reconciles paths.
+---
 
-Toggle the sidecars in the menu at **N → A**, or per run with `--abs`.
+## [1.22.0] - 2026-07-21
 
-## License
+### Fixed
+- **Audible search is keyword-first.** The `title` parameter matches a
+  product's full title, and series entries are named
+  `Warriors: Omen of the Stars #6: The Last Hope`, so `title=The Last Hope`
+  returned nothing. Strategies now run keywords+author → keywords →
+  title+author → title.
+- Candidate titles are compared against their trailing segment too, so
+  `The Last Hope` scores 100 against that full product name instead of 58 —
+  previously the right book was fetched and then discarded.
 
-MIT — see [LICENSE](LICENSE).
+### Added
+- `strip_series_from_title` (default on) so the album tag reads `The Last Hope`
+  rather than Audible's full product title.
+- `search` command showing each strategy, the parameters sent, result counts
+  and per-candidate scores against the acceptance floor. Menu option 15.
 
-Dependencies are installed separately via pip and keep their own licenses;
-note that mutagen is GPL-2.0-or-later, which matters only if you redistribute
-this as a bundled binary rather than as a script. Metadata retrieved from
-Audible, Open Library, Google Books, MusicBrainz and Cover Art Archive belongs
-to those services. Not affiliated with Audible, Amazon, Plex, Audiobookshelf
-or OpenAudible.
+---
+
+## [1.21.0] - 2026-07-21
+
+### Added
+- Warning when `--force` and `--overwrite-fields` are combined — force
+  overwrites everything, making the field list meaningless.
+- The echoed command line is shell-quoted so it can be pasted directly.
+
+---
+
+## [1.20.0] - 2026-07-21
+
+### Fixed
+- An album tag matching the parent folder is a series or box-set name, not a
+  title (`Warriors 1: The Prophecies Begin`). The book's own folder name is
+  used instead and the album becomes the series.
+- Several search terms are tried before giving up, so a junk album tag no
+  longer sinks an otherwise findable book.
+
+### Added
+- Typing free text at the ASIN prompt runs a fresh Audible search and redraws
+  the candidate list.
+
+---
+
+## [1.19.0] - 2026-07-21
+
+### Fixed
+- Ripper placeholders (`Unknown Album`, `Unknown Artist`, `Track 3`,
+  `<unknown>`, and Windows Media Player's `Unknown Album (4/6/2009 ...)`) are
+  ignored rather than treated as titles and propagated into searches, folder
+  names and filenames. Genuine titles like `Unknown Soldier` are kept.
+- Shelf shorthand is stripped before searching (`SoS1 - The Shadow of
+  Saganami` → `The Shadow of Saganami`).
+- A bare Enter at the main menu redraws instead of quitting; only `Q`/`quit`/
+  `exit` or EOF exits.
+
+---
+
+## [1.18.0] - 2026-07-21
+
+### Added
+- `preserve_mtime` (default on): each file's access and modified times are
+  restored after a write, and on Windows the NTFS creation time too, via
+  `SetFileTime`. `rollback` preserves them the same way. `--no-preserve-mtime`
+  opts out.
+
+---
+
+## [1.17.0] - 2026-07-20
+
+### Fixed
+- **Multi-value ID3 frames were being concatenated.** ID3v2.3 separates several
+  values with `/`, and `safe_name` deleted it as an illegal filename character,
+  producing `Kristen WelchMeredith Mitchell`. Now `Kristen Welch, Meredith
+  Mitchell`.
+- `organize`/`rename` had their provider chain hardcoded to `existing, folder`,
+  so they inherited junk tags instead of using the configured providers.
+- Audible IDs are not always `B0xxxxxxxx`; ten-digit numeric IDs and pasted
+  `audible.com/pd/...` URLs are now accepted.
+- Cataloguing noise is stripped before searching (`Book 9 (Special) - Author -
+  Title`, `Title (Series #1) by Author`).
+
+### Added
+- Series written to iTunes movement frames (`MVNM`/`MVIN`, `©mvn`/`©mvi`,
+  `MOVEMENTNAME`/`MOVEMENT`) alongside `TXXX:SERIES`, controlled by
+  `series_frames`.
+- `organize_template`, `organize_template_no_series`, `rename_template`.
+- Path diagnostics: close-name suggestions, case differences, stray whitespace,
+  en/em dashes and curly quotes. The menu validates a library path on entry.
+- `organize` refuses to move a book that matched below 100% with no ASIN.
+
+---
+
+## [1.16.0] - 2026-07-20
+
+### Fixed
+- A file carrying both `TDRC` and `TYER`/`TDAT` displayed as
+  `2014\2014-06-17`. The year write now honours `--overwrite-fields year`, and
+  normalising a date to its year no longer requires forcing at all.
+
+### Added
+- `verify` reports missing track totals (`n of 0`) as a note.
+
+---
+
+## [1.15.0] - 2026-07-20
+
+### Added
+- `comment_source`: `summary` (default), `series`, `both`, `none` — Audible has
+  no comment field, so this decides what a comment should contain.
+- **Menu settings persist.** Changes mark the session dirty, quitting offers to
+  save, **C → 1** saves on demand. Saving re-renders the commented config with
+  current values. Every menu toggle has a config key, so saved settings also
+  apply to plain command-line runs.
+
+---
+
+## [1.14.0] - 2026-07-20
+
+### Fixed
+- `--overwrite-fields track` and `disc` were silently ignored; only
+  `--force`/`--renumber` reached those writes.
+- `--plex` unconditionally forced the flat genre, discarding `audible_genre`.
+
+### Added
+- Warnings when `provider_order` omits `existing` or `folder`.
+
+---
+
+## [1.13.0] - 2026-07-20
+
+### Fixed
+- **MP3 comments were never written.** `_write_id3` wrote a description frame
+  but never `m.comment`; MP4 and Vorbis did. Now written as `COMM` with an
+  empty description, which is what tag editors show as "Comment".
+
+### Added
+- `--overwrite-fields LIST` — overwrite named fields without `--force`.
+- The `--plex` comment is deterministic instead of preferring an existing one.
+
+---
+
+## [1.12.0] - 2026-07-20
+
+### Fixed
+- Files sorted lexicographically, so `Part 10` landed between `Part 1` and
+  `Part 2` and track numbers came out wrong. Now natural-sorted.
+- Per-file titles were derived from filenames and collapsed inconsistently, so
+  files in one book disagreed. Every file now carries the book title;
+  `--chapter-titles` restores the old behaviour.
+- Year is written as a single 4-digit value, clearing `TYER`/`TDAT`/`TDRL`/
+  `TORY`/`TRDA` first.
+
+### Added
+- `inspect` command: raw tag frames plus the parsed interpretation.
+
+---
+
+## [1.11.0] - 2026-07-20
+
+### Added
+- Every command and flag reachable from the menu, across five settings screens
+  (tag options, matching, providers, network/output, config).
+- `-o/--option KEY=VALUE` to override any config key from the command line.
+- Explicit `menu` subcommand.
+
+---
+
+## [1.10.0] - 2026-07-20
+
+### Added
+- `TXXX:AUTHOR_URL` built from Audible's author ASIN.
+- Interactive menu, with a write guard requiring a dry run first.
+- `--manual` (prompt on every book) and `-y/--yes` (never prompt).
+- A commented config is written automatically when none is found.
+- README.
+
+### Fixed
+- `--plex` album mapping is re-applied after a manual ASIN pick.
+
+---
+
+## [1.9.0] - 2026-07-20
+
+### Added
+- `-p/--providers` to override the provider order without a config file.
+- `doctor` queries Audible per sampled book, not just once.
+
+---
+
+## [1.8.0] - 2026-07-20
+
+### Fixed
+- Title-only matches are held to a higher floor (`title_only_threshold`,
+  default 90). `Foundation and Empire` scored 88 against `Foundation and Earth`
+  once the author agreed — a wrong book, not a match.
+- `--plex` no longer overrides `audible_genre`.
+
+### Added
+- TLS handling: certifi support, `ca_bundle`, `ssl_verify`, and targeted advice
+  when a probe fails with `CERTIFICATE_VERIFY_FAILED`.
+- Audible cover art requested at up to 2400px, upscaling the CDN filename.
+- Default provider order puts `audible` first.
+
+---
+
+## [1.7.0] - 2026-07-20
+
+### Added
+- **Audible catalog provider** using the public, unauthenticated
+  `/1.0/catalog/products` endpoint — no account or API key. Supplies narrator,
+  publisher, summary, release date, series and index, ASIN, language and cover
+  art. Region-selectable via `audible_region`.
+- `doctor` probes Audible live and reports the result.
+
+---
+
+## [1.6.0] - 2026-07-20
+
+### Added
+- `--find-json` also scans the working directory, the script's folder, Desktop,
+  and `\OpenAudible` on other fixed drives; `--scan PATH` adds more.
+- Per-field counts in the scan output rather than present/absent.
+
+---
+
+## [1.5.0] - 2026-07-20
+
+### Added
+- `doctor --find-json`: searches the disk for library JSON files and reports
+  which fields each one actually contains.
+
+---
+
+## [1.4.0] - 2026-07-20
+
+### Fixed
+- Cover art indexed recursively, since OpenAudible nests it under `art\`.
+- Match hints have collection words trimmed (`Foundation Series` vs
+  `Foundation`) before prefix stripping.
+
+---
+
+## [1.3.0] - 2026-07-20
+
+### Fixed
+- Path matching used `token_set_ratio`, which scored
+  `...series 7 foundation and earth` against `...series 3 foundation` at 97 and
+  matched the wrong volume. Now sequence-based with a 97 floor.
+- Merged OpenAudible entries keyed on folder path rather than ASIN, which had
+  split one book into two records.
+
+### Added
+- Multiple OpenAudible JSON sources merged, earlier files winning.
+- Field-coverage table in `doctor`.
+
+---
+
+## [1.2.0] - 2026-07-20
+
+### Fixed
+- Series-prefixed titles (`Foundation 01 - Prelude to Foundation`) are stripped
+  to the book title, with the number harvested as the series index.
+- Track sequences validated per disc rather than across the whole book.
+
+### Added
+- `doctor` command.
+- `--renumber` to rewrite track numbers 1..N without a full `--force`.
+
+---
+
+## [1.1.0] - 2026-07-19
+
+### Fixed
+- OpenAudible provider rewritten against the real schema — `narrated_by`, not
+  `narratedBy`. HTML stripped from summaries, language normalised to ISO-639-2,
+  cover lookup repaired.
+- Books matched on their recorded folder path rather than fuzzy title guessing.
+- A missing OpenAudible library is a visible warning listing every path tried.
+
+### Added
+- `openaudible_json`, `openaudible_genre`.
+
+---
+
+## [1.0.1] - 2026-07-19
+
+### Fixed
+- Source is pure ASCII with an encoding declaration. Literal en/em dashes in
+  regexes became invalid bytes when the file was saved as ANSI on Windows,
+  producing `SyntaxError: Non-UTF-8 code starting with '\x96'`.
+
+---
+
+## [1.0.0] - 2026-07-19
+
+### Added
+- Initial release. Scans a library, identifies books through a configurable
+  provider chain, and writes Plex- and Audiobookshelf-friendly tags across MP3,
+  M4B/M4A, FLAC and OGG.
+- Providers: existing tags, OpenAudible, Open Library, Google Books,
+  MusicBrainz, folder inference.
+- Cover art download, resize and embed. Verification, duplicate detection, and
+  HTML/CSV/JSON reports. Dry-run mode. Transaction-safe rollback. Parallel
+  processing. YAML/JSON config and daily logs.
