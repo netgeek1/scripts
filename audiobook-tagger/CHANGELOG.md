@@ -6,6 +6,18 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.35.0] - 2026-08-28
+
+### Changed
+- **`organize` and `rename` no longer abort the whole run on a collision.**
+  They now separate the non-conflicting items from the conflicting ones, list
+  the conflicts, and offer a choice: proceed with the clean ones only (leaving
+  the conflicting items untouched), or abort and change nothing. A dry run
+  previews the split without changing anything; a non-interactive run (`-y`)
+  still takes the safe path and aborts.
+
+---
+
 ## [1.34.0] - 2026-08-28
 
 ### Fixed
