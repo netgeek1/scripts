@@ -6,6 +6,18 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.37.0] - 2026-08-28
+
+### Changed
+- **Dry run now previews the complete picture, not just conflicts.** Every book
+  is listed with what would happen to it: `move` with its destination,
+  `CONFLICT` with the shared destination (both colliding sources shown),
+  `in place`, `held`, or `no dest`, followed by the reconciling accounting line.
+  A dry run never prompts. `rename` previews the same way. The choose/abort
+  prompt now appears only on a real run.
+
+---
+
 ## [1.36.0] - 2026-08-28
 
 ### Changed
