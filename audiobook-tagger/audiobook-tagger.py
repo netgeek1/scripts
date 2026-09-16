@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.34.0
+audiobook-tagger 1.35.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.34.0"
+__version__ = "1.35.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -3738,8 +3738,49 @@ def _organize_base(scan_root: Path, books: Sequence[Book],
     return base
 
 
+def _resolve_conflict(kind: str, clean_count: int,
+                      conflicts: List[Tuple[str, List[str]]],
+                      dry_run: bool, non_interactive: bool) -> str:
+    """Show the conflict, then decide how to proceed.
+
+    Returns 'clean' (do the non-conflicting ones), 'abort' (do nothing), or
+    'preview' (dry-run only: just show, change nothing). In non-interactive
+    runs the safe default is 'abort' for a real run and 'preview' for a dry run.
+    """
+    log.warning("%s: %d destination(s) would receive more than one item:", kind,
+                len(conflicts))
+    for dest, names in conflicts[:20]:
+        log.warning("    %s  <-  %s", Path(dest).name, ", ".join(names))
+    if len(conflicts) > 20:
+        log.warning("    ... and %d more", len(conflicts) - 20)
+    log.warning("%d %s have NO conflict and can proceed.", clean_count,
+                "book(s)" if kind.startswith("organize") else "file(s)")
+
+    if dry_run:
+        return "preview"        # never changes anything on a dry run
+    if non_interactive:
+        log.warning("%s: conflicts present and running non-interactively - "
+                    "nothing moved. Re-run without -y to choose, or fix the "
+                    "conflicts.", kind)
+        return "abort"
+
+    print("")
+    print(f"  {len(conflicts)} conflict(s); {clean_count} clean.")
+    print("  [c] proceed with the clean ones only")
+    print("  [a] abort, change nothing")
+    while True:
+        try:
+            choice = input("  Choose c/a: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "abort"
+        if choice in ("c", "clean", "proceed"):
+            return "clean"
+        if choice in ("a", "abort", "", "n"):
+            return "abort"
+
+
 def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
-                dry_run: bool) -> int:
+                dry_run: bool, non_interactive: bool = False) -> int:
     scan_root = root.resolve()
     base = _organize_base(scan_root, books, cfg)
 
@@ -3784,17 +3825,31 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
                 continue
             plan.append((b, dest, False))
 
-    # collision guard across the whole run
+    # find destinations that more than one book targets
     dests: Dict[str, List[str]] = {}
     for b, dest, _ in plan:
         dests.setdefault(str(dest).lower(), []).append(b.path.name)
-    clash = {d: n for d, n in dests.items() if len(n) > 1}
-    if clash:
-        log.error("ABORTING organize: %d destination(s) would receive more than "
-                  "one book. Nothing has been moved.", len(clash))
-        for d, names in list(clash.items())[:10]:
-            log.error("  %s  <-  %s", Path(d).name, ", ".join(names))
-        return 0
+    clash_keys = {d for d, n in dests.items() if len(n) > 1}
+
+    clean_plan = [(b, dest, mv) for (b, dest, mv) in plan
+                  if str(dest).lower() not in clash_keys]
+    if clash_keys:
+        conflicts = [(d, dests[d]) for d in sorted(clash_keys)]
+        decision = _resolve_conflict("organize", len(clean_plan), conflicts,
+                                     dry_run, non_interactive)
+        if decision == "abort":
+            log.warning("organize: nothing moved.")
+            return 0
+        if decision == "preview":
+            # dry run: show the clean ones as what WOULD move, note the skips
+            log.info("organize [dry-run]: %d clean book(s) would move; "
+                     "%d in conflict would be skipped.",
+                     len(clean_plan), len(plan) - len(clean_plan))
+            plan = clean_plan
+        elif decision == "clean":
+            log.info("organize: proceeding with %d clean book(s); skipping %d "
+                     "in conflict.", len(clean_plan), len(plan) - len(clean_plan))
+            plan = clean_plan
 
     moved = 0
     for b, dest, move_folder in plan:
@@ -3840,7 +3895,8 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
     return moved
 
 
-def do_rename(books: Sequence[Book], cfg: Dict[str, Any], dry_run: bool) -> int:
+def do_rename(books: Sequence[Book], cfg: Dict[str, Any], dry_run: bool,
+              non_interactive: bool = False) -> int:
     renamed = 0
     skipped = 0
 
@@ -3866,19 +3922,23 @@ def do_rename(books: Sequence[Book], cfg: Dict[str, Any], dry_run: bool) -> int:
     targets: Dict[str, List[Path]] = {}
     for src, dst in plan:
         targets.setdefault(str(dst).lower(), []).append(src)
-    collisions = {t: srcs for t, srcs in targets.items() if len(srcs) > 1}
-    if collisions:
-        log.error("ABORTING rename: %d target name(s) would receive more than one "
-                  "file. This usually means separate books were grouped as one. "
-                  "Nothing has been renamed.", len(collisions))
-        for t, srcs in list(collisions.items())[:10]:
-            log.error("  %s  <-  %s", Path(t).name,
-                      ", ".join(s.name for s in srcs))
-        if len(collisions) > 10:
-            log.error("  ... and %d more", len(collisions) - 10)
-        log.error("Run 'inspect' on that folder, or rename those books into their "
-                  "own subfolders first.")
-        return 0
+    clash_keys = {t for t, srcs in targets.items() if len(srcs) > 1}
+    clean_plan = [(src, dst) for (src, dst) in plan
+                  if str(dst).lower() not in clash_keys]
+    if clash_keys:
+        conflicts = [(t, [s.name for s in targets[t]]) for t in sorted(clash_keys)]
+        decision = _resolve_conflict("rename", len(clean_plan), conflicts,
+                                     dry_run, non_interactive)
+        if decision == "abort":
+            log.warning("rename: nothing renamed. Run 'inspect' on that folder, "
+                        "or move those books into their own subfolders first.")
+            return 0
+        if decision in ("clean", "preview"):
+            log.info("rename%s: %d clean file(s)%s; %d in conflict skipped.",
+                     " [dry-run]" if dry_run else "", len(clean_plan),
+                     " would be renamed" if dry_run else " renamed",
+                     len(plan) - len(clean_plan))
+            plan = clean_plan
 
     for src, dst in plan:
         if dst.exists():
@@ -5561,7 +5621,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             b.final = resolve_metadata(b, cfg, providers, opts)
             return b
         books = run_parallel(books, _prep, cfg["workers"])
-        moved = do_organize(books, root, cfg, opts.dry_run)
+        moved = do_organize(books, root, cfg, opts.dry_run,
+                             non_interactive=opts.non_interactive)
         return 0
     elif args.command == "rename":
         def _prep2(b: Book) -> Book:
@@ -5569,7 +5630,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             b.final = resolve_metadata(b, cfg, providers, opts)
             return b
         books = run_parallel(books, _prep2, cfg["workers"])
-        renamed = do_rename(books, cfg, opts.dry_run)
+        renamed = do_rename(books, cfg, opts.dry_run,
+                            non_interactive=opts.non_interactive)
         log.info("rename: %d file(s) %s", renamed, "planned" if opts.dry_run else "renamed")
         return 0
 
