@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.33.0
+audiobook-tagger 1.34.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.33.0"
+__version__ = "1.34.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -993,10 +993,13 @@ def _looks_multipart(names: Sequence[str]) -> bool:
 
 
 def _album_key(path: Path) -> Optional[str]:
-    """The embedded album (or title) for one file - the 'which book' identity.
+    """The embedded ALBUM for one file - the 'which book' identity.
 
-    Read cheaply and defensively; return None if unreadable or absent so the
-    caller can fall back to filename heuristics.
+    ALBUM only, never title: chapters and parts of one book share an album but
+    carry per-part titles ('Part 1', 'Chapter 3', ...). Falling back to title
+    would give every part a different key and split one book into many.
+    Also reads the series/movement name as a corroborating grouping key.
+    Returns None when there is no album, so the caller falls back to filenames.
     """
     try:
         ext = path.suffix.lower()
@@ -1005,21 +1008,25 @@ def _album_key(path: Path) -> Optional[str]:
                 tags = ID3(path)
             except ID3NoHeaderError:
                 return None
-            val = tags.get("TALB") or tags.get("TIT2")
+            val = tags.get("TALB")
             text = str(val.text[0]).strip() if val and val.text else ""
         elif ext in (".m4b", ".m4a", ".mp4"):
             tags = MP4(path).tags or {}
-            val = tags.get("\xa9alb") or tags.get("\xa9nam")
+            val = tags.get("\xa9alb")
             text = str(val[0]).strip() if val else ""
         elif ext in (".flac", ".ogg", ".opus"):
             audio = FLAC(path) if ext == ".flac" else OggVorbis(path)
-            val = audio.get("album") or audio.get("title")
+            val = audio.get("album")
             text = str(val[0]).strip() if val else ""
         else:
             return None
     except Exception:  # noqa: BLE001
         return None
-    text = re.sub(r"\s*\(unabridged\)\s*$", "", text, flags=re.I).strip()
+    text = re.sub(r"\s*[\(\[]?unabridged[\)\]]?\s*$", "", text, flags=re.I).strip()
+    # strip a trailing 'Part N' / ', Book N' so two parts of one album that
+    # someone stamped 'Album, Part 1' / 'Album, Part 2' still group together
+    text = re.sub(r"[\s,;:_-]+\b(part|pt|book|vol|volume|disc|disk|cd)\s*\d+\s*$",
+                  "", text, flags=re.I).strip()
     return text.lower() or None
 
 
@@ -1104,6 +1111,36 @@ def split_distinct_books(files: Sequence[Path]) -> List[List[Path]]:
     bases = {part_re.sub("", st).strip() for st in stems}
     if len(bases) == 1 and any(part_re.search(st) for st in stems):
         return [files]
+
+    # A shared title stem with a trailing number differing ('The Book 01',
+    # 'The Book 02', ...) is ambiguous from the filename alone: it could be one
+    # book's parts or distinct volumes. Use the shape of the numbers to decide:
+    # a gapless run starting at 1 (1,2,3) reads as parts; gaps or a high start
+    # (8,9,11) read as distinct volumes. Only applies without a 'Book' word.
+    trail = re.compile(r"[\s._#-]*(\d{1,3})\s*$")
+    trail_nums, stem_bases = [], set()
+    for st in stems:
+        mt = trail.search(st)
+        if mt:
+            trail_nums.append(int(mt.group(1)))
+            stem_bases.add(trail.sub("", st).strip().lower())
+    # Shared stem with only a trailing number differing: a gapless run from 0
+    # or 1 reads as one book's parts (1,2,3), while gaps or a high start
+    # (8,9,11) read as distinct volumes. This is a filename heuristic only;
+    # when the files carry an ALBUM tag, split_books_in_dir has already used it
+    # and never reaches here, which is the reliable path.
+    # A TRAILING 'Book N' / 'Vol N' (the word right before the number, at the
+    # end of the name) is a volume marker -> distinct books. 'The Book 01' has
+    # 'Book' inside the title, not before the trailing number, so it does not
+    # count. This lets 'Series Book 1' / 'Series Book 2' split while
+    # 'The Book 01' / '02' / '03' stays one book.
+    trailing_vol = all(re.search(r"\b(book|vol|volume)\s*\d{1,3}\s*$", st, re.I)
+                       for st in stems)
+    shared_stem = (len(stem_bases) == 1 and len(trail_nums) == len(stems))
+    if shared_stem and not trailing_vol:
+        run = sorted(trail_nums)
+        if run == list(range(1, len(run) + 1)) or run == list(range(0, len(run))):
+            return [files]        # 1,2,3(,4...) -> parts of one book
 
     # Distinct whole-book volume numbers -> separate books, one per volume.
     vols = [_volume_of(n) for n in names]
