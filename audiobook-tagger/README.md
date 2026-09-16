@@ -270,11 +270,21 @@ holds even after `rename` reduces filenames to bare titles. When files carry no
 album tag, a filename heuristic is used instead (distinct volume numbers split;
 Chapter/Part/CD wording or a shared title with a running number stays grouped).
 
-**Collision guard.** `rename` and `organize` plan every operation first and
-abort the entire run if two sources would land on the same target — renaming
-three books onto `Book 1.m4b` would destroy two of them. Nothing is moved or
-renamed when a collision is detected; the clashing names are listed so you can
-fix the grouping (usually by giving each book its own subfolder).
+**Collision handling.** `rename` and `organize` plan every operation first and
+detect when two sources would land on the same target (which would destroy
+data). When that happens they separate the clean items from the conflicting
+ones, list the conflicts, and let you choose:
+
+- **[c] proceed with the clean ones** — moves/renames everything that has no
+  conflict and leaves the conflicting items exactly where they are.
+- **[a] abort** — changes nothing.
+
+A dry run always just previews: it shows which clean items would move and how
+many conflicts would be skipped, and changes nothing. A non-interactive run
+(`-y`) takes the safe path and aborts, telling you to re-run without `-y` to
+choose. Conflicts usually mean two books were grouped together or resolved to
+the same title — give each its own subfolder, or tag them so their albums
+differ.
 
 ### Placeholder tags
 
