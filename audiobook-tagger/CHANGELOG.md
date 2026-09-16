@@ -6,6 +6,19 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.36.0] - 2026-08-28
+
+### Changed
+- `organize` now prints a reconciling breakdown so the numbers always add up
+  to the scan count: "N scanned, X to move, Y in conflict, Z already in place,
+  ..." Previously books that were already in the right place or held back for
+  uncertain metadata silently dropped out, so "39 clean + 2 conflict" did not
+  match "43 scanned". Every book is now accounted for in one of: to move,
+  in conflict, already in place, held (uncertain metadata), or no destination.
+- `rename` prints a matching accounting line at its conflict prompt.
+
+---
+
 ## [1.35.0] - 2026-08-28
 
 ### Changed
