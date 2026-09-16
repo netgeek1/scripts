@@ -6,6 +6,27 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.34.0] - 2026-08-28
+
+### Fixed
+- **Parts of one book were split into separate books.** The per-book identity
+  read the embedded TITLE when no ALBUM was present, but parts carry per-part
+  titles ("Part 1", "Chapter 3"), so every part became its own book. Identity
+  now uses the ALBUM tag only (a trailing "Part N"/"Book N" on the album is
+  stripped so oddly-stamped albums still group). The filename fallback, used
+  only when files carry no album, now keeps a shared-stem gapless number run
+  (1,2,3) together as parts while still splitting genuine volume markers
+  ("Book 1"/"Book 2", "Vol 1"/"Vol 2") and gapped/high runs (8,9,11).
+
+### Known limitation
+- For UNtagged files whose name literally contains the word "Book" immediately
+  before a part number ("The Book 01", "The Book 02"), the filename heuristic
+  cannot tell that "Book" is part of the title rather than a volume marker and
+  will over-split. Tag the files first (the album tag resolves it), or put the
+  parts in their own folder.
+
+---
+
 ## [1.33.0] - 2026-08-28
 
 ### Fixed
