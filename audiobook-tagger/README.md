@@ -279,10 +279,12 @@ ones, list the conflicts, and let you choose:
   conflict and leaves the conflicting items exactly where they are.
 - **[a] abort** — changes nothing.
 
-A dry run always just previews: it shows which clean items would move and how
-many conflicts would be skipped, and changes nothing. A non-interactive run
-(`-y`) takes the safe path and aborts, telling you to re-run without `-y` to
-choose. Conflicts usually mean two books were grouped together or resolved to
+Every real run shows the complete plan first — each book/file with its
+destination, plus any conflicts, in-place, and held items — then asks to
+proceed (`[y/N]` with no conflicts, or the clean/abort choice with conflicts).
+A dry run shows the same plan and changes nothing. A non-interactive run (`-y`)
+proceeds without confirming when there are no conflicts, and aborts when there
+are. Conflicts usually mean two books were grouped together or resolved to
 the same title — give each its own subfolder, or tag them so their albums
 differ.
 
