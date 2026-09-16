@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.37.0
+audiobook-tagger 1.38.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.37.0"
+__version__ = "1.38.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -3852,25 +3852,29 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
             parts.append(f"{len(undetermined)} no destination")
         log.info("organize accounting: " + ", ".join(parts))
 
-    # A dry run shows the COMPLETE picture - every book and what would happen to
-    # it - and changes nothing. No prompt on a preview.
+    # Show the COMPLETE plan - every book and what would happen to it - before
+    # anything is written, on dry runs AND real runs. A real run then asks
+    # whether to proceed (only when there are conflicts to resolve).
+    prefix = "[dry-run] " if dry_run else ""
+    log.info("%sorganize plan:", prefix)
+    for b, dest, move_folder in sorted(plan, key=lambda t: str(t[1]).lower()):
+        if str(dest).lower() in clash_keys:
+            log.warning("  %sCONFLICT  %s -> %s  (shares destination)",
+                        prefix, b.path.name, dest)
+        elif move_folder:
+            log.info("  %smove      %s -> %s", prefix, b.path.name, dest)
+        else:
+            log.info("  %smove %d file(s)  %r -> %s",
+                     prefix, len(b.files), (b.final.title or b.path.name), dest)
+    for name in sorted(already):
+        log.info("  %sin place  %s", prefix, name)
+    for name in sorted(held):
+        log.info("  %sheld      %s  (uncertain metadata)", prefix, name)
+    for name in sorted(undetermined):
+        log.info("  %sno dest   %s", prefix, name)
+    _breakdown()
+
     if dry_run:
-        for b, dest, move_folder in sorted(plan, key=lambda t: str(t[1]).lower()):
-            if str(dest).lower() in clash_keys:
-                log.warning("[dry-run] CONFLICT  %s -> %s  (shares destination)",
-                            b.path.name, dest)
-            elif move_folder:
-                log.info("[dry-run] move      %s -> %s", b.path.name, dest)
-            else:
-                log.info("[dry-run] move %d file(s)  %r -> %s",
-                         len(b.files), (b.final.title or b.path.name), dest)
-        for name in sorted(already):
-            log.info("[dry-run] in place   %s", name)
-        for name in sorted(held):
-            log.info("[dry-run] held       %s  (uncertain metadata)", name)
-        for name in sorted(undetermined):
-            log.info("[dry-run] no dest    %s", name)
-        _breakdown()
         if clash_keys:
             log.warning("[dry-run] %d destination(s) have a conflict; on a real run "
                         "you can proceed with the clean ones or abort.",
@@ -3878,7 +3882,6 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
         return len(clean_plan)
 
     if clash_keys:
-        _breakdown()
         conflicts = [(d, dests[d]) for d in sorted(clash_keys)]
         decision = _resolve_conflict("organize", len(clean_plan), conflicts,
                                      dry_run, non_interactive)
@@ -3888,37 +3891,40 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
         log.info("organize: proceeding with %d clean book(s); skipping %d "
                  "in conflict.", len(clean_plan), len(plan) - len(clean_plan))
         plan = clean_plan
+    elif not non_interactive:
+        # no conflicts: still confirm before a real move
+        try:
+            if input(f"  Move {len(plan)} book(s)? [y/N] ").strip().lower() \
+                    not in ("y", "yes"):
+                log.warning("organize: nothing moved.")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            log.warning("organize: nothing moved.")
+            return 0
 
+    # plan already shown and confirmed; execute quietly, reporting only trouble
     moved = 0
     for b, dest, move_folder in plan:
         if move_folder:
-            log.info("%smove %s -> %s", "[dry-run] " if dry_run else "",
-                     b.path, dest)
-            if not dry_run:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(b.path), str(dest))
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(b.path), str(dest))
             moved += 1
         else:
-            # move each file individually into the destination folder
-            log.info("%smove %d file(s) of %r -> %s",
-                     "[dry-run] " if dry_run else "", len(b.files),
-                     (b.final.title or b.path.name), dest)
             file_targets = {}
             collision = False
             for f in b.files:
                 tgt = dest / f.name
-                key = str(tgt).lower()
-                if key in file_targets or tgt.exists():
-                    log.error("  would overwrite %s - skipping this book", tgt.name)
+                if str(tgt).lower() in file_targets or tgt.exists():
+                    log.error("  would overwrite %s - skipping %r",
+                              tgt.name, (b.final.title or b.path.name))
                     collision = True
                     break
                 file_targets[f] = tgt
             if collision:
                 continue
-            if not dry_run:
-                dest.mkdir(parents=True, exist_ok=True)
-                for f, tgt in file_targets.items():
-                    shutil.move(str(f), str(tgt))
+            dest.mkdir(parents=True, exist_ok=True)
+            for f, tgt in file_targets.items():
+                shutil.move(str(f), str(tgt))
             moved += 1
 
     verb = "planned" if dry_run else "moved"
@@ -3980,25 +3986,27 @@ def do_rename(books: Sequence[Book], cfg: Dict[str, Any], dry_run: bool,
                  f"{max(0, already_named)} already named correctly"]
         log.info("rename accounting: " + ", ".join(parts))
 
-    # A dry run shows the COMPLETE picture and changes nothing.
+    # Show the full plan first, on dry runs AND real runs.
+    prefix = "[dry-run] " if dry_run else ""
+    log.info("%srename plan:", prefix)
+    for src, dst in sorted(plan, key=lambda t: str(t[1]).lower()):
+        if str(dst).lower() in clash_keys:
+            log.warning("  %sCONFLICT %s -> %s  (shares target)",
+                        prefix, src.name, dst.name)
+        elif dst.exists():
+            log.warning("  %sskip     %s: %s already exists",
+                        prefix, src.name, dst.name)
+        else:
+            log.info("  %srename   %s -> %s", prefix, src.name, dst.name)
+    _rename_breakdown()
+
     if dry_run:
-        for src, dst in sorted(plan, key=lambda t: str(t[1]).lower()):
-            if str(dst).lower() in clash_keys:
-                log.warning("[dry-run] CONFLICT %s -> %s  (shares target)",
-                            src.name, dst.name)
-            elif dst.exists():
-                log.warning("[dry-run] skip     %s: %s already exists",
-                            src.name, dst.name)
-            else:
-                log.info("[dry-run] rename   %s -> %s", src.name, dst.name)
-        _rename_breakdown()
         if clash_keys:
             log.warning("[dry-run] %d target(s) have a conflict; on a real run you "
                         "can proceed with the clean ones or abort.", len(clash_keys))
         return len(clean_plan)
 
     if clash_keys:
-        _rename_breakdown()
         conflicts = [(t, [s.name for s in targets[t]]) for t in sorted(clash_keys)]
         decision = _resolve_conflict("rename", len(clean_plan), conflicts,
                                      dry_run, non_interactive)
@@ -4009,13 +4017,20 @@ def do_rename(books: Sequence[Book], cfg: Dict[str, Any], dry_run: bool,
         log.info("rename: proceeding with %d clean file(s); skipping %d in conflict.",
                  len(clean_plan), len(plan) - len(clean_plan))
         plan = clean_plan
+    elif not non_interactive:
+        try:
+            if input(f"  Rename {len(plan)} file(s)? [y/N] ").strip().lower() \
+                    not in ("y", "yes"):
+                log.warning("rename: nothing renamed.")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            log.warning("rename: nothing renamed.")
+            return 0
 
     for src, dst in plan:
         if dst.exists():
-            log.warning("skip rename %s: %s already exists", src.name, dst.name)
             skipped += 1
             continue
-        log.info("rename %s -> %s", src.name, dst.name)
         src.rename(dst)
         renamed += 1
     if skipped:
