@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.35.0
+audiobook-tagger 1.36.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.35.0"
+__version__ = "1.36.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -3789,9 +3789,12 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
     from collections import Counter
     path_counts = Counter(b.path.resolve() for b in books)
 
-    # plan first, for a whole-run collision check
+    # plan first, for a whole-run collision check. Every book lands in exactly
+    # one bucket so the totals always reconcile with the scan count.
     plan: List[Tuple[Book, Path, bool]] = []   # (book, dest_folder, move_folder)
-    held: List[str] = []
+    held: List[str] = []           # uncertain metadata
+    already: List[str] = []        # already in the right place
+    undetermined: List[str] = []   # no destination could be built
     for b in books:
         m = b.final if b.final.title else b.existing
         if b.match_score is not None and b.match_score < 100 and not m.asin:
@@ -3801,6 +3804,7 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
             continue
         dest = plan_layout(b, base, cfg)
         if dest is None:
+            undetermined.append(b.path.name)
             log.warning("cannot determine a destination for %s - skipping", b.path.name)
             continue
         dest = dest.resolve()
@@ -3813,8 +3817,10 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
 
         if dedicated:
             if dest == src_dir:
+                already.append(b.path.name)
                 continue
             if src_dir in dest.parents:
+                undetermined.append(b.path.name)
                 log.warning("skip %s: destination would be inside the source. "
                             "Point organize at the LIBRARY ROOT.", b.path.name)
                 continue
@@ -3822,6 +3828,7 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
         else:
             # move this book's FILES into a new folder; never move the shared dir
             if any(f.resolve().parent == dest for f in b.files):
+                already.append(b.path.name)
                 continue
             plan.append((b, dest, False))
 
@@ -3833,7 +3840,22 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
 
     clean_plan = [(b, dest, mv) for (b, dest, mv) in plan
                   if str(dest).lower() not in clash_keys]
+    conflict_count = len(plan) - len(clean_plan)
+
+    def _breakdown() -> None:
+        parts = [f"{len(books)} scanned",
+                 f"{len(clean_plan)} to move",
+                 f"{conflict_count} in conflict"]
+        if already:
+            parts.append(f"{len(already)} already in place")
+        if held:
+            parts.append(f"{len(held)} held (uncertain metadata)")
+        if undetermined:
+            parts.append(f"{len(undetermined)} no destination")
+        log.info("organize accounting: " + ", ".join(parts))
+
     if clash_keys:
+        _breakdown()
         conflicts = [(d, dests[d]) for d in sorted(clash_keys)]
         decision = _resolve_conflict("organize", len(clean_plan), conflicts,
                                      dry_run, non_interactive)
@@ -3885,6 +3907,10 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
 
     verb = "planned" if dry_run else "moved"
     log.info("organize: %d book(s) %s", moved, verb)
+    if not clash_keys:
+        _breakdown()
+    if already:
+        log.info("organize: %d book(s) already in the right place.", len(already))
     if held:
         log.warning("organize: %d book(s) held back for uncertain metadata - "
                     "tag them first (tag --ask-asin), then organize again:", len(held))
@@ -3892,6 +3918,9 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
             log.warning("    %s", name)
         if len(held) > 12:
             log.warning("    ... and %d more", len(held) - 12)
+    if undetermined:
+        log.warning("organize: %d book(s) had no usable destination.",
+                    len(undetermined))
     return moved
 
 
@@ -3926,6 +3955,11 @@ def do_rename(books: Sequence[Book], cfg: Dict[str, Any], dry_run: bool,
     clean_plan = [(src, dst) for (src, dst) in plan
                   if str(dst).lower() not in clash_keys]
     if clash_keys:
+        already_named = sum(1 for b in books for f in b.files) - len(plan)
+        log.info("rename accounting: %d file(s) across %d book(s); %d to rename, "
+                 "%d in conflict, %d already correctly named",
+                 sum(len(b.files) for b in books), len(books),
+                 len(clean_plan), len(plan) - len(clean_plan), max(0, already_named))
         conflicts = [(t, [s.name for s in targets[t]]) for t in sorted(clash_keys)]
         decision = _resolve_conflict("rename", len(clean_plan), conflicts,
                                      dry_run, non_interactive)
