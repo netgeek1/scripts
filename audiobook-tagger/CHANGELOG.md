@@ -6,6 +6,19 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.38.0] - 2026-08-28
+
+### Changed
+- **The full plan is now shown before any `organize` or `rename` runs, not just
+  on a dry run.** A real run lists every book/file and its destination (moves,
+  conflicts, in-place, held) and then asks to proceed: `[y/N]` when there are no
+  conflicts, or the clean/abort choice when there are. Previously a real run
+  jumped straight to the conflict prompt showing only counts, so you could not
+  review the moves before committing. Execution afterwards is quiet, since the
+  plan was already displayed.
+
+---
+
 ## [1.37.0] - 2026-08-28
 
 ### Changed
