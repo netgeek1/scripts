@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.45.0
+audiobook-tagger 1.46.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.45.0"
+__version__ = "1.46.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -944,6 +944,7 @@ class Book:
     match_score: Optional[float] = None
     match_ambiguous: bool = False
     from_split: bool = False         # one of several books sharing a folder
+    confirm_always: bool = False     # force a prompt even on a certain match
     changes: List[str] = field(default_factory=list)
     status: str = "pending"          # ok | updated | skipped | failed | unknown
     error: str = ""
@@ -3621,6 +3622,9 @@ def prompt_for_asin(book: Book, final: Meta, audible: Optional["AudibleProvider"
     if book.match_ambiguous:
         header = ("MULTIPLE MATCHES" +
                   (f"  (top {score:.0f}%)" if score is not None else ""))
+    elif book.confirm_always:
+        header = ("CONFIRM BOOK" +
+                  (f"  ({score:.0f}%)" if score is not None else ""))
     elif score is None:
         header = "NO MATCH"
     elif score >= 99.5:
@@ -3633,7 +3637,22 @@ def prompt_for_asin(book: Book, final: Meta, audible: Optional["AudibleProvider"
     if book.match_ambiguous:
         print("  Several candidates scored the same - pick the right edition "
               "(watch for 'Dramatized Adaptation' vs the regular edition).")
+    elif book.confirm_always:
+        print("  Multiple books share this folder - confirm THIS file's match "
+              "(see the file name below); tags here may be shared or wrong.")
     print(f"  folder : {book.path}")
+    # List the files this book will tag, so split books in a shared folder are
+    # distinguishable (which of '6 Fugitive' / '7 System Collapse' is this?).
+    names = [f.name for f in book.files]
+    if len(names) == 1:
+        print(f"  file   : {names[0]}")
+    else:
+        shown = names[:6]
+        print(f"  files  : {len(names)} file(s)")
+        for nm in shown:
+            print(f"           {nm}")
+        if len(names) > len(shown):
+            print(f"           ... and {len(names) - len(shown)} more")
     print(f"  tags   : album={book.existing.album!r} artist={book.existing.author!r}")
     print(f"  best   : {final.title!r} by {final.author!r}"
           f"{' / ' + final.narrator if final.narrator else ''}"
@@ -3706,8 +3725,8 @@ def tag_book(book: Book, cfg: Dict[str, Any], providers: Dict[str, Provider],
         # This avoids a 99.5-99.9 score - from multi-author or series scoring -
         # tripping an "ask_below=100" prompt on what is really an exact hit.
         certain = (book.match_score is not None and book.match_score >= 99.5
-                   and not book.match_ambiguous)
-        needs_prompt = opts.manual or book.match_ambiguous or (
+                   and not book.match_ambiguous and not book.confirm_always)
+        needs_prompt = opts.manual or book.match_ambiguous or book.confirm_always or (
             not certain and (book.match_score is None
                              or book.match_score < opts.ask_below))
         if book.match_ambiguous and (opts.non_interactive or not opts.ask_asin):
@@ -5875,6 +5894,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             providers = {}
         if args.command == "match":
             opts.dry_run = True
+        # Split siblings (several books in one folder) are ambiguous by nature -
+        # shared folder, often shared or wrong tags - so always confirm them
+        # when prompting is available, never silently auto-tag.
+        from collections import Counter as _Counter
+        _folder_counts = _Counter(b.path.resolve() for b in books)
+        for _b in books:
+            if _b.from_split or _folder_counts[_b.path.resolve()] > 1:
+                _b.from_split = True
+                _b.confirm_always = True
         try:
             books = run_parallel(books, lambda b: tag_book(b, cfg, providers, opts, backup),
                                  cfg["workers"])
