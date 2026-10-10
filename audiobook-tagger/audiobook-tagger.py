@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.40.0
+audiobook-tagger 1.41.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.40.0"
+__version__ = "1.41.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -1110,19 +1110,19 @@ def split_books_in_dir(files: Sequence[Path]) -> List[List[Path]]:
 
     keys = [_album_key(f) for f in files]
     known = [k for k in keys if k]
-    # only trust the tags if most files actually carry an album
-    if len(known) >= max(2, len(files) * 0.6):
-        distinct = set(known)
-        if len(distinct) >= 2:
-            groups: Dict[str, List[Path]] = {}
-            for f, k in zip(files, keys):
-                groups.setdefault(k or f.name.lower(), []).append(f)
-            return [sorted(g, key=natural_key)
-                    for _, g in sorted(groups.items())]
-        # all one album -> one book, regardless of filenames
-        return [files]
+    # Trust distinct album tags to split: chapters share an album, separate
+    # books do not. (Survives a rename that strips filename volume tokens.)
+    if len(known) >= max(2, len(files) * 0.6) and len(set(known)) >= 2:
+        groups: Dict[str, List[Path]] = {}
+        for f, k in zip(files, keys):
+            groups.setdefault(k or f.name.lower(), []).append(f)
+        return [sorted(g, key=natural_key) for _, g in sorted(groups.items())]
 
-    # no reliable album tags: fall back to filename-based heuristics
+    # A shared album (or missing albums) does NOT prove one book: a series name
+    # is often stamped into every file's album ('Murderbot Diaries',
+    # 'Murderbot Diaries, Book 6'). Let the filenames decide - if they show
+    # distinct volumes with distinct titles, that split wins; otherwise the
+    # files are treated as one book's chapters.
     return split_distinct_books(files)
 
 
