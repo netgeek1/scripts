@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.43.0
+audiobook-tagger 1.44.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.43.0"
+__version__ = "1.44.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -943,6 +943,7 @@ class Book:
     notes: List[str] = field(default_factory=list)
     match_score: Optional[float] = None
     match_ambiguous: bool = False
+    from_split: bool = False         # one of several books sharing a folder
     changes: List[str] = field(default_factory=list)
     status: str = "pending"          # ok | updated | skipped | failed | unknown
     error: str = ""
@@ -1009,8 +1010,11 @@ def scan_library(root: Path, cfg: Dict[str, Any]) -> List[Book]:
     for path, files in sorted(groups.items()):
         rel = path.relative_to(root).parts if path != root else ()
         files = sorted(files, key=natural_key)
-        for sub in split_books_in_dir(files):
-            books.append(Book(path=path, files=sub, root=root, rel_parts=list(rel)))
+        groups_here = split_books_in_dir(files)
+        split = len(groups_here) > 1
+        for sub in groups_here:
+            books.append(Book(path=path, files=sub, root=root,
+                              rel_parts=list(rel), from_split=split))
     log.info("scanned %s: %d book(s), %d file(s)",
              root, len(books), sum(len(b.files) for b in books))
     return books
@@ -1239,10 +1243,18 @@ def split_distinct_books(files: Sequence[Path]) -> List[List[Path]]:
 
 
 def meta_from_path(book: Book, cfg: Dict[str, Any]) -> Meta:
-    """Infer author / series / title / index from the folder layout."""
+    """Infer author / series / title / index from the folder layout.
+
+    For a book split out of a shared folder (several single-file books in one
+    directory), the folder name is the same for every sibling, so the file's
+    own name is the only thing that distinguishes them - use it for the title.
+    """
     m = Meta(source="folder")
     parts = book.rel_parts or [book.path.name]
-    title_raw = parts[-1]
+    if book.from_split and len(book.files) == 1:
+        title_raw = book.files[0].stem
+    else:
+        title_raw = parts[-1]
     title, number = clean_title(title_raw)
     title, series, index = split_series(title)
 
@@ -3410,10 +3422,12 @@ def resolve_metadata(book: Book, cfg: Dict[str, Any], providers: Dict[str, Provi
     if path_asin and not book.existing.asin:
         log.info("%s: using ASIN %s found in the path/filename", book.path.name, path_asin)
 
-    # An album tag identical to the parent folder is a series or box-set name
-    # ("Warriors 1: The Prophecies Begin"), not this book's title. Prefer the
-    # book's own folder name and treat the album as the series.
-    album = book.existing.album or book.existing.title
+    # For a split book the album tag is shared with its siblings and cannot
+    # identify it; the filename-derived folder title is the reliable hint.
+    if book.from_split and folder.title:
+        album = folder.title
+    else:
+        album = book.existing.album or book.existing.title
     parent = book.rel_parts[-2] if len(book.rel_parts) >= 2 else ""
     hint_series = folder.series
     if album and parent and ratio(album, parent) >= 88 and folder.title:
@@ -5765,7 +5779,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         renumber=getattr(args, "renumber", False) or bool(cfg["renumber"]),
         ask_asin=(getattr(args, "ask_asin", False) or getattr(args, "manual", False)
                   or bool(cfg["ask_asin"]) or bool(cfg["manual"])),
-        manual=getattr(args, "manual", False) or bool(cfg["manual"]),
+        # manual-mode comes from the --manual flag or the config's manual key,
+        # BUT an explicit --ask-asin on the command line means "ask only when
+        # needed", so it clears a stale config manual=true rather than turning
+        # every book into a prompt.
+        manual=(getattr(args, "manual", False)
+                or (bool(cfg["manual"]) and not getattr(args, "ask_asin", False))),
         chapter_titles=(getattr(args, "chapter_titles", False)
                         or bool(cfg["chapter_titles"])),
         force_fields=tuple(x.strip() for x in str(fields_raw).split(",") if x.strip()),
