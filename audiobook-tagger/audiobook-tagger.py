@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.44.0
+audiobook-tagger 1.45.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.44.0"
+__version__ = "1.45.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -1242,6 +1242,34 @@ def split_distinct_books(files: Sequence[Path]) -> List[List[Path]]:
     return [files]
 
 
+def title_from_split_filename(stem: str, author: Optional[str],
+                              series: Optional[str]) -> str:
+    """Isolate the book title from a split-folder filename.
+
+    These look like 'Author - Series - N Title' or 'Author - N - Title'. The
+    distinguishing book title is the text AFTER the volume number; everything
+    before (author, series name, the number) is shelving context shared with
+    the sibling books.
+    """
+    text = stem.strip()
+    # drop a leading author segment ('Martha Wells - ...')
+    if author:
+        text = re.sub(r"^\s*" + re.escape(author) + r"\s*[-\u2013\u2014:]\s*",
+                      "", text, flags=re.I)
+    # take whatever follows the first standalone 1-3 digit number: that is the
+    # per-book title ('... - 7 System Collapse' -> 'System Collapse')
+    m = re.search(r"(?:^|[\s\-\u2013\u2014:_])(\d{1,3})[\s\-\u2013\u2014:._]+(.+)$",
+                  text)
+    if m and len(m.group(2).strip()) >= 2:
+        return m.group(2).strip()
+    # no number: drop a leading series prefix if present
+    if series:
+        stripped = strip_series_prefix(text, series).strip(" -\u2013\u2014:")
+        if len(stripped) >= 2:
+            return stripped
+    return text.strip()
+
+
 def meta_from_path(book: Book, cfg: Dict[str, Any]) -> Meta:
     """Infer author / series / title / index from the folder layout.
 
@@ -1251,12 +1279,20 @@ def meta_from_path(book: Book, cfg: Dict[str, Any]) -> Meta:
     """
     m = Meta(source="folder")
     parts = book.rel_parts or [book.path.name]
+    # series/author come from the folder layout even for a split book
+    folder_author = clean_title(parts[0])[0] if len(parts) >= 2 else None
+    folder_series = clean_title(parts[-1])[0]
+    _, fseries, _ = split_series(folder_series)
     if book.from_split and len(book.files) == 1:
-        title_raw = book.files[0].stem
+        # volume number from the filename, title from after it
+        _, number = clean_title(book.files[0].stem)
+        title = title_from_split_filename(book.files[0].stem, folder_author,
+                                          fseries or folder_series)
+        series, index = fseries, None
     else:
         title_raw = parts[-1]
-    title, number = clean_title(title_raw)
-    title, series, index = split_series(title)
+        title, number = clean_title(title_raw)
+        title, series, index = split_series(title)
 
     if len(parts) >= 2:
         m.author = clean_title(parts[0])[0]
