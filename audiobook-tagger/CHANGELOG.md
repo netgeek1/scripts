@@ -6,6 +6,98 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.46.0] - 2026-10-10
+
+### Added
+- **The match prompt now lists the file(s) being tagged.** For a single-file
+  book it shows `file: <name>`; for a multi-file book it lists them. This makes
+  split books in a shared folder distinguishable at the prompt - you can see
+  whether this is "6 Fugitive Telemetry" or "7 System Collapse".
+
+### Changed
+- **Books that share a folder (split siblings) always prompt for confirmation**
+  when `--ask-asin` is on, instead of auto-tagging on a certain match. Because
+  they share a folder and often share or carry wrong tags, auto-tagging risked
+  giving two different books the same match silently. The prompt header reads
+  "CONFIRM BOOK" and names the file. Single-book folders are unaffected and
+  still auto-tag on a certain match.
+
+---
+
+## [1.45.0] - 2026-10-10
+
+### Fixed
+- **A split book's search still used the shared album, so both halves matched
+  the same title.** 1.44.0 made a split book take its title from the filename,
+  but the filename ("Author - Series - 7 System Collapse") was not reduced to
+  the book title, so the noisy query scored below the match floor, Audible
+  returned nothing, and the book fell back to the shared album tag. A split
+  book's title is now isolated from the text after the volume number
+  ("System Collapse"), with author and series stripped, so each half resolves
+  to its own book ("6 Fugitive Telemetry" -> #6, "7 System Collapse" -> #7)
+  with distinct ASINs and series indices.
+
+---
+
+## [1.44.0] - 2026-10-10
+
+### Fixed
+- **Every book prompted even for a certain single match** when a stale
+  `manual: true` sat in the saved config: config manual-mode overrode an
+  explicit `--ask-asin` on the command line. An explicit `--ask-asin` now means
+  "ask only when needed" and clears config manual-mode; only the `--manual`
+  flag (or the menu's Tag MANUAL action) forces a prompt on every book.
+- **Two books split out of one folder could not be told apart** when they
+  shared an album tag ("6 Fugitive Telemetry" and "7 System Collapse" both
+  tagged album "Fugitive Telemetry" both matched book #6). A book split from a
+  shared folder now takes its search title from its own filename rather than
+  the shared, unreliable album tag, so each resolves to the correct book.
+
+---
+
+## [1.43.0] - 2026-10-10
+
+### Fixed
+- **Tied top matches were decided by a silent coin-flip.** When two or more
+  distinct Audible products scored within 0.5 of the top (e.g. a book and its
+  "Dramatized Adaptation", both at 100), the first one was picked with no
+  prompt - and after 1.42.0's certain-match auto-tagging, not even flagged. A
+  real tie is now detected and always prompts ("MULTIPLE MATCHES"), with a note
+  to watch for the dramatized vs regular edition, even when the score would
+  otherwise auto-confirm. Running non-interactively records a review note
+  instead of committing the pick silently.
+
+---
+
+## [1.42.0] - 2026-10-10
+
+### Fixed
+- **A confident match was labelled "UNCERTAIN MATCH" and prompted anyway.** With
+  `ask_below=100`, a score that rounds to 100% but is fractionally under it
+  (99.5-99.9, e.g. from multi-author or series scoring) tripped the
+  below-threshold prompt. A score of 99.5 or higher is now treated as a certain
+  match: it is auto-tagged without prompting under `ask_below=100`, and when a
+  prompt does appear (e.g. `--manual`) a certain match reads "CONFIRM MATCH"
+  rather than "UNCERTAIN MATCH". Genuinely uncertain scores (below 99.5) still
+  prompt and now show one decimal so a near-miss is distinguishable from a
+  perfect hit. `organize` uses the same 99.5 certainty threshold for holding
+  back unmatched books.
+
+---
+
+## [1.41.0] - 2026-10-10
+
+### Fixed
+- **Two books in one folder stayed merged when they shared an album tag.** The
+  album-tag grouping treated a shared album as proof of one book and never
+  consulted the filenames - but a series name is routinely stamped into every
+  file's album ("Murderbot Diaries, Book 6" on both "6 Fugitive Telemetry" and
+  "7 System Collapse"). A shared or missing album now defers to the filename
+  split: distinct volumes with distinct titles split into separate books, while
+  chapters and parts stay grouped. Distinct album tags still split as before.
+
+---
+
 ## [1.40.0] - 2026-10-10
 
 ### Fixed
