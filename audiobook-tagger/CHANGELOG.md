@@ -6,6 +6,47 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.40.0] - 2026-10-10
+
+### Fixed
+- **`.mp4` audio files were not recognized at all.** `.mp4` is a standard
+  audiobook container (MP4/M4A are the same format), but it was missing from the
+  audio-extension set, so any book delivered as `.mp4` was invisible to the
+  scanner. A library with three `.mp4` books in subfolders plus an eight-part
+  `.mp4` book scanned as far fewer books than it had. `.mp4` is now read, tagged
+  and written through the MP4 path like `.m4b`/`.m4a`.
+- **Two single-file books in one folder were merged into one** when their names
+  shared a prefix but carried distinct volume numbers AND distinct titles after
+  the number ("... - 6 Fugitive Telemetry" / "... - 7 System Collapse"). Such
+  files are now split into separate books; chapter files that merely count up
+  ("Track 1", "1-8", "001") still stay grouped.
+
+### Added
+- A scan warning when a book folder also contains a format-only subfolder
+  (`m4b/`, `mp3/`, …) that holds the same book in another format, so you can tag
+  only one copy instead of both rather than having one silently dropped.
+
+---
+
+## [1.39.0] - 2026-09-17
+
+### Fixed
+- **The correct Audible book was found but scored too low to auto-match** when
+  the album tag carried series/edition cruft ("Jatouche; Pyreans Series, Book
+  03", "Libre: A Silver Ships Novel"). The whole string was both the search
+  query and the text scored against the candidate, so the right book landed at
+  ~50-82% and forced a manual confirm. Titles are now stripped of a trailing
+  series/edition/volume suffix before scoring, so these match at 100%.
+- The album tag is now used as an early search query (cleaned, then raw),
+  ahead of the folder name - a book in a folder like "02 Libre" is searched as
+  "Libre" from its tag instead of "02 Libre".
+
+### Note
+- Fixed a character-class bug where the dash list expanded into an unintended
+  range; unrelated to output but it lived in the new title-suffix code.
+
+---
+
 ## [1.38.0] - 2026-08-28
 
 ### Changed
