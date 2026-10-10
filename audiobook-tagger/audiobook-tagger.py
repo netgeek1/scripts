@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.42.0
+audiobook-tagger 1.43.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.42.0"
+__version__ = "1.43.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -902,7 +902,7 @@ class Meta:
     source: str = ""
     rel_path: Optional[str] = None      # matching hint only, never written
     match_score: Optional[float] = None  # provider confidence, never written
-    rel_path: Optional[str] = None       # hint only, never written to tags
+    match_ambiguous: bool = False        # several top candidates tied, never written
 
     def as_dict(self, with_cover: bool = False) -> Dict[str, Any]:
         d = {k: getattr(self, k) for k in FIELDS}
@@ -942,6 +942,7 @@ class Book:
     issues: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     match_score: Optional[float] = None
+    match_ambiguous: bool = False
     changes: List[str] = field(default_factory=list)
     status: str = "pending"          # ok | updated | skipped | failed | unknown
     error: str = ""
@@ -2760,6 +2761,7 @@ class AudibleProvider(Provider):
 
         floor = max(self.cfg["match_threshold"], self.cfg["title_only_threshold"])
         best, best_score, best_query = None, 0.0, None
+        scored_top: List[Tuple[float, str]] = []   # (score, asin) for tie check
 
         for title in self.query_titles(hint):
             probe = dataclasses.replace(hint)
@@ -2774,6 +2776,7 @@ class AudibleProvider(Provider):
                 if hint.narrator and self.names(prod, "narrators"):
                     if ratio(hint.narrator, self.names(prod, "narrators") or "") > 85:
                         s = min(100.0, s + 5.0)
+                scored_top.append((s, str(prod.get("asin") or "")))
                 if s > best_score:
                     best, best_score, best_query = prod, s, title
             if best_score >= floor:
@@ -2787,8 +2790,17 @@ class AudibleProvider(Provider):
         if best_query and best_query != self.clean_hint_title(hint):
             log.info("audible matched via fallback query %r", best_query)
         log.debug("audible matched %r (%.0f)", best.get("title"), best_score)
+
+        # Two or more DISTINCT products within 0.5 of the top score is a real
+        # tie (e.g. a book and its Dramatized Adaptation both at 100). Picking
+        # the first silently is a coin-flip, so flag it to force a prompt.
+        near = {asin for sc, asin in scored_top
+                if asin and sc >= best_score - 0.5}
+        ambiguous = len(near) >= 2
+
         m = self.to_meta(best, want_cover=want_cover)
         m.match_score = best_score
+        m.match_ambiguous = ambiguous
         return m
 
 
@@ -3440,6 +3452,8 @@ def resolve_metadata(book: Book, cfg: Dict[str, Any], providers: Dict[str, Provi
         if got:
             if got.match_score is not None:
                 book.match_score = max(book.match_score or 0.0, got.match_score)
+            if getattr(got, "match_ambiguous", False):
+                book.match_ambiguous = True
             log.debug("%s returned for %s: %s", name, book.path.name,
                       json.dumps(got.as_dict(with_cover=True), ensure_ascii=False))
             added = final.merge_from(got, overwrite=False)
@@ -3554,7 +3568,10 @@ def prompt_for_asin(book: Book, final: Meta, audible: Optional["AudibleProvider"
                     hint: Meta) -> Optional[str]:
     """Ask the operator to confirm or supply an ASIN."""
     score = book.match_score
-    if score is None:
+    if book.match_ambiguous:
+        header = ("MULTIPLE MATCHES" +
+                  (f"  (top {score:.0f}%)" if score is not None else ""))
+    elif score is None:
         header = "NO MATCH"
     elif score >= 99.5:
         header = f"CONFIRM MATCH  ({score:.0f}%)"
@@ -3563,6 +3580,9 @@ def prompt_for_asin(book: Book, final: Meta, audible: Optional["AudibleProvider"
     print("")
     print("-" * 72)
     print(f"  {header}")
+    if book.match_ambiguous:
+        print("  Several candidates scored the same - pick the right edition "
+              "(watch for 'Dramatized Adaptation' vs the regular edition).")
     print(f"  folder : {book.path}")
     print(f"  tags   : album={book.existing.album!r} artist={book.existing.author!r}")
     print(f"  best   : {final.title!r} by {final.author!r}"
@@ -3635,10 +3655,16 @@ def tag_book(book: Book, cfg: Dict[str, Any], providers: Dict[str, Provider],
         # "uncertain" or prompt on it (unless --manual asks for every book).
         # This avoids a 99.5-99.9 score - from multi-author or series scoring -
         # tripping an "ask_below=100" prompt on what is really an exact hit.
-        certain = (book.match_score is not None and book.match_score >= 99.5)
-        needs_prompt = opts.manual or (
+        certain = (book.match_score is not None and book.match_score >= 99.5
+                   and not book.match_ambiguous)
+        needs_prompt = opts.manual or book.match_ambiguous or (
             not certain and (book.match_score is None
                              or book.match_score < opts.ask_below))
+        if book.match_ambiguous and (opts.non_interactive or not opts.ask_asin):
+            # cannot ask: record it so the run summary and report flag it rather
+            # than silently committing a coin-flip pick
+            book.notes.append("multiple equally-scored matches - review edition "
+                              "(auto-picked the first)")
         if opts.ask_asin and needs_prompt and not opts.non_interactive:
             audible = providers.get("audible")
             chosen = prompt_for_asin(book, book.final, audible if isinstance(
