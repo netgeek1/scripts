@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.38.0
+audiobook-tagger 1.40.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.38.0"
+__version__ = "1.40.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -133,7 +133,7 @@ def ssl_context(cfg: Dict[str, Any]):
 # constants
 # --------------------------------------------------------------------------
 
-AUDIO_EXTS = {".mp3", ".m4b", ".m4a", ".flac", ".ogg"}
+AUDIO_EXTS = {".mp3", ".m4b", ".m4a", ".mp4", ".flac", ".ogg"}
 COVER_NAMES = ("cover", "folder", "front", "artwork", "albumart")
 COVER_EXTS = (".jpg", ".jpeg", ".png")
 USER_AGENT = f"{PROGRAM}/{__version__} (+https://certifiedgeeks.net)"
@@ -744,6 +744,56 @@ def clean_book_title(title: str, series: Optional[str],
     return stripped if len(stripped) >= 3 else original
 
 
+# Words that mark the start of a trailing series/edition suffix in an album tag:
+#   'Jatouche; Pyreans Series, Book 03'  -> 'Jatouche'
+#   'The Silver Ships: The Silver Ships, Book 1' -> 'The Silver Ships'
+#   'Libre: A Silver Ships Novel' -> 'Libre'
+#   'Celus-5 Silver Ships, Book 8' -> 'Celus-5'
+_SERIES_WORD = re.compile(
+    r"\b(series|saga|trilogy|duology|novella?|novel|book|vol|volume|"
+    r"collection|cycle|omnibus|unabridged|abridged)\b", re.I)
+# a trailing ', Book N' / ' #N' / ' Book N' with no separator
+_TRAILING_BOOKNUM = re.compile(
+    r"\s*[,;:]?\s*(?:book|bk|vol|volume|#)\s*\d+\s*$", re.I)
+
+
+def strip_title_suffix(title: str) -> str:
+    """Remove a trailing series/edition/volume phrase from a book title.
+
+    Album tags are often 'Title; Series, Book N', 'Title: A <Series> Novel',
+    or 'Title <Series>, Book N'. The real title is the head; everything from the
+    point the shelving phrase begins is dropped. The split point is the FIRST
+    separator (; : , ( [ dash) whose tail contains a series/edition word, so a
+    title that itself contains such a word ('The Silver Ships') is handled.
+    """
+    if not title:
+        return title
+    out = title.strip()
+
+    # 1. split on a separator whose remainder names a series/edition.
+    #    Build the class safely - DASHES leads with '-', which would form a
+    #    character range if dropped inside [...] unescaped.
+    #    ';' ':' ',' '(' '[' always separate; a dash only when flanked by
+    #    spaces (' - '), so an internal hyphen like 'Celus-5' is preserved.
+    sep_re = re.compile(r"[;:,()\[\]]|\s[\u2013\u2014-]\s")
+    for sep in sep_re.finditer(out):
+        head, tail = out[:sep.start()].strip(), out[sep.end():]
+        if len(head) >= 2 and _SERIES_WORD.search(tail):
+            out = head
+            break
+
+    # 2. a trailing ', Book N' / ' #3' with no separating word
+    prev = None
+    while prev != out:
+        prev = out
+        out = _TRAILING_BOOKNUM.sub("", out).strip(" " + DASHES + ",;:")
+
+    # 3. a trailing '(Unabridged)' edition parenthetical
+    out = re.sub(r"\s*[\(\[][^)\]]*(unabridged|abridged)[^)\]]*[\)\]]\s*$",
+                 "", out, flags=re.I).strip()
+    return out or title
+
+
 def strip_series_prefix(title: str, series: Optional[str]) -> str:
     """'Foundation 01 - Prelude to Foundation' -> 'Prelude to Foundation'.
 
@@ -939,6 +989,20 @@ def scan_library(root: Path, cfg: Dict[str, Any]) -> List[Book]:
         while owner != root and disc_re.match(owner.name):
             owner = owner.parent
         groups.setdefault(owner, []).extend(audio)
+
+    # Warn when a book folder also has a format-only subfolder that is itself a
+    # book (e.g. ".../All Systems Red" with 8 .mp4 parts AND ".../m4b/book.m4b").
+    # These are the same book in two formats; surfacing it lets the user pick
+    # one instead of tagging both.
+    fmt_only = re.compile(r"^(m4b|m4a|mp4|mp3|flac|ogg|opus|audio|hi-?res|"
+                          r"unabridged|abridged)$", re.I)
+    owners = set(groups)
+    for path in sorted(groups):
+        parent = path.parent
+        if fmt_only.match(path.name) and parent in owners:
+            log.warning("format-variant folder: %s holds the same book as its "
+                        "parent %s in another format - tag only one, or move one "
+                        "out of the library", path.name, parent.name)
 
     books = []
     for path, files in sorted(groups.items()):
@@ -1147,10 +1211,19 @@ def split_distinct_books(files: Sequence[Path]) -> List[List[Path]]:
     distinct = {v for v in vols if v is not None}
     have_book_word = sum(1 for st in stems
                          if re.search(r"\b(book|vol|volume)\b", st, re.I))
-    all_single_type = all(f.suffix.lower() in (".m4b", ".m4a") for f in files)
+    all_single_type = all(f.suffix.lower() in (".m4b", ".m4a", ".mp4") for f in files)
+    # Distinct TEXT after each volume number means distinct titles, i.e. these
+    # are separate books ('... - 6 Fugitive Telemetry' / '... - 7 System
+    # Collapse'), not chapters that merely count up ('Track 1' / 'Track 2').
+    after_num = []
+    for st in stems:
+        m = re.search(r"\b\d{1,3}\b[\s._:-]*(.+)$", st)
+        after_num.append(m.group(1).strip().lower() if m and m.group(1).strip() else "")
+    distinct_titles = len({a for a in after_num if a}) == len([a for a in after_num if a]) \
+        and len({a for a in after_num if a}) >= 2
     if len(distinct) >= 2 and (
             len(distinct) == len([v for v in vols if v is not None])) and (
-            have_book_word or all_single_type):
+            have_book_word or all_single_type or distinct_titles):
         by_vol: Dict[Any, List[Path]] = {}
         for f, v in zip(files, vols):
             by_vol.setdefault(v if v is not None else f.name, []).append(f)
@@ -1308,7 +1381,7 @@ def read_tags(path: Path) -> Meta:
     try:
         if ext == ".mp3":
             return _read_id3(path)
-        if ext in (".m4b", ".m4a"):
+        if ext in (".m4b", ".m4a", ".mp4"):
             return _read_mp4(path)
         if ext == ".flac":
             return _read_flac(path)
@@ -1317,6 +1390,31 @@ def read_tags(path: Path) -> Meta:
     except Exception as exc:  # noqa: BLE001 - any tag lib error
         raise TagError(f"{path.name}: {exc}") from exc
     raise TagError(f"unsupported format: {path.name}")
+
+
+def _demojibake(text: str) -> str:
+    """Repair the two common tag corruptions, and flag the unrecoverable one.
+
+    - 'MÃ©ridien'  : UTF-8 bytes wrongly decoded as latin-1. Reversible.
+    - 'M\ufffd\ufffdridien' : the accented byte was replaced with U+FFFD before we
+      ever saw it - the original character is GONE. We strip the replacement
+      chars so the rest of the word is usable as a search hint.
+    """
+    if not text:
+        return text
+    if "\ufffd" in text:
+        # unrecoverable; drop the replacement markers, leave the rest
+        return re.sub(r"\ufffd+", "", text).strip()
+    # reversible mojibake: re-encode as latin-1, decode as utf-8
+    if re.search(r"[ÃÂ][\x80-\xbf\u0080-\u00bf\xa0-\xff]", text):
+        try:
+            fixed = text.encode("latin-1").decode("utf-8")
+            # only accept if it reduced the odd-character run
+            if fixed and sum(c in "ÃÂ" for c in fixed) < sum(c in "ÃÂ" for c in text):
+                return fixed
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    return text
 
 
 def _t(frames, key) -> Optional[str]:
@@ -1336,6 +1434,7 @@ def _t(frames, key) -> Optional[str]:
         text = values[0] if values else str(v)
     text = re.sub(r"\s*/\s*", ", ", text) if "/" in text and key in (
         "TPE1", "TPE2", "TCOM", "TIT2") else text
+    text = _demojibake(text)
     return text.strip() or None
 
 
@@ -1508,7 +1607,7 @@ def _write_dispatch(path: Path, m: Meta, ext: str, overwrite: bool, cover_mode: 
         if ext == ".mp3":
             return _write_id3(path, m, overwrite, cover_mode, track, total, force_track,
                          set(force_fields or ()))
-        if ext in (".m4b", ".m4a"):
+        if ext in (".m4b", ".m4a", ".mp4"):
             return _write_mp4(path, m, overwrite, cover_mode, track, total, force_track,
                          set(force_fields or ()))
         if ext == ".flac":
@@ -1996,7 +2095,8 @@ class Provider:
         78 and threw away the right book, so a disagreeing author is now a
         small penalty rather than a third of the score.
         """
-        s = max(self.title_score(hint.title or "", variant)
+        hint_title = strip_title_suffix(hint.title or "")
+        s = max(self.title_score(hint_title, variant)
                 for variant in self.title_variants(title))
         if hint.author and author:
             a = ratio(hint.author, author)
@@ -2005,6 +2105,11 @@ class Provider:
             else:
                 s = max(0.0, s - 8.0)
         return s
+
+    @staticmethod
+    @staticmethod
+    def _strip_suffix(title: str) -> str:
+        return strip_title_suffix(title)
 
     @staticmethod
     def clean_hint_title(hint: Meta) -> Optional[str]:
@@ -2058,6 +2163,8 @@ class Provider:
             title = re.sub(r"^\s*[A-Za-z]{2,6}\s?\d{1,3}\s*[" + DASHES + r":]\s+",
                            "", title)
             title = title.strip(" " + DASHES + ",:")
+
+        title = strip_title_suffix(title)
         return title or hint.title
 
 
@@ -2549,7 +2656,14 @@ class AudibleProvider(Provider):
             if value and not is_junk_value(value) and value not in out:
                 out.append(value)
 
+        # 1. cleaned album/title tag (best signal) - suffix stripped
         add(self.clean_hint_title(hint))
+        # 2. the album tag stripped of series/edition cruft, directly
+        if hint.album:
+            add(strip_title_suffix(hint.album))
+        if hint.title:
+            add(strip_title_suffix(hint.title))
+        # 3. folder-derived title, cleaned then raw
         if hint.rel_path:
             parts = [x for x in str(hint.rel_path).replace("\\", "/").split("/") if x]
             if parts:
@@ -2557,7 +2671,9 @@ class AudibleProvider(Provider):
                 probe = dataclasses.replace(hint)
                 probe.title = folder_title
                 add(self.clean_hint_title(probe))
+                add(strip_title_suffix(folder_title))
                 add(folder_title)
+        # 4. raw tag as a last resort
         add(hint.title)
         return out
 
@@ -3201,7 +3317,7 @@ def verify_book(book: Book) -> List[str]:
     for f in book.files:
         ext = f.suffix.lower()
         try:
-            if ext in (".m4b", ".m4a"):
+            if ext in (".m4b", ".m4a", ".mp4"):
                 trkn = (MP4(f).tags or {}).get("trkn")
                 if trkn and len(trkn[0]) > 1 and not trkn[0][1]:
                     book.notes.append(f"{f.name}: track total missing (n of 0)")
@@ -3222,7 +3338,7 @@ def verify_book(book: Book) -> List[str]:
             elif sorted(n for n in numbers if n) != list(range(1, len(numbers) + 1)):
                 book.notes.append(f"{label}track numbers are not 1..{len(numbers)}")
 
-    if len(book.files) == 1 and book.files[0].suffix.lower() in (".m4b", ".m4a"):
+    if len(book.files) == 1 and book.files[0].suffix.lower() in (".m4b", ".m4a", ".mp4"):
         try:
             audio = MP4(book.files[0])
             if not getattr(audio, "chapters", None):
