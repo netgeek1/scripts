@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.41.0
+audiobook-tagger 1.42.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.41.0"
+__version__ = "1.42.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -3552,10 +3552,17 @@ def apply_output_mapping(final: Meta, cfg: Dict[str, Any], opts: "Options") -> N
 
 def prompt_for_asin(book: Book, final: Meta, audible: Optional["AudibleProvider"],
                     hint: Meta) -> Optional[str]:
-    """Ask the operator to confirm or supply an ASIN for a non-exact match."""
+    """Ask the operator to confirm or supply an ASIN."""
+    score = book.match_score
+    if score is None:
+        header = "NO MATCH"
+    elif score >= 99.5:
+        header = f"CONFIRM MATCH  ({score:.0f}%)"
+    else:
+        header = f"UNCERTAIN MATCH  ({score:.1f}%)"
     print("")
     print("-" * 72)
-    print(f"  UNCERTAIN MATCH  ({'no match' if book.match_score is None else f'{book.match_score:.0f}%'})")
+    print(f"  {header}")
     print(f"  folder : {book.path}")
     print(f"  tags   : album={book.existing.album!r} artist={book.existing.author!r}")
     print(f"  best   : {final.title!r} by {final.author!r}"
@@ -3624,9 +3631,14 @@ def tag_book(book: Book, cfg: Dict[str, Any], providers: Dict[str, Provider],
     try:
         book.final = resolve_metadata(book, cfg, providers, opts)
 
-        needs_prompt = (opts.manual
-                        or book.match_score is None
-                        or book.match_score < opts.ask_below)
+        # A score that rounds to 100 is a certain match; never call it
+        # "uncertain" or prompt on it (unless --manual asks for every book).
+        # This avoids a 99.5-99.9 score - from multi-author or series scoring -
+        # tripping an "ask_below=100" prompt on what is really an exact hit.
+        certain = (book.match_score is not None and book.match_score >= 99.5)
+        needs_prompt = opts.manual or (
+            not certain and (book.match_score is None
+                             or book.match_score < opts.ask_below))
         if opts.ask_asin and needs_prompt and not opts.non_interactive:
             audible = providers.get("audible")
             chosen = prompt_for_asin(book, book.final, audible if isinstance(
@@ -3911,7 +3923,7 @@ def do_organize(books: Sequence[Book], root: Path, cfg: Dict[str, Any],
     undetermined: List[str] = []   # no destination could be built
     for b in books:
         m = b.final if b.final.title else b.existing
-        if b.match_score is not None and b.match_score < 100 and not m.asin:
+        if b.match_score is not None and b.match_score < 99.5 and not m.asin:
             held.append(b.path.name)
             log.warning("uncertain metadata, not moving: %s (score %.0f)",
                         b.path.name, b.match_score if b.match_score else 0)
