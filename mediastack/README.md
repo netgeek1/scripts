@@ -2,6 +2,7 @@
 
 A menu-driven installer and lifecycle manager for [MediaStack](https://github.com/geekau/mediastack), the Docker
 Compose stack built around Gluetun VPN, the *ARR apps, Plex/Jellyfin, Authentik, Traefik, Guacamole and Headscale.
+It also adds optional services that upstream doesn't ship, such as [Audiobookshelf](https://www.audiobookshelf.org/).
 
 It **detects** sensible defaults and asks for the rest. From there it:
 
@@ -26,6 +27,7 @@ After installation it handles day-2 operations: settings, apply/update, stop, st
 - [Settings reference](#settings-reference)
 - [Storage: local, SMB, NFS, external](#storage-local-smb-nfs-external)
 - [Services: on / disabled / removed](#services-on--disabled--removed)
+- [Add-on services (Audiobookshelf)](#add-on-services-audiobookshelf)
 - [Secrets](#secrets)
 - [Service account](#service-account)
 - [Upstream pinning and upgrades](#upstream-pinning-and-upgrades)
@@ -160,7 +162,7 @@ or by hand followed by **Apply**.
 | `SERVICE_USER` / `SERVICE_UID` / `SERVICE_GID` | `mediastack` / auto / auto | Becomes `PUID`/`PGID` |
 | `ADMIN_DOCKER_GROUP` | `no` | `yes` adds your sudo user to `docker` (root-equivalent) |
 | `DISABLED_SERVICES` | `whisparr` | Never started; folders kept |
-| `REMOVED_SERVICES` | `readarr` | Never started; no app-data folder |
+| `REMOVED_SERVICES` | `readarr` | Never started; no app-data folder (also applies to add-ons such as `audiobookshelf`) |
 | `VPN_TYPE` / `VPN_SERVICE_PROVIDER` / `SERVER_REGIONS` | `openvpn` / `custom` / blank | Gluetun provider names |
 | `EMAIL_SERVER_HOST` / `_PORT` / `EMAIL_ADDRESS` / `EMAIL_SENDER` | blank / `587` | Authentik email |
 | `UPSTREAM_REPO` / `UPSTREAM_REF` / `UPSTREAM_VARIANT` | `geekau/mediastack` / pinned SHA / `full-download-vpn` | |
@@ -254,9 +256,34 @@ Defaults:
 The upstream compose file is never edited. Exclusions live in a managed `docker-compose.override.yaml`. If you
 already keep your own override file, the installer leaves it alone and tells you exclusions are not applied.
 
+Add-ons are marked `+` in the list and use the same three states.
+
 Disabling core services (gluetun, postgresql, valkey, traefik, authentik) is allowed but warned about. Other
 services depend on them. Unpackerr and some dashboards still reference removed apps and will log harmless
 connection errors.
+
+---
+
+## Add-on services (Audiobookshelf)
+
+Add-ons are services this installer adds on top of upstream. They are defined in the managed
+`docker-compose.override.yaml`, so the upstream compose file stays untouched. **Audiobookshelf** is on by default:
+
+| | |
+|---|---|
+| Image | `ghcr.io/advplyr/audiobookshelf:latest` (official) |
+| Runs as | `user: PUID:PGID`, the service account. ABS does not support PUID/PGID environment variables |
+| Web UI | `http://<host>:13378` (`WEBUI_PORT_AUDIOBOOKSHELF` in `.env`, added once and then yours to change) and `https://audiobookshelf.<domain>` via Traefik |
+| Network | `mediastack` bridge, not behind Gluetun. It serves media and needs no VPN |
+| `/config`, `/metadata` | `<FOLDER_FOR_DATA>/audiobookshelf/{config,metadata}`. `/config` is SQLite and ABS warns against network storage, so the installer warns if app data isn't local |
+| `/audiobooks` | `<FOLDER_FOR_MEDIA>/media/audio`, upstream's audiobook folder, so downloads land where ABS reads them |
+| `/podcasts` | `<FOLDER_FOR_MEDIA>/media/podcasts` (created) |
+| `/books` | `<FOLDER_FOR_MEDIA>/media/books` (ebooks) |
+
+In ABS, create libraries pointing at `/audiobooks`, `/podcasts` and/or `/books`.
+
+The Traefik route deliberately has **no Authentik forward-auth**. ABS has its own login, and its mobile apps call
+the API directly, which forward-auth would break. It keeps upstream's security headers and CrowdSec bouncer.
 
 ---
 
@@ -369,14 +396,14 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 31 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 34 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
 
 - `.env` parsing and editing, and config quoting
 - CIDR maths and the delete-path guard
-- folder layout drift, override rendering and the service-state cycle
+- folder layout drift, override rendering (including add-ons in each state) and the service-state cycle
 - SMB/NFS remote validation and normalisation
 - fstab line rendering and fstab edit/remove
 - config migration and an encrypted vault round-trip
