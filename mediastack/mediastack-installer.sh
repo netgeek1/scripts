@@ -18,7 +18,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -72,6 +72,13 @@ DOMAIN_FILES=( headscale-config.yaml headplane-config.yaml traefik-dynamic.yaml
                traefik-internal.yaml traefik-static.yaml )
 # Upstream helper scripts: kept as *.upstream; replaced by wrappers that call this installer.
 UPSTREAM_SCRIPTS=( restart.sh create_guacamole_database.sh secure_authentik_database.sh get-apikeys.sh )
+
+# Add-on services: not part of upstream MediaStack; defined by this installer in the managed
+# docker-compose.override.yaml and toggled like any other service (on/disabled/removed).
+ADDON_SERVICES=( audiobookshelf )
+declare -A ADDON_DATA_DIRS=( [audiobookshelf]="audiobookshelf/config audiobookshelf/metadata" )
+declare -A ADDON_MEDIA_DIRS=( [audiobookshelf]="media/audio media/podcasts media/books" )
+declare -A ADDON_ENV_DEFAULTS=( [audiobookshelf]="WEBUI_PORT_AUDIOBOOKSHELF=13378" )
 
 # -----------------------------------------------------------------------------
 # CONFIG MODEL (non-secret settings -> $CONF_FILE)
@@ -974,6 +981,18 @@ render_env() {
     done
     env_set "$envf" PUID "$PUID"
     env_set "$envf" PGID "$PGID"
+    local a kv
+    while IFS= read -r a; do
+        [[ -n "$a" ]] || continue
+        for kv in ${ADDON_ENV_DEFAULTS[$a]:-}; do
+            if ! grep -q "^${kv%%=*}=" "$envf" 2>/dev/null; then
+                if (( DRY_RUN )); then log_info "[dry-run] would add ${kv} for add-on $a"; continue; fi
+                printf '\n# added for add-on %s by %s\n' "$a" "$SCRIPT_NAME" >>"$envf"
+                env_set "$envf" "${kv%%=*}" "${kv#*=}"
+                log_ok "Added ${kv} to .env for $a"
+            fi
+        done
+    done < <(active_addons)
 
     if [[ "${CFG[SECRETS_MODE]}" == vault ]]; then
         for k in "${SECRET_KEYS[@]}"; do
@@ -1032,13 +1051,63 @@ compose_services_list() {   # FILE -> service names under services:
          s && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ {sub(/^  /, ""); sub(/:.*/, ""); print}' "$1"
 }
 
+render_addon() {   # render_addon NAME -> compose service YAML (2-space indented)
+    case "$1" in
+        audiobookshelf)
+            cat <<'EOF'
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:latest
+    container_name: audiobookshelf
+    restart: unless-stopped
+    networks:
+      - mediastack
+    user: ${PUID:?err}:${PGID:?err}           # ABS has no PUID/PGID env; run as the service account
+    ports:
+      - ${WEBUI_PORT_AUDIOBOOKSHELF:?err}:80
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/audiobookshelf/config:/config       # SQLite: keep on local disk
+      - ${FOLDER_FOR_DATA:?err}/audiobookshelf/metadata:/metadata
+      - ${FOLDER_FOR_MEDIA:?err}/media/audio:/audiobooks
+      - ${FOLDER_FOR_MEDIA:?err}/media/podcasts:/podcasts
+      - ${FOLDER_FOR_MEDIA:?err}/media/books:/books
+    environment:
+      - TZ=${TIMEZONE:?err}
+    labels:
+      - traefik.enable=true
+    # ROUTERS (no Authentik forward-auth: ABS has its own login and its mobile apps use the API)
+      - traefik.http.routers.audiobookshelf.service=audiobookshelf
+      - traefik.http.routers.audiobookshelf.rule=Host(`audiobookshelf.${CLOUDFLARE_DNS_ZONE:?err}`)
+      - traefik.http.routers.audiobookshelf.entrypoints=secureweb
+      - traefik.http.routers.audiobookshelf.middlewares=security-headers@file,traefik-bouncer@file
+    # SERVICES
+      - traefik.http.services.audiobookshelf.loadbalancer.server.scheme=http
+      - traefik.http.services.audiobookshelf.loadbalancer.server.port=80
+EOF
+            ;;
+    esac
+}
+
+is_addon() { in_list "$1" "${ADDON_SERVICES[@]}"; }
+active_addons() {   # add-ons not 'removed'
+    local a; for a in "${ADDON_SERVICES[@]}"; do is_removed "$a" || printf '%s\n' "$a"; done
+    return 0
+}
+
 render_override() {   # render_override COMPOSEFILE -> stdout
     local compose=$1 s n=0 body=""
     printf '%s\n' "$OVERRIDE_MARKER"
-    printf '# Regenerated on every install/apply. Services in DISABLED_SERVICES / REMOVED_SERVICES are\n'
-    printf "# parked in the 'disabled' profile so they are never started.\n"
+    printf '# Regenerated on every install/apply -- do not edit (a file without the marker line is left alone).\n'
+    printf "# - add-on services defined by the installer (not part of upstream MediaStack)\n"
+    printf "# - services in DISABLED_SERVICES / REMOVED_SERVICES parked in the 'disabled' profile\n"
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
+        body+="$(render_addon "$s")"$'\n'
+        [[ "$(svc_state "$s")" == disabled ]] && body+="    profiles: [\"disabled\"]"$'\n'
+        n=$((n + 1))
+    done < <(active_addons)
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        is_addon "$s" && continue
         if [[ -f "$compose" ]] && ! grep -qE "^  ${s}:[[:space:]]*$" "$compose"; then
             printf '# %s: not found in docker-compose.yaml, ignored\n' "$s"; continue
         fi
@@ -1051,16 +1120,16 @@ render_override() {   # render_override COMPOSEFILE -> stdout
 write_override() {
     local f="$FOLDER_FOR_YAML/docker-compose.override.yaml" compose="$FOLDER_FOR_YAML/docker-compose.yaml"
     if [[ -f "$f" ]] && ! grep -qF "$OVERRIDE_MARKER" "$f"; then
-        log_warn "$f exists and is not managed by this installer; leaving it alone (service exclusions NOT applied)."
+        log_warn "$f exists and is not managed by this installer; leaving it alone (add-ons and service exclusions NOT applied)."
         return 0
     fi
-    if [[ -z "$(excluded_services)" ]]; then
+    if [[ -z "$(excluded_services)" && -z "$(active_addons)" ]]; then
         [[ -f "$f" ]] && run rm -f "$f"
-        log_ok "All services enabled"
+        log_ok "All upstream services enabled; no add-ons"
         return 0
     fi
     render_override "$compose" | write_file "$f" 640 root:root
-    log_ok "Disabled: ${CFG[DISABLED_SERVICES]:-none}   Removed: ${CFG[REMOVED_SERVICES]:-none}"
+    log_ok "Add-ons: $(active_addons | xargs) | disabled: ${CFG[DISABLED_SERVICES]:-none} | removed: ${CFG[REMOVED_SERVICES]:-none}"
     local s
     while IFS= read -r s; do
         [[ -n "$s" && -d "$FOLDER_FOR_DATA/$s" ]] && log_info "Removed service '$s' still has data in $FOLDER_FOR_DATA/$s (left in place; delete it if unwanted)"
@@ -1370,6 +1439,12 @@ ensure_folders() {
         ddirs+=("$FOLDER_FOR_DATA/$d")
     done
     for d in "${MEDIA_SUBDIRS[@]}"; do mdirs+=("$FOLDER_FOR_MEDIA/$d"); done
+    local a
+    while IFS= read -r a; do
+        [[ -n "$a" ]] || continue
+        for d in ${ADDON_DATA_DIRS[$a]:-};  do ddirs+=("$FOLDER_FOR_DATA/$d"); done
+        for d in ${ADDON_MEDIA_DIRS[$a]:-}; do in_list "$FOLDER_FOR_MEDIA/$d" "${mdirs[@]}" || mdirs+=("$FOLDER_FOR_MEDIA/$d"); done
+    done < <(active_addons)
     local -a mtop=("$FOLDER_FOR_MEDIA"/{media,usenet,torrents,filebot})
     make_dirs DATA "$FOLDER_FOR_DATA" "${ddirs[@]}"
     make_dirs MEDIA "$FOLDER_FOR_MEDIA" "${mdirs[@]}"
@@ -1417,6 +1492,9 @@ ensure_folders() {
             fi
             run chmod 2775 "$FOLDER_FOR_MEDIA" "${mdirs[@]}" "${mtop[@]}" 2>/dev/null || true ;;
     esac
+    if [[ "$dty" != local ]] && active_addons | grep -qx audiobookshelf; then
+        log_warn "Audiobookshelf keeps a SQLite DB in $FOLDER_FOR_DATA/audiobookshelf/config; its docs warn against network storage."
+    fi
     log_ok "Data: $FOLDER_FOR_DATA ($dty)  Media: $FOLDER_FOR_MEDIA ($mty)  owner $PUID:$PGID"
 }
 
@@ -1939,17 +2017,19 @@ cfg_services() {
         ask "CFG[REMOVED_SERVICES]"  "Removed services (space separated)"  "${CFG[REMOVED_SERVICES]}"
         return 0
     fi
-    local -a svcs; mapfile -t svcs < <(compose_services_list "$f")
+    local -a svcs; mapfile -t svcs < <(compose_services_list "$f"; printf '%s\n' "${ADDON_SERVICES[@]}")
     local in n i s st line
     while :; do
         echo
         for i in "${!svcs[@]}"; do
             st=$(svc_state "${svcs[$i]}")
             case "$st" in on) line="${G}on${NC}      " ;; disabled) line="${Y}disabled${NC}" ;; *) line="${R}removed${NC} " ;; esac
-            printf '  %2d) %-20s %s' "$((i + 1))" "${svcs[$i]}" "$line"
+            if is_addon "${svcs[$i]}"; then printf '  %2d) %-20s %s' "$((i + 1))" "${svcs[$i]}+" "$line"
+            else printf '  %2d) %-20s %s' "$((i + 1))" "${svcs[$i]}" "$line"; fi
             (( (i + 1) % 3 == 0 )) && echo
         done
         echo
+        printf '  (+ = add-on provided by this installer, not upstream)\n'
         read -rp "  Numbers to cycle on -> disabled -> removed (e.g. '12 31'), Enter when done: " in || true
         [[ -z "$in" ]] && break
         for n in $in; do
@@ -2086,7 +2166,8 @@ print_summary() {
     log_step "Done"
     [[ -f "$envf" ]] || return 0
     local app port
-    for app in HOMEPAGE PORTAINER AUTHENTIK GUACAMOLE PLEX JELLYFIN QBITTORRENT PROWLARR SONARR RADARR; do
+    for app in HOMEPAGE PORTAINER AUTHENTIK GUACAMOLE PLEX JELLYFIN AUDIOBOOKSHELF QBITTORRENT PROWLARR SONARR RADARR; do
+        [[ "$app" == AUDIOBOOKSHELF ]] && [[ "$(svc_state audiobookshelf)" != on ]] && continue
         port=$(env_get "$envf" "WEBUI_PORT_$app" || true)
         [[ -n "$port" ]] && printf '  %-12s http://%s:%s\n' "${app,,}" "$ip" "$port"
     done
@@ -2323,6 +2404,9 @@ self_test() {
     st "domain/ip validators"              'valid_domain media.example.org && ! valid_domain "bad domain" && valid_ipv4 10.0.0.1 && valid_cidr 10.0.0.0/8 && ! valid_cidr 10.0.0.0/33'
     printf 'networks:\n  mediastack:\n    name: mediastack\n\nservices:\n\n####\n  whisparr:\n    image: x\n  radarr:\n    image: y\n' >"$t/compose.yaml"
     st "override renders profile"          'CFG[DISABLED_SERVICES]="whisparr,bogus"; CFG[REMOVED_SERVICES]="radarr whisparr"; out=$(render_override "$t/compose.yaml"); [[ "$out" == *"  whisparr:"* && "$out" == *"  radarr:"* && $(grep -c "  whisparr:" <<<"$out") == 1 && "$out" == *"bogus: not found"* ]]'
+    st "add-on rendered when on"            'CFG[DISABLED_SERVICES]=""; CFG[REMOVED_SERVICES]=""; out=$(render_override "$t/compose.yaml"); [[ "$out" == *"  audiobookshelf:"* && "$out" == *"user: \${PUID:?err}"* && "$out" != *disabled\"* ]]'
+    st "add-on disabled -> profile"         'CFG[DISABLED_SERVICES]="audiobookshelf"; CFG[REMOVED_SERVICES]=""; out=$(render_override "$t/compose.yaml"); [[ "$out" == *"  audiobookshelf:"* && "$out" == *"profiles: [\"disabled\"]"* ]]'
+    st "add-on removed -> absent"           'CFG[DISABLED_SERVICES]=""; CFG[REMOVED_SERVICES]="audiobookshelf"; out=$(render_override "$t/compose.yaml"); [[ "$out" != *audiobookshelf* && "$out" == *"services: {}"* ]]'
     st "compose service list (skips networks)" '[[ "$(compose_services_list "$t/compose.yaml" | xargs)" == "whisparr radarr" ]]'
     st "service state cycle"               'CFG[DISABLED_SERVICES]="whisparr"; CFG[REMOVED_SERVICES]="readarr"; set_svc_state whisparr removed; set_svc_state readarr on; set_svc_state sonarr disabled; [[ "${CFG[DISABLED_SERVICES]}" == sonarr && "${CFG[REMOVED_SERVICES]}" == whisparr && $(svc_state readarr) == on ]]'
     st "smb remote normalisation"          '[[ "$(normalize_remote smb "\\\\winsrv\\Media Share\\")" == "//winsrv/Media Share" ]] && valid_remote smb "//nas/media" && ! valid_remote smb "nas" && ! valid_remote smb "//nas/"'
