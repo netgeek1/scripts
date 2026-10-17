@@ -3,6 +3,21 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v1.2.0 — 2026-10-16 — Audiobookshelf add-on
+
+### Added
+- **Add-on services**: services the installer adds on top of upstream. They are rendered into the managed
+  `docker-compose.override.yaml`, so the upstream compose file is never edited, and they toggle on, disabled or
+  removed like any other service. They are marked `+` in Settings → Services.
+- **Audiobookshelf** add-on (on by default):
+  - official `ghcr.io/advplyr/audiobookshelf` image, run as `user: PUID:PGID`
+  - port `WEBUI_PORT_AUDIOBOOKSHELF=13378`, added to `.env` once
+  - Traefik route `audiobookshelf.<domain>` without forward-auth, so the mobile apps work
+  - `/config` and `/metadata` under app data; `/audiobooks`, `/podcasts` and `/books` under `media/`
+  - creates `media/podcasts` and the app-data folders
+  - warns when app data is on network storage (SQLite)
+- Self-test: 34 checks (add-on rendering when on, disabled and removed).
+
 ## v1.1.0 — 2026-10-16 — Storage, settings menu, generic defaults
 
 ### Added
