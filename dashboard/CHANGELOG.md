@@ -3,6 +3,13 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.1.1 — 2026-10-26 — Progress output
+
+### Fixed
+- Image pulls and apt output scrolled line by line instead of updating in place. Commands now write straight to the
+  terminal when there is one. The run log records each command and its exit code, and timer runs, which have no
+  terminal, still log the full output.
+
 ## v2.1.0 — 2026-10-26 — Host preparation
 
 ### Added
