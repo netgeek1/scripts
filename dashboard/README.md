@@ -49,8 +49,13 @@ scripts you `curl` onto other machines.
 | Network | The image registries (docker.io, ghcr.io, and registry.community.greenbone.net for GVM), plus github.com for first-run defaults |
 | Ports | 80/443 for the proxy, 53 for Pi-hole, and each app's fallback port if you keep it |
 
-On Ubuntu, `systemd-resolved` holds port 53. The port check detects this and prints the two commands that free it.
-Debian doesn't have this issue.
+The install prepares the host before writing anything:
+
+- **Base packages:** installs any that are missing.
+- **Checks:** disk, RAM, NTP, a DHCP-leased address on the DNS server, host DNS, and Docker Hub reachability.
+- **Port 53:** if `systemd-resolved` holds it and Pi-hole is enabled, it turns off only resolved's stub listener,
+  after asking first. The host keeps resolving through the upstream servers resolved already uses. The change is
+  rolled back if host DNS stops working, and undone on uninstall.
 
 ## Quick start (new host)
 
@@ -64,7 +69,8 @@ The install runs in this order:
 1. It installs Docker.
 2. It walks through the settings: domain, apps, certificate, file share, updates and paths. Each prompt shows the
    current value, so Enter accepts it.
-3. It checks every port the apps need.
+3. It prepares the host: base packages, the checks above, and freeing port 53 for Pi-hole. Then it checks every
+   port the apps need.
 4. It brings everything up.
 5. It prints the DNS records to create.
 
@@ -293,7 +299,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 50 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 52 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
