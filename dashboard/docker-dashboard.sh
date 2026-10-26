@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -39,6 +39,9 @@ DD_INSTALL_BIN="${DD_INSTALL_BIN:-/usr/local/sbin/docker-dashboard}"
 DD_LOCK_FILE="${DD_LOCK_FILE:-/run/docker-dashboard.lock}"
 DD_HEALTH_LOCK="${DD_HEALTH_LOCK:-/run/docker-dashboard-health.lock}"
 DD_UNIT_DIR="${DD_UNIT_DIR:-/etc/systemd/system}"
+DD_RESOLV_CONF="${DD_RESOLV_CONF:-/etc/resolv.conf}"
+DD_RESOLVED_DIR="${DD_RESOLVED_DIR:-/etc/systemd/resolved.conf.d}"
+DD_RESOLVED_UPSTREAM="${DD_RESOLVED_UPSTREAM:-/run/systemd/resolve/resolv.conf}"
 
 CONF_FILE="$DD_CONF_DIR/dashboard.conf"
 SERVICES_FILE="$DD_CONF_DIR/services.conf"
@@ -1604,6 +1607,110 @@ render_oncalendar() {   # render_oncalendar SCHEDULE DAY HH:MM
 
 
 # -----------------------------------------------------------------------------
+# HOST PREPARATION (after the settings are known, before anything is deployed)
+# -----------------------------------------------------------------------------
+readonly BASE_PACKAGES="ca-certificates curl gnupg openssl iproute2 gawk sed util-linux diffutils tar gzip openssh-client"
+
+ensure_base_packages() {
+    local -a missing=() p
+    for p in $BASE_PACKAGES; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
+    if (( ${#missing[@]} )); then
+        log_info "Installing base packages: ${missing[*]}"
+        run_logged apt-get update
+        run_logged apt-get install -y "${missing[@]}"
+    fi
+    log_ok "Base packages present"
+}
+
+resolved_stub_active() { ss -Hlnp "sport = :53" 2>/dev/null | grep -q '"systemd-resolve"'; }
+resolved_dropin() { printf '%s/docker-dashboard-no-stub.conf' "$DD_RESOLVED_DIR"; }
+host_dns_ok() { getent hosts download.docker.com >/dev/null 2>&1 || getent hosts github.com >/dev/null 2>&1; }
+
+# free_resolved_stub -- Pi-hole needs :53. Turn off only resolved's stub listener; the host keeps
+# resolving through the upstream servers resolved already uses. Rolled back if host DNS breaks.
+free_resolved_stub() {
+    log_info "systemd-resolved's stub listener (127.0.0.53) holds port 53, which Pi-hole needs."
+    log_info "Fix: switch off only the stub listener and point $DD_RESOLV_CONF at resolved's upstream DNS list."
+    confirm "Apply that now?" y || return 1
+    if (( DRY_RUN )); then
+        run write "$(resolved_dropin)"; run ln -sf "$DD_RESOLVED_UPSTREAM" "$DD_RESOLV_CONF"; run systemctl restart systemd-resolved
+        return 0
+    fi
+    local orig=""
+    [[ -L "$DD_RESOLV_CONF" ]] && orig=$(readlink "$DD_RESOLV_CONF")
+    mkdir -p "$DD_STATE_DIR"
+    if [[ ! -f "$DD_STATE_DIR/resolv.conf.orig" ]]; then
+        if [[ -n "$orig" ]]; then printf 'link %s\n' "$orig" >"$DD_STATE_DIR/resolv.conf.orig"
+        else { printf 'file\n'; cat "$DD_RESOLV_CONF" 2>/dev/null; } >"$DD_STATE_DIR/resolv.conf.orig"; fi
+    fi
+    mkdir -p "$DD_RESOLVED_DIR"
+    printf '# Managed by %s: Pi-hole serves DNS on port 53\n[Resolve]\nDNSStubListener=no\n' "$SCRIPT_NAME" \
+        | write_file "$(resolved_dropin)" 644 root:root
+    # only repoint resolv.conf when it is the stub (127.0.0.53); a hand-written one is left alone
+    if [[ "$orig" == *stub-resolv.conf ]] || grep -q '^nameserver 127\.0\.0\.53' "$DD_RESOLV_CONF" 2>/dev/null; then
+        if [[ -s "$DD_RESOLVED_UPSTREAM" ]]; then ln -sf "$DD_RESOLVED_UPSTREAM" "$DD_RESOLV_CONF"
+        else log_warn "$DD_RESOLVED_UPSTREAM is missing; $DD_RESOLV_CONF left as it was."; fi
+    fi
+    systemctl restart systemd-resolved
+    sleep 2
+    if ! host_dns_ok; then
+        log_error "Host DNS stopped working after the change -- rolling back."
+        restore_resolved_stub quiet
+        die "systemd-resolved has no upstream DNS of its own. Give the host a DNS server (other than this Pi-hole) in its network config, then run this again."
+    fi
+    resolved_stub_active && die "systemd-resolved still holds port 53 (check $DD_RESOLVED_DIR)."
+    log_ok "Port 53 freed; host DNS still works (nameservers: $(awk '/^nameserver/ {printf "%s ", $2}' "$DD_RESOLV_CONF" 2>/dev/null))"
+}
+
+restore_resolved_stub() {   # undo free_resolved_stub (uninstall, or rollback)
+    [[ -f "$(resolved_dropin)" ]] || return 0
+    [[ "${1:-}" == quiet ]] || confirm "Turn systemd-resolved's stub listener back on (Pi-hole no longer needs port 53)?" y || return 0
+    run rm -f "$(resolved_dropin)"
+    local how=""
+    [[ -f "$DD_STATE_DIR/resolv.conf.orig" ]] && how=$(head -n1 "$DD_STATE_DIR/resolv.conf.orig")
+    case "$how" in
+        link\ *) run ln -sf "${how#link }" "$DD_RESOLV_CONF" ;;
+        file)    (( DRY_RUN )) || tail -n +2 "$DD_STATE_DIR/resolv.conf.orig" >"$DD_RESOLV_CONF" ;;
+    esac
+    run rm -f "$DD_STATE_DIR/resolv.conf.orig"
+    run systemctl restart systemd-resolved
+    log_ok "systemd-resolved stub listener restored"
+}
+
+# host_checks -- things that would bite later; warnings only
+host_checks() {
+    local parent avail_g need_g=10 mem_g code
+    parent=$STACKS_DIR; while [[ ! -d "$parent" ]]; do parent=$(dirname "$parent"); done
+    app_on gvm && need_g=30
+    avail_g=$(df -Pk "$parent" | awk 'NR==2 {print int($4/1024/1024)}')
+    if (( avail_g < need_g )); then log_warn "Only ${avail_g} GiB free under $parent (want ${need_g}+ for images and data)."
+    else log_ok "Disk: ${avail_g} GiB free under $parent"; fi
+    mem_g=$(awk '/^MemTotal:/ {print int($2/1024/1024 + 0.5)}' /proc/meminfo)
+    if app_on gvm && (( mem_g < 8 )); then log_warn "Greenbone wants 8 GB RAM; this host has ${mem_g} GB."
+    else log_ok "Memory: ${mem_g} GB"; fi
+    if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == yes ]]; then log_ok "Clock is NTP-synchronised"
+    else log_warn "Clock is not NTP-synchronised (certificate checks and Prometheus need correct time): timedatectl set-ntp true"; fi
+    if [[ -n "$DET_IFACE" ]] && ip -4 -o addr show dev "$DET_IFACE" 2>/dev/null | grep -q ' dynamic '; then
+        app_on pihole && log_warn "$DET_IP on $DET_IFACE is a DHCP lease. A DNS server should have a static IP or a DHCP reservation."
+    fi
+    if [[ "${CFG[HOST_ADDR]}" != auto && "${CFG[HOST_ADDR]}" != "$DET_IP" ]]; then
+        log_info "Names will point at ${CFG[HOST_ADDR]}; this host is $DET_IP right now (fine when it moves there at cutover)."
+    fi
+    if host_dns_ok; then log_ok "Host DNS resolves"; else log_warn "This host cannot resolve names; image pulls will fail."; fi
+    code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' https://registry-1.docker.io/v2/ 2>/dev/null || true)
+    if [[ "$code" == 401 || "$code" == 200 ]]; then log_ok "Docker Hub reachable"
+    else log_warn "Docker Hub not reachable (HTTP ${code:-000}); image pulls will fail."; fi
+    return 0
+}
+
+host_prepare() {
+    log_step "Host preparation"
+    detect_network
+    ensure_base_packages
+    host_checks
+}
+
+# -----------------------------------------------------------------------------
 # PORTS
 # -----------------------------------------------------------------------------
 is_own_project() { [[ "$1" == "$PROJECT_NAME" || "$1" == "$APP_PREFIX"* ]]; }
@@ -1637,16 +1744,21 @@ check_port() {
         [[ "${img,,}" == *pihole* ]] && log_info "  If this is the Pi-hole you are replacing, stop it first: docker stop $c"
     done
     if [[ " $procs " == *" systemd-resolve "* ]]; then
-        log_info "  systemd-resolved's stub listener holds :53 (common on Ubuntu). Free it with:"
+        log_info "  systemd-resolved's stub listener holds :53. Answer yes when asked, or free it by hand:"
         log_info "    mkdir -p /etc/systemd/resolved.conf.d && printf '[Resolve]\\nDNSStubListener=no\\n' > /etc/systemd/resolved.conf.d/no-stub.conf"
         log_info "    ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf && systemctl restart systemd-resolved"
     fi
     return 1
 }
 
+PORTS_CHECKED=0
 check_ports() {
+    (( PORTS_CHECKED )) && return 0
     log_step "Port check"
     local rc=0 a pp label
+    if app_on pihole && [[ "${CFG[PIHOLE_DNS_PORT]}" == 53 ]] && resolved_stub_active; then
+        free_resolved_stub || true
+    fi
     [[ "${CFG[HTTP_PORT]}" != "${CFG[HTTPS_PORT]}" ]] || die "HTTP and HTTPS ports must differ."
     local -A seen=()
     while IFS=$'\t' read -r pp label; do
@@ -1659,6 +1771,7 @@ check_ports() {
         for a in $(enabled_apps); do app_host_ports "$a"; done
     )
     (( rc == 0 )) || die "Free the port(s) above, or change them in Settings / Apps, then run this again."
+    PORTS_CHECKED=1
 }
 
 # -----------------------------------------------------------------------------
@@ -3027,11 +3140,9 @@ full_install() {
     ensure_docker_group
     [[ -n "$IMPORT_FILE" ]] && import_stage "$IMPORT_FILE"
     config_wizard
-    if [[ -n "$IMPORT_FILE" ]]; then
-        detect_network
-        check_ports        # before any data is written, so a conflict leaves nothing half-done
-        import_data
-    fi
+    host_prepare
+    check_ports            # before any data is written, so a conflict leaves nothing half-done
+    [[ -n "$IMPORT_FILE" ]] && import_data
     stack_apply pull
     print_summary
 }
@@ -3076,6 +3187,7 @@ uninstall_dashboard() {
     unit_set "$UNIT_HEALTH" no "" ""; unit_set "$UNIT_UPDATE" no "" ""; unit_set "$UNIT_CERT" no "" ""; unit_set_path "$UNIT_CERT" no "" ""
     run rm -rf -- "$DEPLOY_DIR"
     log_ok "Dashboard and app containers removed"
+    restore_resolved_stub
     if [[ -d "$STACKS_DIR" ]] && is_tty && confirm "Also DELETE all app data in $STACKS_DIR (Pi-hole, Grafana, Guacamole DB, ...)?" n; then
         safe_path "$STACKS_DIR" || die "Refusing: unsafe apps path '$STACKS_DIR'."
         if confirm_typed DELETE-DATA; then run rm -rf -- "$STACKS_DIR"; log_ok "App data deleted"; else log_info "App data kept"; fi
@@ -3182,6 +3294,14 @@ self_test() {
                                                SECRETS=([GUAC_DB_PASSWORD]="p@ss'"'"'w\"rd \$x"); save_secrets && SECRETS=() && SECRETS_LOADED=0 && load_secrets &&
                                                [[ "${SECRETS[GUAC_DB_PASSWORD]}" == "p@ss'"'"'w\"rd \$x" ]] && ! grep -q "p@ss" "$SECRETS_FILE" )'
     st "manifest lines only set known keys" '( set_default_config; apply_cfg_line "APP_PIHOLE='"'"'yes'"'"'"; apply_cfg_line "EVIL='"'"'x'"'"'"; [[ "${CFG[APP_PIHOLE]}" == yes && -z "${CFG[EVIL]:-}" ]] )'
+    st "resolved stub freed and restored"   '( DRY_RUN=0; ASSUME_YES=1; LOG_FILE=""; DD_STATE_DIR="$t/state"; DD_RESOLVED_DIR="$t/rd"; DD_RESOLV_CONF="$t/resolv.conf"; DD_RESOLVED_UPSTREAM="$t/run/upstream"
+                                               mkdir -p "$t/run"; printf "nameserver 127.0.0.53\n" >"$t/run/stub"; printf "nameserver 192.168.0.243\n" >"$DD_RESOLVED_UPSTREAM"; ln -s "$t/run/stub" "$DD_RESOLV_CONF"
+                                               systemctl() { :; }; sleep() { :; }; host_dns_ok() { :; }; resolved_stub_active() { false; }
+                                               free_resolved_stub && grep -qx "DNSStubListener=no" "$t/rd/docker-dashboard-no-stub.conf" && [[ "$(readlink "$DD_RESOLV_CONF")" == "$DD_RESOLVED_UPSTREAM" ]] &&
+                                               restore_resolved_stub quiet && [[ ! -f "$t/rd/docker-dashboard-no-stub.conf" && "$(readlink "$DD_RESOLV_CONF")" == "$t/run/stub" ]] )'
+    st "resolved stub rolled back on DNS failure" '( DRY_RUN=0; ASSUME_YES=1; LOG_FILE=""; DD_STATE_DIR="$t/s2"; DD_RESOLVED_DIR="$t/rd2"; DD_RESOLV_CONF="$t/resolv2.conf"
+                                               ln -s "$t/run/stub" "$DD_RESOLV_CONF"; systemctl() { :; }; sleep() { :; }; host_dns_ok() { false; }
+                                               ! ( free_resolved_stub ) && [[ ! -f "$t/rd2/docker-dashboard-no-stub.conf" && "$(readlink "$DD_RESOLV_CONF")" == "$t/run/stub" ]] )'
     st "index.html loads nothing external"  '! render_index | grep -Eq "(src|href)=\"(https?:)?//"'
     rm -rf "$t"
     printf '\n  Result: %s%d passed%s, %s%d failed%s\n' "$G" "$pass" "$NC" "$( ((fail)) && echo "$R" || echo "$G")" "$fail" "$NC"
