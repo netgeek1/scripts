@@ -3,6 +3,25 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.1.0 — 2026-10-26 — Host preparation
+
+### Added
+- **Host preparation** runs during install, after the settings and before anything is written:
+  - It installs the base packages (`ca-certificates curl gnupg openssl iproute2 ...`) as `docker-base-install.sh`
+    does.
+  - It checks disk space (30 GiB with Greenbone), RAM for Greenbone, NTP sync, a DHCP-leased address on a DNS
+    server, host DNS, and Docker Hub reachability.
+- **Port 53 freed automatically** when Pi-hole is on and systemd-resolved's stub listener holds it.
+  - Only the stub listener is turned off. `/etc/resolv.conf` is pointed at resolved's upstream list, so the host
+    keeps resolving.
+  - If host DNS breaks, the change is rolled back.
+  - The original is recorded and restored on uninstall.
+  - This also runs on `--apply`.
+- Self-test: 52 checks (stub freed/restored, rollback on DNS failure).
+
+### Changed
+- The install checks ports before any import data is written, and checks them once per run.
+
 ## v2.0.0 — 2026-10-26 — All-in-one installer, reverse proxy, migration
 
 ### Added
