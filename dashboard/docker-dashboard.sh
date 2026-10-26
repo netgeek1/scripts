@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.1.1"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -174,15 +174,21 @@ run() {
 }
 
 # run_logged CMD...  -- like run, but also tees command output into the run log
+# On a terminal the command writes straight to it, so docker/apt keep their in-place progress bars
+# (a pipe makes them print one line per update); the log gets the command and its exit code.
+# Without a terminal (timers) the full output is teed into the log.
 run_logged() {
     if (( DRY_RUN )); then run "$@"; return 0; fi
     _log_file RUN "$*"
-    if [[ -n "$LOG_FILE" ]]; then
-        "$@" 2>&1 | tee -a "$LOG_FILE"
-        return "${PIPESTATUS[0]}"
+    local rc=0
+    if [[ -t 1 || -z "$LOG_FILE" ]]; then
+        "$@" || rc=$?
+        _log_file RC "$rc (output shown on the terminal)"
     else
-        "$@"
+        "$@" 2>&1 | tee -a "$LOG_FILE"
+        rc=${PIPESTATUS[0]}
     fi
+    return "$rc"
 }
 
 # write_file PATH MODE OWNER:GROUP  (content on stdin), atomic. Returns 0; sets WROTE=1 if content changed.
