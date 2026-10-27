@@ -3,6 +3,25 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.3.0 — 2026-10-26 — Apps started by their own script
+
+### Added
+- **Custom apps started by their own script** (`MANAGED='no'`): docker-dashboard adds the proxy name, card, DNS
+  entry and health checks, and attaches to the running container.
+  - It never starts, stops, pulls or rebuilds the app; its own installer keeps doing that.
+  - Update-all reports it once and skips it. A delegate can run its installer instead.
+  - Remove only takes it off the proxy.
+- **Set up a folder** (F) detects an app already running from that folder under its own compose project and offers
+  this mode (recommended), or handing it over to docker-dashboard under the same project, so no second copy starts.
+- `PROJECT` in `app.conf` uses an existing compose project name instead of `dd-c-<name>`.
+- Self-test: 70 checks.
+
+### Fixed
+- Setting up a folder whose compose file needs variables or secrets supplied by its installer exited the script.
+  The setup now finds the services from the running containers, and `docker compose config` errors are shown with
+  a hint instead.
+- Errors inside the Custom apps menu return to the menu instead of ending the script.
+
 ## v2.2.2 — 2026-10-26 — Remove options for custom apps
 
 ### Changed
