@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  switch-dashboard-installer.sh
+#  hp1810-dashboard-installer.sh
 #  Installer and lifecycle manager for the HP 1810-8G / Netgear GS110TP port dashboard (Docker)
 #
 #  Version   : SCRIPT_VERSION below is the authoritative version string
@@ -8,9 +8,9 @@
 #  Docs      : README.md
 #  Author    : netgeek1 (Claude.ai)
 #
-#  Usage     : sudo ./switch-dashboard-installer.sh              interactive menu
-#              sudo ./switch-dashboard-installer.sh --install    full install / reconfigure
-#              sudo ./switch-dashboard-installer.sh --help       all CLI flags
+#  Usage     : sudo ./hp1810-dashboard-installer.sh              interactive menu
+#              sudo ./hp1810-dashboard-installer.sh --install    full install / reconfigure
+#              sudo ./hp1810-dashboard-installer.sh --help       all CLI flags
 #
 #  Requires  : bash 4.4+, Ubuntu or Debian (amd64/arm64), root (re-execs via sudo)
 #              Self-contained: the app source (Dockerfile + app/) is embedded at the end of
@@ -21,7 +21,7 @@ set -Eeuo pipefail
 umask 022
 
 readonly SCRIPT_VERSION="1.4.1"
-readonly SCRIPT_NAME="switch-dashboard-installer"
+readonly SCRIPT_NAME="hp1810-dashboard-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
@@ -31,10 +31,10 @@ readonly SCRIPT_DIR
 # PATHS (overridable via environment for testing; normal use leaves these alone)
 # -----------------------------------------------------------------------------
 HD_CONF_DIR="${HD_CONF_DIR:-/etc/hp1810-dashboard}"
-HD_STATE_DIR="${HD_STATE_DIR:-/var/lib/switch-dashboard-installer}"
+HD_STATE_DIR="${HD_STATE_DIR:-/var/lib/hp1810-dashboard-installer}"
 HD_LOG_DIR="${HD_LOG_DIR:-/var/log/hp1810-dashboard}"
 HD_INSTALL_BIN="${HD_INSTALL_BIN:-/usr/local/sbin/hp1810-dashboard}"
-HD_LOCK_FILE="${HD_LOCK_FILE:-/run/switch-dashboard-installer.lock}"
+HD_LOCK_FILE="${HD_LOCK_FILE:-/run/hp1810-dashboard-installer.lock}"
 
 CONF_FILE="$HD_CONF_DIR/hp1810-dashboard.conf"
 SECRETS_FILE="$HD_CONF_DIR/secrets.enc"
