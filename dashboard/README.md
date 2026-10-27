@@ -1,390 +1,238 @@
-# docker-dashboard
-
-An all-in-one, menu-driven installer for a self-hosted Docker host. It runs your apps behind one HTTPS reverse proxy
-with a landing page, keeps them updated, and moves them from an old host to a new one.
-
-| App | What you get |
-|---|---|
-| **Pi-hole** | DNS filtering. It also answers the proxy's own names locally |
-| **Portainer CE** | Container management |
-| **Internet monitoring** | Grafana, Prometheus, speedtest, ping (blackbox) and node exporters — the [geerlingguy/internet-pi](https://github.com/geerlingguy/internet-pi) stack |
-| **Guacamole** | Clientless remote desktop with PostgreSQL. Schema upgrades are applied for you |
-| **MeshCentral** | Remote device management |
-| **Greenbone / OpenVAS** *(optional, off)* | Vulnerability scanning, using Greenbone's own compose file |
-
-Every app gets its own name, such as `https://grafana.example.net`, with one certificate (a wildcard or
-self-signed). Its original port can stay published as a fallback.
-
-The landing page shows a live up/down dot for each app, your own extra links, and an optional `/files/` share for
-scripts you `curl` onto other machines.
-
-> Version: see `SCRIPT_VERSION` in the script. History: [CHANGELOG.md](CHANGELOG.md).
-
----
-
-## Contents
-
-- [Requirements](#requirements)
-- [Quick start (new host)](#quick-start-new-host)
-- [Migrating from an existing host](#migrating-from-an-existing-host)
-- [Names, DNS and certificates](#names-dns-and-certificates)
-- [Menu and CLI](#menu-and-cli)
-- [Apps](#apps)
-- [Custom apps](#custom-apps)
-- [Host health](#host-health)
-- [Updating containers](#updating-containers)
-- [Secrets](#secrets)
-- [Settings reference](#settings-reference)
-- [Files and paths](#files-and-paths)
-- [Uninstall](#uninstall)
-- [Testing](#testing)
-
----
-
-## Requirements
-
-| | |
-|---|---|
-| OS | Debian 12/13 or Ubuntu 22.04/24.04 (amd64 / arm64) with systemd |
-| Access | root. The script re-runs itself through `sudo` |
-| Docker | Installed for you if missing (Docker CE + compose plugin from download.docker.com) |
-| Network | The image registries (docker.io, ghcr.io, and registry.community.greenbone.net for GVM), plus github.com for first-run defaults |
-| Ports | 80/443 for the proxy, 53 for Pi-hole, and each app's fallback port if you keep it |
-
-The install prepares the host before writing anything:
-
-- **Base packages:** installs any that are missing.
-- **Checks:** disk, RAM, NTP, a DHCP-leased address on the DNS server, host DNS, and Docker Hub reachability.
-- **Port 53:** if `systemd-resolved` holds it and Pi-hole is enabled, it turns off only resolved's stub listener,
-  after asking first. The host keeps resolving through the upstream servers resolved already uses. The change is
-  rolled back if host DNS stops working, and undone on uninstall.
-
-## Quick start (new host)
-
-```bash
-chmod +x docker-dashboard.sh
-sudo ./docker-dashboard.sh          # menu -> 1) Full install
-```
-
-The install runs in this order:
-
-1. It installs Docker.
-2. It walks through the settings: domain, apps, certificate, file share, updates and paths. Each prompt shows the
-   current value, so Enter accepts it.
-3. It prepares the host: base packages, the checks above, and freeing port 53 for Pi-hole. Then it checks every
-   port the apps need.
-4. It brings everything up.
-5. It prints the DNS records to create.
-
-Afterwards the tool is installed as `sudo docker-dashboard`.
-
-First-run defaults for a fresh install:
-
-| App | Default |
-|---|---|
-| Pi-hole, Grafana, Guacamole DB | Passwords are generated and stored in the vault (see **Secrets**) |
-| Guacamole | Starts with `guacadmin` / `guacadmin`. Change it at first login |
-| Internet monitoring | Upstream's dashboards and blackbox config. Ping targets are in `/opt/stacks/monitoring/prometheus/pinghosts.yaml` |
-| MeshCentral | A `config.json` is written so agents connect to `meshcentral.<domain>:<MeshCentral port>`. Create your admin account first, then set `NewAccounts` to `false` |
-
-## Migrating from an existing host
-
-Export runs on the **old** host and needs only `bash`, `docker`, `tar` and `openssl`. It works on old Docker 20.10
-hosts with `docker-compose` v1. Import runs on the **new** host as part of the install.
-
-```bash
-# old host -- stops each app briefly for a consistent copy, then starts it again
-sudo ./docker-dashboard.sh --export                 # asks for a passphrase; writes ~/docker-dashboard-export-<host>-<date>.tar.gz.enc
-
-# new host
-sudo ./docker-dashboard.sh --install --import docker-dashboard-export-<host>-<date>.tar.gz.enc
-```
-
-The export recognises apps by image, not by name or path. It reads each app's settings from the running container.
-
-| App | What is carried over |
-|---|---|
-| Pi-hole | `/etc/pihole` (gravity, settings, local DNS records, query log), web password, `FTLCONF_*` settings, ports |
-| Portainer | `/data` (users, endpoints, stacks), ports |
-| Internet monitoring | Prometheus config and **history**, Grafana database and provisioning, blackbox config, the exact image tags you run, retention, plugins, admin password, ports |
-| Guacamole | The database via `pg_dump`, which restores into a current PostgreSQL. The 1.6 schema upgrade is applied automatically. Also drive/recording folders and the old HTTPS port |
-| MeshCentral | `meshcentral-data` (config, **server certificates** — your agents keep connecting), `-files`, `-backups`, `-web`. This works even when the data was never in a volume and lived inside the container |
-| File share | `~/web-site-content` of the user running the export |
-
-The bundle is AES-256 encrypted with your passphrase, because it contains the apps' passwords.
-
-**Export options:**
-
-- `--no-metrics` leaves out Prometheus history, which can be gigabytes.
-- `--leave-stopped` keeps the old apps down after the export. Use it for the final cutover, so nothing changes after
-  the snapshot.
-- `--passphrase-file FILE` lets the export run without prompting.
-
-**Not migrated:** containers the export doesn't recognise are listed in the bundle's notes, and the import shows them.
-
-**Import behaviour:**
-
-- Import refuses to write over existing app data unless you type `OVERWRITE` (or pass `--confirm OVERWRITE`). It
-  then stops those apps first.
-- The port check runs before any data is written.
-
-### Cutover keeping the same IP
-
-1. Build the new host on a temporary IP. In **Settings → Page** set the host address to the **final** IP, so links,
-   DNS records and the certificate point there.
-2. On the old host, run `sudo ./docker-dashboard.sh --export --leave-stopped`.
-3. Copy the bundle to the new host, then run `--install --import`.
-4. Shut the old host down, move the new one to the final IP, and run `sudo docker-dashboard --apply`.
-
-Pi-hole is down from step 2 until step 4. Give clients a secondary DNS server for that window.
-
-## Names, DNS and certificates
-
-With a domain set, each app endpoint gets `https://<name>.<domain>`, and the landing page lives at
-`https://dashboard.<domain>`. The names are configurable per app. Without a domain, links use `IP:port`.
-
-**DNS:**
-
-- `sudo docker-dashboard --dns-records` (menu D) lists every name with ready-to-paste `Add-DnsServerResourceRecordA`
-  lines for Windows DNS.
-- If Pi-hole is enabled, it answers these names itself. The script writes `etc-pihole/hosts/docker-dashboard.list`
-  and leaves your own local DNS records alone.
-- If clients resolve the domain through another server, such as Active Directory, add the records there as well.
-
-**Certificates** (Settings → Certificate):
-
-| Mode | Behaviour |
-|---|---|
-| `selfsigned` | Generated for the host IP, `*.<domain>` and `<domain>`. Browsers warn once |
-| `custom` | Your full-chain PEM + key on this host. A systemd path unit redeploys them whenever the files change |
-| `fetch` | Copied over `scp` every day from another machine, such as **OPNsense running acme.sh**, then deployed if changed |
-
-Every mode is checked before it is used. The key must match, the certificate must not be expired, and every name the
-proxy serves is checked against it (a warning names any that aren't covered). A bad certificate is refused and the
-running one stays in place. nginx reloads without dropping connections.
-
-**Fetch mode setup:**
-
-1. Choose `fetch` and enter `user@host:/folder` plus the two file names, for example `fullchain.pem` and
-   `privkey.pem`.
-2. Let it create a key, or run `sudo docker-dashboard --cert-fetch-key`. Add the printed public key to that user on
-   the source machine. On OPNsense, that is **System → Access → Users → Authorized keys**; the user needs a login
-   shell and read access to the files.
-3. If the source needs a non-standard SSH port, add a `Host` entry for it to root's `~/.ssh/config`.
-
-If a fetch fails, the last good certificate keeps being served, and the timer run exits non-zero so the failure shows
-in the journal.
-
-## Menu and CLI
-
-| Menu | CLI | What it does |
-|---|---|---|
-| 1 | `--install [--import FILE]` | Docker, settings, ports, (import), apps, proxy, page |
-| 2 / 3 | `--settings` / `--apps` | Settings menu / turn apps on or off and edit their images, names and ports |
-| 4 | `--services`, `--add-service`, `--remove-service`, `--detect` | Custom links on the page |
-| K | `--secrets` | View or change stored passwords |
-| C | `--cert-refresh`, `--cert-fetch-key` | Certificate actions |
-| 5 | `--apply` | Converge everything: compose files, proxy config, page, DNS file, timers |
-| 6 | `--update-all` | Update every running container on the host |
-| 7 | `--check-updates` | Pull newer images and report which containers are behind; changes nothing |
-| 8 / 9 | `--status` / `--health` | Overview / check every link now |
-| D | `--dns-records` | DNS names to create |
-| E / I | `--export` / `--import FILE` | Migration |
-| X / U | `--stop` / `--uninstall` | Stop all (data kept) / remove (typed `UNINSTALL`) |
-| T / S | `--dry-run` / `--self-test` | Show what would change / built-in tests |
-
-More actions:
-
-- `--host` (menu H) shows host health and refreshes the page's Host panel.
-- `--custom-apps` (or Apps → C) manages your own apps.
-- `--gvm-password` sets the Greenbone admin password from the vault once its first start has finished.
-
-## Apps
-
-Each app is its own compose project, `dd-<app>`, in `/opt/stacks/<app>/`. Its data sits next to its compose file in
-plain folders, so one copy of `/opt/stacks` backs up everything.
-
-- **Compose files are generated:** on every apply, from your settings. Change settings, not the files.
-- **Passwords:** they never touch disk in plain text. They are passed to `docker compose` from the vault at run time.
-- **Turning an app off:** it stops and its containers are removed, but its data stays. Turn it on again and it comes
-  back as it was.
-- **Ports:** every app's direct port is a setting. Blank means proxy only.
-
-## Custom apps
-
-Any app with a compose file can join the proxy: its own name, the wildcard certificate, a card with a status dot,
-the DNS list, the port check, update-all and export/import. Your compose file is never changed. After each start,
-the script attaches the app's container to the proxy network under the alias `dd-c-<name>`.
-
-**Adding one from the menu:** **Apps → C → N**. Give it a short name, then either point at an existing compose file
-(its `.env` is copied too) or let the script write a basic one from an image and port. Answer a few questions, then
-apply.
-
-**A project folder that's already there:** if a folder in `/opt/stacks/custom/` already has its own
-`docker-compose.yml`, for example one another installer put there, it shows as "not set up yet". Choose
-**Apps → C → F** to give it an `app.conf`. Apps with a `build:` section are built on the first apply, and
-update-all rebuilds them.
-
-**Adding one by hand:** create `/opt/stacks/custom/<name>/compose.yaml` (or `docker-compose.yml`) and an `app.conf`, then run
-`sudo docker-dashboard --apply`:
-
-```
-TITLE='HP Switches'
-SUBDOMAIN='switches'                       # -> https://switches.<domain>
-SERVICE='web'                              # compose service the proxy talks to
-PORT='8443'                                # its container port
-TLS='yes'                                  # that port speaks HTTPS itself
-FLAGS='ws'                                 # ws (websockets), stream (no buffering), big (large uploads)
-FALLBACK_URL='https://192.168.0.190:8444/' # shown under the card (optional)
-DESCRIPTION='Port status and admin up/down'
-ENABLED='yes'
-```
-
-**How it behaves:**
-
-- **Host networking:** apps using `network_mode: host` can't join a network. Set
-  `UPSTREAM_URL='http://<host-ip>:<port>'` instead of `SERVICE`/`PORT`.
-- **Checks at apply:** names must be unique, and the service must exist in the compose file.
-- **One broken app doesn't block the rest:** a custom app with a problem is reported and skipped.
-- **Recreated outside the script:** if the container is recreated another way (for example with
-  `docker compose up` by hand), the next health run re-attaches it, within the health interval.
-- **Disable or remove:** `ENABLED='no'` stops the app and keeps its folder. **Remove** in the menu offers three
-  levels: *unregister only* (containers and folder untouched), *stop + unregister* (folder and data kept), or
-  *delete everything* (after you type `DELETE-APP`).
-
-## Host health
-
-The health check (every 2 minutes) also collects host health for the **Host** panel at the top of the page. Each
-value shows OK, HIGH or CRITICAL against thresholds you set in **Settings → Health**.
-
-| Tile | Shows |
-|---|---|
-| CPU | Busy % and 5-min load per core (default: high at 1.0, critical at 2.0) |
-| Memory / Swap | Use % and amounts (memory default: high at 85%, critical at 95%) |
-| Disk (each filesystem) | Use % and amounts (default: high at 80%, critical at 90%). Includes NFS/SMB mounts |
-| Containers | Running / total. Lists unhealthy, restarting, and exited-with-error containers |
-| Uptime | Uptime and OS |
-
-`sudo docker-dashboard --host` (menu H) prints the same in the terminal. For history and graphs, Grafana's
-*Node Exporter Full* dashboard (ID 1860) uses the node-exporter that the monitoring app already runs.
-
-## Updating containers
-
-`sudo docker-dashboard --update-all` (menu 6) runs in three passes:
-
-1. **Managed apps and the dashboard:** `pull` + `up` with secrets from the vault. Guacamole's schema is checked
-   before it starts.
-2. **Other compose projects:** `pull` + `up` from their own folder. Projects that need an installer's secrets are
-   skipped with a hint, or handed to that installer as a **delegate**, e.g.
-   `mediastack=/usr/local/sbin/mediastack-installer --apply --yes`. MediaStack is detected automatically.
-3. **`docker run` containers:** recreated with their original settings by one run of the maintained Watchtower fork
-   (`nickfedor/watchtower`). `--rm` containers are never touched.
-
-Pinned tags stay pinned: an update moves within the tag you chose. You can exclude apps, containers or projects. A
-daily or weekly timer is optional.
-
-## Secrets
-
-Secrets are stored in `/etc/docker-dashboard/secrets.enc`, encrypted with **systemd-creds** (bound to the TPM2 when
-present) or with openssl and a root-only key file. This is the same scheme as `mediastack-installer`.
-
-| Secret | Used for | Changing it later |
-|---|---|---|
-| `PIHOLE_PASSWORD` | Pi-hole web login | Applies on the next apply. If an imported Pi-hole had no password in its environment, none is set, and the one in its `pihole.toml` stays |
-| `GRAFANA_ADMIN_PASSWORD` | Grafana's first start only | Change it in the Grafana UI |
-| `GUAC_DB_PASSWORD` | Guacamole's PostgreSQL user | The Secrets menu changes it in PostgreSQL too |
-| `GVM_ADMIN_PASSWORD` | Greenbone admin, via `--gvm-password` | Run `--gvm-password` again |
-
-## Settings reference
-
-All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menus, or edit the file and then run
-`--apply`. In menus, `-` clears an optional value.
-
-**General:**
-
-| Key | Default | Meaning |
-|---|---|---|
-| `DOMAIN` | detected | Names become `<sub>.<domain>`; empty = port links |
-| `DASH_SUBDOMAIN` | `dashboard` | Landing page name |
-| `HOST_ADDR` | `auto` | IP the names point at. Set the final IP before a cutover |
-| `HTTP_PORT` / `HTTPS_PORT` | `80` / `443` | Proxy ports |
-| `TIMEZONE` | host's | `TZ` for the apps |
-| `STACKS_DIR` / `DEPLOY_DIR` | `/opt/stacks` / `/opt/docker-dashboard` | App folders / proxy + page |
-| `CERT_MODE` | `selfsigned` | `selfsigned`, `custom` or `fetch` |
-| `CERT_FILE`, `CERT_KEY_FILE` | — | `custom` mode |
-| `CERT_FETCH_SOURCE`, `CERT_FETCH_CERT`, `CERT_FETCH_KEY` | — | `fetch` mode |
-| `FILES_DIR`, `FILES_HTTP` | —, `yes` | `/files/` share, plus plain-HTTP downloads |
-| `HEALTH_CHECK`, `HEALTH_INTERVAL` | `yes`, `2` | Status dots |
-| `HOST_PANEL` | `yes` | Host panel on the page |
-| `HOST_DISK_WARN`, `HOST_DISK_CRIT` | `80`, `90` | Disk thresholds (%) |
-| `HOST_MEM_WARN`, `HOST_MEM_CRIT` | `85`, `95` | Memory thresholds (%) |
-| `HOST_LOAD_WARN`, `HOST_LOAD_CRIT` | `1.0`, `2.0` | Load-per-core thresholds |
-| `UPDATE_SCHEDULE`, `UPDATE_DAY`, `UPDATE_TIME` | `off`, `Sun`, `04:00` | Scheduled updates |
-| `UPDATE_PRUNE` | `yes` | Prune dangling images after updates |
-| `UPDATE_EXCLUDE` | — | Apps, containers or projects never updated |
-| `UPDATE_DELEGATE` | — | `project=command;...` |
-
-**Per app:**
-
-| Keys | Meaning |
-|---|---|
-| `APP_<NAME>` | `yes` / `no` |
-| `<APP>_IMAGE` | Image and tag |
-| `<APP>_SUBDOMAIN` | Name on the proxy |
-| `<APP>_*_PORT` | Direct ports. Blank = not published |
-| `PIHOLE_EXTRA_ENV`, `GRAFANA_EXTRA_ENV` | Extra settings as `K=V;K=V` |
-| `PROMETHEUS_RETENTION`, `GRAFANA_PLUGINS` | Monitoring options |
-| `GUAC_POSTGRES_IMAGE` | Default `postgres:17`. Keep the major version once data exists |
-
-## Files and paths
-
-| Path | What |
-|---|---|
-| `/etc/docker-dashboard/dashboard.conf` | Settings (0600) |
-| `/etc/docker-dashboard/secrets.enc` | Encrypted secrets |
-| `/etc/docker-dashboard/services.conf` | Custom links |
-| `/etc/docker-dashboard/certfetch_ed25519` | Fetch-mode SSH key |
-| `/opt/stacks/<app>/` | `compose.yaml` + the app's data |
-| `/opt/stacks/guacamole/.restore/` | Imported database dump (kept after restore) |
-| `/opt/docker-dashboard/` | Proxy compose, `nginx/`, `html/` (page, `services.json`, `status.json`), `certs/` |
-| `/var/log/docker-dashboard/run-*.log` | One log per run (newest 30 kept) |
-| `/etc/systemd/system/docker-dashboard-*` | Health, update and certificate timers/watchers |
-| `/usr/local/sbin/docker-dashboard` | Installed copy |
-
-## Uninstall
-
-`sudo docker-dashboard --uninstall` (menu U) requires you to type `UNINSTALL`. It removes:
-
-- the dashboard and every managed app container
-- the proxy network
-- the timers
-- `/opt/docker-dashboard`
-
-It then asks two questions. Deleting app data needs a second typed `DELETE-DATA`; removing settings and the vault is
-a yes/no. Both default to keeping, so `--apply` brings everything back. Other containers and Docker itself are
-never touched.
-
-## Testing
-
-```bash
-./docker-dashboard.sh --self-test      # 67 checks, no root or Docker needed
-```
-
-The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
-parsing, port-conflict parsing, certificate SANs, the vault round-trip, manifest safety, delegates and exclusions.
-
-v2.0.0 was also run end to end on a real Docker daemon. The test environment used PostgreSQL holding a real
-Guacamole 1.5 schema, and stand-in containers for the other apps at their real ports, mounts and image names. It
-covered:
-
-- export from a replica of an old Debian 11 layout, including MeshCentral data inside a container
-- wipe, then import
-- every name served through the proxy with the wildcard certificate, including websocket upgrade
-- the Guacamole data restored onto the new PostgreSQL, with the 1.6 schema upgrade applied
-- ownership kept for Grafana (472) and Prometheus (65534)
-- the Pi-hole local DNS file written, with existing records untouched
-- idempotent re-apply, with no containers recreated
-- update-all recreating only the changed image
-- app off/on, certificate renewal, a mismatched key refused, a fetch over scp, a fetch failure fallback
-- port-conflict and overwrite guards, the menus, uninstall, and a fresh install without a bundle
-- the Greenbone override validated against Greenbone's real `compose.yaml`
+# Changelog
+
+All notable changes, newest first. Two components are versioned separately:
+
+- **installer**: `SCRIPT_VERSION` in `hp1810-dashboard-installer.sh`
+- **app**: `__version__` in `app/hp1810dash.py`, which is also the image tag
+
+Versions follow `MAJOR.MINOR.PATCH`.
+
+## installer v1.4.1 / app v2.3.1 — 2026-10-23 — dashboard layout fix
+
+### App 2.3.1
+- **Cards no longer overflow on wide screens.** Port tiles grew to fit long port names, which pushed a card wider
+  than its column. Columns can now shrink, cards are at least 680 px wide (one per row on small screens), and long
+  port names wrap onto a second line, breaking at hyphens, before they are cut off. The full name stays in the
+  tooltip.
+- No stray "·" before the uptime when a switch doesn't report a firmware version.
+- The top bar no longer causes sideways scrolling on phone-width screens.
+
+### Installer 1.4.1
+- Ships app 2.3.1.
+
+## installer v1.4.0 / app v2.3.0 — 2026-10-23 — SNMPv3, port names from the switch
+
+### App 2.3.0
+- **SNMPv3 for the GS110TP**, now the default for new SNMP switches.
+  - USM in `snmplite.py`: engine discovery, RFC 3414 key localization (checked against the RFC test vectors),
+    HMAC-MD5/SHA-96 and HMAC-SHA-224/256/384/512 authentication, DES-CBC and AES-128-CFB privacy, time-window
+    resync. USM reports are turned into plain messages (wrong auth password, wrong encryption key, unknown user,
+    unsupported security level, user without write access).
+  - Interop tested against net-snmp `snmpd` v3 users (SHA/AES, MD5/DES, SHA-256, read-only user).
+  - New switch fields `snmp_version` (`3`/`2c`), `snmp_user`, `snmp_auth`, `snmp_priv`, and an encrypted privacy
+    key (falls back to the auth password). Switches saved by 2.2.0 have no `snmp_version` and keep using v2c.
+  - v3 auth passwords and privacy keys must be 8+ characters; checked when saved.
+- **GS110TP port names come from the switch.** Each port's description (`ifAlias`) is read on every poll and shown
+  as its name. Renaming a port from the dashboard or `ctl port-name` writes `ifAlias`, reads it back, and saves the
+  config. HP 1810 names stay in the dashboard config as before.
+  - A dashboard-side name (e.g. set in 2.2.0) still wins as an override; renaming the port moves it to the switch.
+  - A poll that was already running when a port was renamed can no longer put the old name back.
+  - Ports carry `alias` and `label_src` (`switch`/`dashboard`) in `/api/status`; cards carry `proto` and
+    `snmp_version`.
+- **Web UI.** The switch editor has SNMP version, user, authentication, encryption and encryption key fields, with
+  GS110TP hints. For SNMP switches the port-name grid is replaced by a note (shown only to clear old overrides).
+  The port dialog says the name is saved on the switch; a rename that couldn't be saved is shown as a warning.
+- **ctl.** `switch add/edit --snmp-version --snmp-user --auth-proto --priv-proto --priv-key-stdin|--priv-key-prompt`,
+  `edit --clear-priv-key`. `switch list` shows `snmp v3 admin sha/des`. `port-name` reports where the name went.
+- Mock GS110TP: SNMPv3 agent (reusing the client's USM code), writable `ifAlias`, saved/rebooted descriptions.
+- Tests: 55 (was 48).
+
+### Installer 1.4.0
+- The add-switch menu asks for the SNMP version (3 by default), then the v3 user, auth and encryption protocols, auth
+  password and encryption key. It explains the GS110TP specifics (admin user, auth password = login password, DES)
+  and warns that v2c is cleartext.
+
+## installer v1.3.0 / app v2.2.0 — 2026-10-23 — Netgear GS110TP, port picker
+
+### App 2.2.0
+- **Netgear GS110TP support** (`model: gs110tp`, 10 ports), using SNMP v2c.
+  - **Status** comes from IF-MIB / ifXTable / EtherLike-MIB: physical ports only, numbered from `ifName`. Packet
+    rates use 64-bit counters, falling back to 32-bit.
+  - **Admin up/down** is a `SET ifAdminStatus`, verified by reading it back.
+  - **Saving.** With "Save config" on (the default), each change is saved through NETGEAR-SWITCHING-MIB
+    `agentSaveConfig`; the `4526.10` and `4526.11` trees are tried, and completion is confirmed with
+    `agentSaveConfigStatus`. A save that fails is reported to the user and recorded in the audit log.
+  - **Credentials.** The SNMP write community is stored encrypted; SNMP switches never inherit the HP default
+    password.
+- **`app/snmplite.py`**: a dependency-free SNMP v2c client (BER codec, GET, GETBULK walk, SET). It reports a
+  read-only community and no reply (wrong community or SNMP off) as clear errors. Checked against net-snmp.
+- **Model abstraction.**
+  - Each switch has a `model`; drivers return a common poll format.
+  - Protected ports and port names are checked against the model's port count.
+  - Cards show the model and a 10-wide port grid.
+  - The switch editor shows HP or SNMP fields to match the model, with a port-name grid sized to it.
+- **New `ctl` commands.** `models`, `ports SWITCH [--json|--tsv]`; `switch add/edit --model --snmp-port
+  --save-config`. `switch list` shows a numbered list with model and connection. `port` on an unknown switch lists
+  the configured ones. Port results include whether the change was saved.
+- **Fixed: config edits from `ctl` could be missed by the running server.** It compared against a read cache that any
+  web request refreshed. It now tracks the version it last applied.
+- **Fixed: no polling without credentials.** Switches with no password or community are no longer polled with empty
+  credentials; the card says what's missing.
+- **Fixed: retiring an SNMP client no longer waits** for a poll that is timing out.
+- **Tests:** 48, up from 39. New: the codec, the client against the mock agent, the GS110TP driver (poll, set + save,
+  persistence across a simulated reboot, running-config only mode, save-tree fallback, missing save object,
+  read-only community), mixed-model dashboard, model validation, CLI with a GS110TP, and change detection for edits
+  made in another process.
+
+### Installer 1.3.0
+- **Port picker.** Menu **P** and `--port` with missing arguments:
+  1. list the configured switches (numbered: model, host, connection);
+  2. show the chosen switch's ports with name, admin, link, speed and protection;
+  3. offer the opposite of the current state, and ask for confirmation.
+  `--port SWITCH N up|down` still runs unattended; an unknown switch name lists the configured ones.
+- **`--ports [SWITCH]`** shows the ports of one switch, or of all.
+- **Add switch** (menu and wizard) asks for the model first. For the GS110TP it then asks for the SNMP port, the save
+  option and the write community.
+- **Fixed: keystrokes swallowed.** `docker exec -it` could swallow keystrokes typed while a `ctl` command ran. Now
+  the terminal is attached only for `--password-prompt`, and stdin is passed only when piped.
+- **Self-test: 30 checks.**
+
+## installer v1.2.0 / app v2.1.0 — 2026-10-23 — HTTPS by default, port names
+
+### App 2.1.0
+- **HTTPS by default.** New `general.tls_mode`:
+  - `self-signed` (the default) generates an EC P-256 certificate, valid 825 days, covering the host name,
+    `localhost`, loopback addresses and `general.tls_san`. It is regenerated when those names change or fewer than
+    30 days remain.
+  - `custom` serves your certificate chain and key, checked first: valid PEM, key matches certificate, not expired.
+  - `off` serves plain HTTP.
+  - If a custom certificate becomes unusable, the dashboard falls back to the self-signed one and shows a warning.
+  - HSTS is sent only in custom mode, and the session cookie is `Secure` whenever HTTPS is on.
+  - A config from before 2.1 without TLS settings becomes `self-signed`; one with a certificate path becomes
+    `custom`.
+- **Settings → HTTPS tab.**
+  - Shows the certificate being served: names, issuer, expiry, SHA-256.
+  - Mode and extra names; regenerate the self-signed certificate.
+  - **Import certificate…** by paste or file chooser.
+  - **Restart now**, which exits so Docker restarts the container. It's enabled when the restart policy allows it.
+  - Warnings for pending restarts and for certificates expiring within 30 days.
+- **Port names.**
+  - Per-switch `port_names`, up to 24 characters each.
+  - Shown on the tiles, in the port dialog title, and matched by the filter.
+  - Operators can rename ports from the port dialog (`PUT /api/port-name`); admins can edit all 8 in the switch
+    editor.
+  - Names survive renaming the switch, and each rename is audited with the old and new name.
+- **New `ctl` commands.** `port-name`, `port-names`, `tls-info`, `tls-import CERT KEY`, `tls-regen`. `switch show`
+  now lists port names.
+- **Fixed.** On the Settings page, changing the `#tab` in the URL now switches the tab.
+- **Tests:** 39, up from 33. New: self-signed creation, reuse and regeneration; custom import with chain,
+  mismatch and garbage input; fallback; config upgrade; an HTTPS round trip with a Secure cookie and no HSTS for
+  self-signed; port names in the store, the API with roles, and the CLI.
+
+### Installer 1.2.0
+- **Install wizard asks about HTTPS:** self-signed (default), import certificate files, or off. The choice is
+  applied before the first start. The self-signed certificate is given the host's FQDN and its non-Docker IPs.
+  After every start, the installer prints the certificate mode, days left and SHA-256 fingerprint.
+- **New flags:** `--tls-info`, `--tls-import CERT KEY` (host files are validated by the app, then the container
+  restarts), `--tls-mode self-signed|off`, `--tls-names LIST`, `--tls-regen`, `--port-name SWITCH N NAME`.
+- **Menus.** Settings → 6 **HTTPS**, and Settings → 1 → 6 **Name a port**.
+- **Compose file.** Sets the container's host name to the Docker host's short name, so the certificate matches it,
+  and passes `HP1810_SELF_RESTART`, which is off when `RESTART_POLICY=no`.
+- **Fixed.** The banner showed a stray line break before "absent" when no container existed.
+- **Self-test: 28 checks.** New: host name and self-restart in the compose file, and certificate names skipping
+  Docker bridge addresses.
+
+## installer v1.1.0 — 2026-10-23 — Self-contained, prerequisites
+
+### Fixed
+- **Standalone runs stopped at preflight.** Running the installer on its own, without the repository checkout next to
+  it, stopped with "Cannot find the dashboard source" before Docker or anything else was installed.
+
+### Added
+- **Embedded app source.** The Dockerfile, `app/` and docs are embedded at the end of the script as a sha256-checked,
+  reproducible tar.gz inside a heredoc that is never executed. The installer looks for the source in this order:
+  `--source`, a checkout next to the script, the embedded copy, the installed copy. It reports which one it used and
+  cleans up the temporary folder on exit.
+- **`--build-standalone OUT`** regenerates the self-contained installer. No root needed.
+- **Missing prerequisites are installed.** Each required tool is mapped to the package that provides it; only the
+  missing packages are installed, with `--no-install-recommends`.
+- **Docker handling.**
+  - A stopped Docker daemon is started (systemctl, then `service`), waiting up to 20 s.
+  - `docker-buildx-plugin` is added when Docker CE is present without it.
+  - The banner shows "docker not installed" instead of "docker not running" when Docker is missing.
+- **Generated admin password surfaced.** If the container generated the first admin password (for example, the data
+  volume was started outside the installer), the installer now shows it.
+- **Self-test: 26 checks.** New: source available, embedded payload checksum and layout, version match, script body
+  stops before the payload, prerequisite map.
+
+## installer v1.0.0 / app v2.0.0 — 2026-10-23 — Docker, web settings, users
+
+### Installer (new)
+- **Menu and CLI.** Menu-driven installer and lifecycle manager in the `mediastack-installer.sh` style. Every menu
+  item has a CLI flag. `--dry-run` and `--yes` are supported, destructive actions need a typed keyword (`UNINSTALL`,
+  `PURGE-DATA`, `RESTORE`), runs are serialised by a lock, and run logs are rotated (newest 20 kept).
+- **Docker.** Installs Docker CE if it's missing, the same way as `docker-base-install.sh`. Builds the image locally
+  from the checkout with a pinned `BASE_IMAGE` and `CRYPTOGRAPHY_VERSION`; both can be overridden with `--set`, and
+  `BUILD_NETWORK=host` is available for builds behind a local proxy.
+- **Service account and vault.** A dedicated nologin, home-less account that is not in the docker group; the data
+  directory belongs to it (0700). The vault holding the app secret key is encrypted with systemd-creds/TPM2 or an
+  openssl fallback, and `--rekey` re-encrypts it.
+- **Compose file.** Generated with a read-only root filesystem, `tmpfs /tmp`, `cap_drop: ALL`,
+  `no-new-privileges`, `init`, a memory limit, log rotation and a healthcheck. The secret key is injected at start
+  time; the compose file itself refuses to start without it.
+- **First admin.** The first admin user is created before the first start, with your password or a generated one
+  (shown once and saved root-only).
+- **Settings menu.**
+  - Switches: add, edit, remove, test one, test all.
+  - Switch defaults, users and general settings, all wrapping `hp1810dash ctl`.
+  - Container/host settings: network, paths, image pins, limits, logs, account, vault.
+- **`--ctl ARGS…`** runs any `ctl` command. It uses `docker exec` when the container is running, a one-off container
+  when it is stopped, and a TTY when you're at a terminal so `--password-prompt` works.
+- **`--port SWITCH N up|down`.**
+- **Backup and restore.**
+  - `--backup` archives the data, settings, vault and key (0600) and prunes old archives.
+  - `--restore` validates the archive's paths, moves the current data aside, and re-owns the restored data.
+- **Uninstall** keeps data unless you also purge it, and asks separately before removing the service account.
+- **Self-test.** `--self-test` runs 22 checks: validators, `safe_path`, config round-trip, compose rendering and
+  hardening, build command, `docker compose config` validation, the start-without-key guard, and a vault round-trip.
+  `--app-self-test` runs the app suite inside the image.
+
+### App 2.0.0
+- **Breaking.** Configuration moved to `/data/config.json` (schema 2). Use `ctl import-v1` to bring in a v1
+  `switches.json`.
+- **Container-ready.** `serve`, `ctl`, `health` and `selftest` subcommands; runs as non-root on a read-only root
+  filesystem; `/data` volume.
+- **Encrypted secrets.** Switch passwords and the default password are encrypted with Fernet. The key comes from
+  `HP1810_SECRET_KEY`, or `/data/.secret.key` when that variable isn't set.
+- **Users and roles.**
+  - viewer, operator and admin, with PBKDF2-SHA256 password hashes.
+  - Form login with server-side sessions, an HttpOnly + SameSite=Strict cookie, and a CSRF header on every change.
+  - Lockout per IP after failed logins.
+  - Sessions are dropped when a user's role or password changes; the last admin can't be removed.
+- **Web Settings page.**
+  - Switches: add, edit, delete, test connection with the unsaved values, test all.
+  - Switch defaults, including the default password.
+  - Users.
+  - General: title, poll interval, session lifetime, lockout, log level, audit rotation, TLS certificate/key.
+- **Audit page.** Search, adjustable limit, auto-refresh.
+- **Self-service.** Change your own password and sign out from the user menu.
+- **`ctl` CLI.** `show`, `keys`, `get`, `set` (several keys in one call), `switch …`, `user …`, `port`, `audit`,
+  `import-v1`. Passwords are only read from stdin or a prompt.
+- **Live reload.** Changes made from the GUI and the CLI are picked up without a restart. When a switch's settings
+  change, its old session is logged out.
+- **`ctl port` goes through the running server** via a token-protected, loopback-only endpoint, so it reuses that
+  switch's session instead of using up another login slot. If the server isn't running, it connects to the switch
+  directly.
+- **Per-switch options.** Each switch can override the scheme, TLS verification, timeout and username, or inherit
+  them from the defaults. Switches can also have notes, and polling can be turned off without deleting the switch.
+- **Optional HTTPS** using a certificate and key in `/data` (adds a Secure cookie and HSTS).
+- **Audit log.** Rotates by size, records which fields changed rather than their values, and never records
+  passwords.
+- **Security headers.** Strict CSP with no inline script or style, `X-Frame-Options: DENY`, nosniff, no-referrer.
+- **Tests.** 33 tests covering parsers, the client against a mock switch, crypto, the config store, the audit log,
+  the HTTP API with roles and CSRF, the internal endpoint and the CLI.
+
+## app v1.0.0 — 2026-10-22 — Initial release
+- Single-file dashboard (standard library only) that drives the PL.2.10 web UI.
+- Port status and admin up/down, protected ports, HTTP Basic auth, an audit log.
+- `--check` and `--set` CLI. Plaintext `switches.json`.
