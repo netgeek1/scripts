@@ -2,10 +2,42 @@
 
 All notable changes, newest first. Two components are versioned separately:
 
-- **installer**: `SCRIPT_VERSION` in `hp1810-dashboard-installer.sh`
-- **app**: `__version__` in `app/hp1810dash.py`, which is also the image tag
+- **installer**: `SCRIPT_VERSION` in `switch-dashboard-installer.sh` (`hp1810-dashboard-installer.sh` before 2.0)
+- **app**: `__version__` in `app/switchdash.py` (`app/hp1810dash.py` before 3.0), which is also the image tag
 
 Versions follow `MAJOR.MINOR.PATCH`.
+
+## installer v2.0.0 / app v3.0.0 — 2026-10-26 — renamed to switch-dashboard, optional plain HTTP
+
+### Renamed: hp1810-dashboard → switch-dashboard
+- Installer `switch-dashboard-installer.sh`, host command `switch-dashboard`, container and image `switch-dashboard`,
+  folders `/opt|/etc|/var/backups|/var/log/switch-dashboard`, service account `switchdash`, in-container command
+  `switchdash`, Python module `app/switchdash.py`, environment variables `SWDASH_*`, session cookie `swdash_sid`.
+- Model IDs (`hp1810`, `gs110tp`) are unchanged. The app still reads `HP1810_*` environment variables as a fallback,
+  and the stored-secret format is unchanged (a test now decrypts a password written by 2.x).
+
+### Installer 2.0.0
+- **Upgrade from hp1810-dashboard.** Any action detects an old install and, after confirmation (or `--yes`):
+  backs it up; removes the old container; moves folders that used the old default paths; renames the service
+  account keeping its UID/GID; re-encrypts the vault under the new name and verifies it; removes the old settings
+  folder, command and images; then builds and starts the new container. Custom paths are kept.
+- **Plain HTTP option.** New setting `HTTP_PORT` (default 8880; empty = not published) and flag
+  `--http-mode off|redirect|on`. The wizard asks after the HTTPS choice; the HTTPS menu has a new item 6. The URL
+  summary shows the HTTP address when it's on.
+- **Fix:** the build context now gets fresh file times on every copy. The embedded source has fixed timestamps,
+  and Docker's build cache treated a changed file of the same size as unchanged, so such an edit could be left
+  out of the image.
+- Self-test: 34 checks (was 30).
+
+### App 3.0.0
+- **`general.http_mode`** (`off` | `redirect` | `on`, restart to apply): a second listener on container port 8880.
+  `redirect` answers with `308` to the same host and path on the published HTTPS port; `on` serves the dashboard
+  (session cookie without `Secure`, no HSTS). Ignored when `tls_mode` is `off`.
+- Web UI: the **HTTP / HTTPS** tab has a Plain HTTP setting with port and risk notes; "Serving now" shows it.
+- `ctl tls-info` shows `http_mode`.
+- Dropped connections (scans, health probes, a browser rejecting the certificate) are logged at debug level
+  instead of printing a traceback.
+- Tests: 59 (was 55), including the real `serve` command in all three HTTP modes.
 
 ## installer v1.4.1 / app v2.3.1 — 2026-10-23 — dashboard layout fix
 
