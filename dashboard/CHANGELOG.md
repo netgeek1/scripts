@@ -3,6 +3,22 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.2.1 — 2026-10-26 — Custom app fixes
+
+### Fixed
+- A custom app whose `docker compose up` failed was reported as `[ OK ] ... is up`. Errors weren't being caught in
+  that step. Each step is now checked, the proxied service must actually be running, and failures are reported
+  while the other apps still start.
+- Custom apps accept `docker-compose.yml`, `docker-compose.yaml` and `compose.yml`, as well as `compose.yaml`.
+
+### Added
+- **Set up a folder already in custom/** (Apps → C → F): for project folders another installer put there, built
+  from source or not. The menu lists such folders as "not set up yet".
+- Custom apps with a `build:` section are built on first apply. Update-all rebuilds them against a fresh base image,
+  and falls back to the local base if it can't be pulled.
+- "Make one from an image" warns when the image isn't on the host and points source-built apps to the folder setup.
+- Self-test: 67 checks.
+
 ## v2.2.0 — 2026-10-26 — Custom apps and host health
 
 ### Added
