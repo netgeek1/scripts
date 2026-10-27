@@ -3,6 +3,15 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.2.2 — 2026-10-26 — Remove options for custom apps
+
+### Changed
+- **Remove** (Apps → C → R) now offers three levels:
+  - *unregister only*: off the proxy, page and DNS list; containers keep running and the folder is untouched
+  - *stop + unregister*: containers removed, folder and data kept
+  - *delete everything*: still needs `DELETE-APP`
+- An unregistered folder shows as "not set up yet" and can be set up again with F.
+
 ## v2.2.1 — 2026-10-26 — Custom app fixes
 
 ### Fixed
