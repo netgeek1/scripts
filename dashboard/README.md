@@ -220,7 +220,12 @@ the script attaches the app's container to the proxy network under the alias `dd
 (its `.env` is copied too) or let the script write a basic one from an image and port. Answer a few questions, then
 apply.
 
-**Adding one by hand:** create `/opt/stacks/custom/<name>/compose.yaml` and an `app.conf`, then run
+**A project folder that's already there:** if a folder in `/opt/stacks/custom/` already has its own
+`docker-compose.yml`, for example one another installer put there, it shows as "not set up yet". Choose
+**Apps → C → F** to give it an `app.conf`. Apps with a `build:` section are built on the first apply, and
+update-all rebuilds them.
+
+**Adding one by hand:** create `/opt/stacks/custom/<name>/compose.yaml` (or `docker-compose.yml`) and an `app.conf`, then run
 `sudo docker-dashboard --apply`:
 
 ```
@@ -361,7 +366,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 65 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 67 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
