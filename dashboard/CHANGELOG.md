@@ -3,6 +3,25 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.4.0 — 2026-10-26 — Add any running container
+
+### Added
+- **Add a container that's already running** (Apps → C → D): lists every running container that docker-dashboard
+  doesn't run or proxy yet, from any folder, compose or `docker run`. The menu shows them as "running, not added".
+  - The chosen one is set up as started by its own script. Its folder under `custom/` holds only an `app.conf`, and
+    its files stay where they are.
+  - The container port and HTTPS are pre-filled from the container.
+- `CONTAINER` in `app.conf` lets you proxy a single `docker run` container instead of a compose project.
+- Self-test: 72 checks.
+
+### Fixed
+- Update-all warned about a custom app started by its own script a second time, in the compose-project pass.
+  `producer | grep -q` reports failure under `pipefail` when grep exits early, so the membership checks now
+  capture the list first.
+- Update-all no longer passes a registered `docker run` custom app to Watchtower; its own script updates it.
+- Records with empty fields (docker-run containers have no compose labels) use the 0x1f separator, so `read`
+  doesn't shift fields.
+
 ## v2.3.0 — 2026-10-26 — Apps started by their own script
 
 ### Added
