@@ -248,8 +248,9 @@ ENABLED='yes'
 - **One broken app doesn't block the rest:** a custom app with a problem is reported and skipped.
 - **Recreated outside the script:** if the container is recreated another way (for example with
   `docker compose up` by hand), the next health run re-attaches it, within the health interval.
-- **Disable or remove:** `ENABLED='no'` stops the app and keeps its folder. **Remove** in the menu deletes the folder
-  after you type `DELETE-APP`.
+- **Disable or remove:** `ENABLED='no'` stops the app and keeps its folder. **Remove** in the menu offers three
+  levels: *unregister only* (containers and folder untouched), *stop + unregister* (folder and data kept), or
+  *delete everything* (after you type `DELETE-APP`).
 
 ## Host health
 
