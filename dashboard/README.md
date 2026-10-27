@@ -30,6 +30,8 @@ scripts you `curl` onto other machines.
 - [Names, DNS and certificates](#names-dns-and-certificates)
 - [Menu and CLI](#menu-and-cli)
 - [Apps](#apps)
+- [Custom apps](#custom-apps)
+- [Host health](#host-health)
 - [Updating containers](#updating-containers)
 - [Secrets](#secrets)
 - [Settings reference](#settings-reference)
@@ -191,7 +193,11 @@ in the journal.
 | X / U | `--stop` / `--uninstall` | Stop all (data kept) / remove (typed `UNINSTALL`) |
 | T / S | `--dry-run` / `--self-test` | Show what would change / built-in tests |
 
-`--gvm-password` sets the Greenbone admin password from the vault once its first start has finished.
+More actions:
+
+- `--host` (menu H) shows host health and refreshes the page's Host panel.
+- `--custom-apps` (or Apps → C) manages your own apps.
+- `--gvm-password` sets the Greenbone admin password from the vault once its first start has finished.
 
 ## Apps
 
@@ -203,6 +209,58 @@ plain folders, so one copy of `/opt/stacks` backs up everything.
 - **Turning an app off:** it stops and its containers are removed, but its data stays. Turn it on again and it comes
   back as it was.
 - **Ports:** every app's direct port is a setting. Blank means proxy only.
+
+## Custom apps
+
+Any app with a compose file can join the proxy: its own name, the wildcard certificate, a card with a status dot,
+the DNS list, the port check, update-all and export/import. Your compose file is never changed. After each start,
+the script attaches the app's container to the proxy network under the alias `dd-c-<name>`.
+
+**Adding one from the menu:** **Apps → C → N**. Give it a short name, then either point at an existing compose file
+(its `.env` is copied too) or let the script write a basic one from an image and port. Answer a few questions, then
+apply.
+
+**Adding one by hand:** create `/opt/stacks/custom/<name>/compose.yaml` and an `app.conf`, then run
+`sudo docker-dashboard --apply`:
+
+```
+TITLE='HP Switches'
+SUBDOMAIN='switches'                       # -> https://switches.<domain>
+SERVICE='web'                              # compose service the proxy talks to
+PORT='8443'                                # its container port
+TLS='yes'                                  # that port speaks HTTPS itself
+FLAGS='ws'                                 # ws (websockets), stream (no buffering), big (large uploads)
+FALLBACK_URL='https://192.168.0.190:8444/' # shown under the card (optional)
+DESCRIPTION='Port status and admin up/down'
+ENABLED='yes'
+```
+
+**How it behaves:**
+
+- **Host networking:** apps using `network_mode: host` can't join a network. Set
+  `UPSTREAM_URL='http://<host-ip>:<port>'` instead of `SERVICE`/`PORT`.
+- **Checks at apply:** names must be unique, and the service must exist in the compose file.
+- **One broken app doesn't block the rest:** a custom app with a problem is reported and skipped.
+- **Recreated outside the script:** if the container is recreated another way (for example with
+  `docker compose up` by hand), the next health run re-attaches it, within the health interval.
+- **Disable or remove:** `ENABLED='no'` stops the app and keeps its folder. **Remove** in the menu deletes the folder
+  after you type `DELETE-APP`.
+
+## Host health
+
+The health check (every 2 minutes) also collects host health for the **Host** panel at the top of the page. Each
+value shows OK, HIGH or CRITICAL against thresholds you set in **Settings → Health**.
+
+| Tile | Shows |
+|---|---|
+| CPU | Busy % and 5-min load per core (default: high at 1.0, critical at 2.0) |
+| Memory / Swap | Use % and amounts (memory default: high at 85%, critical at 95%) |
+| Disk (each filesystem) | Use % and amounts (default: high at 80%, critical at 90%). Includes NFS/SMB mounts |
+| Containers | Running / total. Lists unhealthy, restarting, and exited-with-error containers |
+| Uptime | Uptime and OS |
+
+`sudo docker-dashboard --host` (menu H) prints the same in the terminal. For history and graphs, Grafana's
+*Node Exporter Full* dashboard (ID 1860) uses the node-exporter that the monitoring app already runs.
 
 ## Updating containers
 
@@ -251,6 +309,10 @@ All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menu
 | `CERT_FETCH_SOURCE`, `CERT_FETCH_CERT`, `CERT_FETCH_KEY` | — | `fetch` mode |
 | `FILES_DIR`, `FILES_HTTP` | —, `yes` | `/files/` share, plus plain-HTTP downloads |
 | `HEALTH_CHECK`, `HEALTH_INTERVAL` | `yes`, `2` | Status dots |
+| `HOST_PANEL` | `yes` | Host panel on the page |
+| `HOST_DISK_WARN`, `HOST_DISK_CRIT` | `80`, `90` | Disk thresholds (%) |
+| `HOST_MEM_WARN`, `HOST_MEM_CRIT` | `85`, `95` | Memory thresholds (%) |
+| `HOST_LOAD_WARN`, `HOST_LOAD_CRIT` | `1.0`, `2.0` | Load-per-core thresholds |
 | `UPDATE_SCHEDULE`, `UPDATE_DAY`, `UPDATE_TIME` | `off`, `Sun`, `04:00` | Scheduled updates |
 | `UPDATE_PRUNE` | `yes` | Prune dangling images after updates |
 | `UPDATE_EXCLUDE` | — | Apps, containers or projects never updated |
@@ -299,7 +361,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 52 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 65 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
