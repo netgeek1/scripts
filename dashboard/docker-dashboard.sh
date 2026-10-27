@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.2.1"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1248,7 +1248,7 @@ dns_records() {
 }
 
 # -----------------------------------------------------------------------------
-# CUSTOM APPS: $STACKS_DIR/custom/<name>/compose.yaml + app.conf
+# CUSTOM APPS: $STACKS_DIR/custom/<name>/{compose.yaml|docker-compose.yml} + app.conf
 # Your compose file is never modified: after each start the script attaches the app's
 # container to the proxy network under the alias dd-c-<name>.
 # -----------------------------------------------------------------------------
@@ -1302,7 +1302,27 @@ custom_save() {   # custom_save NAME  (from CA[])
     } | write_file "$d/app.conf" 644 root:root
 }
 
-custom_on() { custom_load "$1" && [[ "${CA[ENABLED]}" == yes && -f "$(custom_dir "$1")/compose.yaml" ]]; }
+# custom_compose_file NAME -> the app's compose file (the usual names, in compose's own order of preference)
+custom_compose_file() {
+    local f
+    for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+        [[ -f "$(custom_dir "$1")/$f" ]] && { printf '%s' "$f"; return 0; }
+    done
+    return 1
+}
+custom_on() { custom_load "$1" && [[ "${CA[ENABLED]}" == yes ]] && custom_compose_file "$1" >/dev/null; }
+
+# folders under custom/ that have a compose file but no app.conf yet (e.g. put there by another installer)
+custom_unconfigured() {
+    local d n
+    [[ -d "$(custom_root)" ]] || return 0
+    for d in "$(custom_root)"/*/; do
+        d=${d%/}; n=${d##*/}
+        [[ -f "$d/app.conf" ]] && continue
+        valid_app_name "$n" && custom_compose_file "$n" >/dev/null && printf '%s\n' "$n"
+    done
+    return 0
+}
 enabled_customs() { local n; for n in $(custom_names); do custom_on "$n" && printf '%s\n' "$n"; done; return 0; }
 
 custom_upstream() {   # from CA[] of NAME
@@ -1333,7 +1353,8 @@ used_subdomains() {
 
 custom_compose() {   # custom_compose NAME ARGS...  (runs in the app folder so its .env is used)
     local n=$1; shift
-    ( cd "$(custom_dir "$n")" && docker compose -p "$(custom_project "$n")" -f compose.yaml "$@" )
+    local f; f=$(custom_compose_file "$n") || { log_error "$n: no compose file in $(custom_dir "$n")"; return 1; }
+    ( cd "$(custom_dir "$n")" && docker compose -p "$(custom_project "$n")" -f "$f" "$@" )
 }
 
 # published host ports from 'docker compose config --format json' -> "port/proto<TAB>label"
@@ -1359,7 +1380,7 @@ custom_host_ports() {
 custom_validate() {   # custom_validate NAME -> 0 ok, messages on failure
     local n=$1 d sub bad=0 svcs
     d=$(custom_dir "$n")
-    [[ -f "$d/compose.yaml" ]] || { log_error "$n: $d/compose.yaml is missing."; return 1; }
+    custom_compose_file "$n" >/dev/null || { log_error "$n: no compose file (compose.yaml or docker-compose.yml) in $d."; return 1; }
     custom_load "$n"
     v_sub "${CA[SUBDOMAIN]}" || { log_error "$n: SUBDOMAIN '${CA[SUBDOMAIN]}' is not a valid name."; bad=1; }
     while IFS= read -r sub; do
@@ -1371,7 +1392,7 @@ custom_validate() {   # custom_validate NAME -> 0 ok, messages on failure
         valid_port "${CA[PORT]}" || { log_error "$n: PORT '${CA[PORT]}' is not a port number."; bad=1; }
         if docker_up; then
             svcs=$(custom_compose "$n" config --services 2>/dev/null) || { log_error "$n: docker compose config fails in $d."; return 1; }
-            in_list "${CA[SERVICE]}" $svcs || { log_error "$n: SERVICE '${CA[SERVICE]}' is not in compose.yaml (services: $(xargs <<<"$svcs"))."; bad=1; }
+            in_list "${CA[SERVICE]}" $svcs || { log_error "$n: SERVICE '${CA[SERVICE]}' is not in $(custom_compose_file "$n") (services: $(xargs <<<"$svcs"))."; bad=1; }
         fi
     fi
     valid_field "${CA[TITLE]}" && valid_field "${CA[DESCRIPTION]}" || { log_error "$n: TITLE/DESCRIPTION may not contain '|'."; bad=1; }
@@ -1405,11 +1426,25 @@ custom_up() {   # custom_up NAME [pull]
         run custom_compose "$n" up -d --remove-orphans
         return 0
     fi
-    [[ "$mode" == pull ]] && { run_logged custom_compose "$n" pull --ignore-pull-failures || true; }
-    run_logged custom_compose "$n" up -d --remove-orphans
+    # errexit is off in here (called as `( custom_up ) || ...`), so every step is checked explicitly
+    if [[ "$mode" == pull ]]; then run_logged custom_compose "$n" pull --ignore-buildable --ignore-pull-failures || true; fi
+    # compose builds images that have a build: section and are not built yet
+    run_logged custom_compose "$n" up -d --remove-orphans || { log_error "$n: docker compose up failed."; return 1; }
+    custom_running "$n" || return 1
     custom_attach "$n"
     log_ok "${CA[TITLE]} is up"
 }
+
+custom_running() {   # the proxied service must actually be running
+    local n=$1
+    [[ -n "${CA[UPSTREAM_URL]}" ]] && return 0
+    if [[ -z "$(custom_compose "$n" ps -q --status running "${CA[SERVICE]}" 2>/dev/null)" ]]; then
+        log_error "$n: service '${CA[SERVICE]}' is not running. See: sudo docker compose -p $(custom_project "$n") logs ${CA[SERVICE]} (in $(custom_dir "$n"))"
+        return 1
+    fi
+}
+
+custom_buildable() { custom_compose "$1" config --format json 2>/dev/null | tr -d '\n ' | grep -q '"build":{'; }
 
 custom_down() {   # custom_down NAME [REASON]
     local n=$1
@@ -1426,7 +1461,7 @@ custom_prompt() {   # custom_prompt NAME -- edit CA[] interactively
     ask v "Name (-> $(fqdn "${CA[SUBDOMAIN]}"))" "${CA[SUBDOMAIN]}"; CA[SUBDOMAIN]=$v
     svcs=$(custom_compose "$n" config --services 2>/dev/null | xargs)
     [[ -z "${CA[SERVICE]}" && "$svcs" != *" "* ]] && CA[SERVICE]=$svcs
-    log_info "Services in compose.yaml: ${svcs:-?}"
+    log_info "Services in $(custom_compose_file "$n" || echo compose.yaml): ${svcs:-?}"
     ask v "Service the proxy talks to" "${CA[SERVICE]}"; CA[SERVICE]=$v
     ask v "Its container port" "${CA[PORT]}"; CA[PORT]=$v
     ask v "Does that port speak HTTPS itself? (yes/no)" "${CA[TLS]}"; CA[TLS]=$v
@@ -1441,7 +1476,7 @@ custom_add() {
     valid_app_name "$n" || { log_warn "Invalid name"; return 0; }
     d=$(custom_dir "$n")
     [[ -e "$d" ]] && { log_warn "$d already exists; use Edit."; return 0; }
-    printf '   1) Use an existing compose file\n   2) Make one from an image\n'
+    printf '   1) Use an existing compose file (copied here)\n   2) Make one from an image\n'
     read -rp "  Choice: " src || return 0
     run mkdir -p "$d"
     case "$src" in
@@ -1452,6 +1487,11 @@ custom_add() {
            log_info "Copied. Relative paths in it (./data ...) now resolve inside $d -- copy those folders there too." ;;
         2) ask img "Image" ""
            [[ "$img" =~ ^[a-z0-9][a-z0-9._/:@-]*$ ]] || { log_warn "Invalid image"; rmdir "$d" 2>/dev/null; return 0; }
+           if ! docker image inspect "$img" >/dev/null 2>&1; then
+               log_warn "Image '$img' is not on this host; apply will try to pull it from a registry."
+               [[ "$img" != */* ]] && log_warn "If it is built from source, use 'Set up a folder' with its project folder instead."
+               confirm "Continue with this image?" n || { rmdir "$d" 2>/dev/null; return 0; }
+           fi
            ask cport "Container port of its web UI" ""
            valid_port "$cport" || { log_warn "Invalid port"; rmdir "$d" 2>/dev/null; return 0; }
            ask hport "Also publish on host port (- for proxy only)" "-"; [[ "$hport" == - ]] && hport=""
@@ -1472,6 +1512,21 @@ custom_add() {
     custom_validate "$n" && log_ok "Custom app '$n' saved. Apply (A) to start it." || log_warn "Saved, but fix the problems above before applying."
 }
 
+custom_adopt() {   # give a folder that already has a compose file (and maybe a build) its app.conf
+    local -a cand; local i n
+    mapfile -t cand < <(custom_unconfigured)
+    (( ${#cand[@]} )) || { log_info "No folders without app.conf in $(custom_root)."; return 0; }
+    for i in "${!cand[@]}"; do printf '   %d) %s  (%s)\n' "$((i + 1))" "${cand[$i]}" "$(custom_compose_file "${cand[$i]}")"; done
+    read -rp "  Number: " i || return 0
+    [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#cand[@]} )) || { log_warn "No such folder"; return 0; }
+    n=${cand[$((i - 1))]}
+    custom_defaults "$n"
+    custom_buildable "$n" && log_info "$n builds its image from source; the first apply builds it, update-all rebuilds it."
+    custom_prompt "$n"
+    custom_save "$n"
+    custom_validate "$n" && log_ok "Custom app '$n' saved. Apply (A) to start it." || log_warn "Saved, but fix the problems above before applying."
+}
+
 menu_custom() {
     ensure_config
     local n ch i
@@ -1480,15 +1535,18 @@ menu_custom() {
         mapfile -t names < <(custom_names)
         printf '\n  %sCustom apps%s  (%s)\n' "$B" "$NC" "$(custom_root)"
         (( ${#names[@]} )) || printf '   none yet\n'
+        local pending; pending=$(custom_unconfigured | xargs)
+        [[ -n "$pending" ]] && printf '   %snot set up yet:%s %s  (F to set up)\n' "$Y" "$NC" "$pending"
         for i in "${!names[@]}"; do
             n=${names[$i]}; custom_load "$n"
             printf '   %d) %-22s %-34s %b\n' "$((i + 1))" "${CA[TITLE]}" "$(fqdn "${CA[SUBDOMAIN]}")" \
                 "$( [[ "${CA[ENABLED]}" == yes ]] && echo "${G}on${NC}" || echo "${D}off${NC}")"
         done
-        printf '\n   N) New   E) Edit   T) Toggle on/off   R) Remove   A) Apply   0) Back\n'
+        printf '\n   N) New   F) Set up a folder already in custom/   E) Edit   T) Toggle on/off   R) Remove   A) Apply   0) Back\n'
         read -rp "  Choice: " ch || return 0
         case "${ch,,}" in
             n) custom_add ;;
+            f) custom_adopt ;;
             e|t|r)
                 read -rp "  Number: " i || continue
                 [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#names[@]} )) || { log_warn "No such app"; continue; }
@@ -2621,7 +2679,14 @@ update_all() {
     for a in $(enabled_customs); do
         if is_excluded "$a" "$(custom_project "$a")"; then log_info "Custom app '$a': excluded"; continue; fi
         log_info "Custom app '$a' ($(custom_dir "$a"))"
-        if run_logged custom_compose "$a" pull --ignore-pull-failures && run_logged custom_compose "$a" up -d --remove-orphans; then
+        if custom_buildable "$a"; then
+            # --pull refreshes the base image; a local-only or private base can't be pulled, so build with what's here
+            if ! run_logged custom_compose "$a" build --pull; then
+                log_warn "Custom app '$a': could not pull its base image; building with the local one."
+                run_logged custom_compose "$a" build || { log_error "Custom app '$a' build failed"; fails=$((fails + 1)); continue; }
+            fi
+        fi
+        if run_logged custom_compose "$a" pull --ignore-buildable --ignore-pull-failures && run_logged custom_compose "$a" up -d --remove-orphans; then
             custom_attach "$a"; log_ok "Custom app '$a' up to date"
         else
             log_error "Custom app '$a' update failed"; fails=$((fails + 1))
@@ -3809,6 +3874,8 @@ self_test() {
     st "custom app off -> not proxied"      '( allcfg; STACKS_DIR="$t/stacks"; DRY_RUN=0; custom_load hp; CA[ENABLED]=no; custom_save hp; [[ "$(render_nginx)" != *switches* ]] )'
     st "custom app name clash rejected"     '( allcfg; STACKS_DIR="$t/stacks"; DRY_RUN=0; docker_up() { false; }; custom_load hp; CA[ENABLED]=yes; CA[SUBDOMAIN]=grafana; custom_save hp; ! custom_validate hp )'
     st "custom app needs service + port"    '( allcfg; STACKS_DIR="$t/stacks"; DRY_RUN=0; docker_up() { false; }; custom_load hp; CA[SUBDOMAIN]=switches; CA[PORT]=x; custom_save hp; ! custom_validate hp; CA[PORT]=8443; CA[UPSTREAM_URL]=""; custom_save hp; custom_validate hp )'
+    st "custom: docker-compose.yml accepted" '( STACKS_DIR="$t/s3"; mkdir -p "$t/s3/custom/hp1810-dashboard"; touch "$t/s3/custom/hp1810-dashboard/docker-compose.yml"; [[ "$(custom_compose_file hp1810-dashboard)" == docker-compose.yml ]] && touch "$t/s3/custom/hp1810-dashboard/compose.yaml" && [[ "$(custom_compose_file hp1810-dashboard)" == compose.yaml ]] )'
+    st "custom: folders without app.conf"   '( STACKS_DIR="$t/s4"; mkdir -p "$t/s4/custom/"{a,b,c}; touch "$t/s4/custom/a/docker-compose.yml" "$t/s4/custom/b/compose.yaml" "$t/s4/custom/b/app.conf"; [[ "$(custom_unconfigured | xargs)" == a && "$(custom_names | xargs)" == b ]] )'
     st "custom app names validated"         'valid_app_name hp-1810 && ! valid_app_name HP && ! valid_app_name -x && ! valid_app_name "a b"'
     st "compose json: no ports is fine"     '[[ -z "$(printf %s "{\"services\":{\"w\":{}}}" | compose_json_ports X)" ]]'
     st "compose json ports parsed"          '[[ "$(printf %s "{\"services\":{\"w\":{\"ports\":[{\"mode\":\"ingress\",\"target\":443,\"published\":\"8444\",\"protocol\":\"tcp\"},{\"target\":53,\"published\":\"5353\",\"protocol\":\"udp\"}]}}}" | compose_json_ports X | cut -f1 | xargs)" == "8444/tcp 5353/udp" ]]'
