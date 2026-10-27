@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.4.0"
+readonly SCRIPT_VERSION="2.4.1"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -939,6 +939,10 @@ render_app_monitoring() {
     # speedtest
     printf '  speedtest:\n    image: %s\n    container_name: speedtest\n    restart: unless-stopped\n' "$(yaml_str "${CFG[SPEEDTEST_IMAGE]}")"
     [[ -n "${CFG[SPEEDTEST_PORT]}" ]] && { printf '    ports:\n'; render_port "${CFG[SPEEDTEST_PORT]}" 9798; }
+    # the image checks http://localhost:9798/, but the exporter listens on IPv4 only; where localhost resolves
+    # to ::1 that check always fails. Probe the address it really listens on (a dead exporter still fails).
+    printf '    healthcheck:\n      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:9798/ || exit 1"]\n'
+    printf '      interval: 60s\n      timeout: 10s\n      retries: 3\n      start_period: 30s\n'
     render_labels monitoring
     render_net_footer
 }
@@ -4034,6 +4038,7 @@ self_test() {
     st "pihole: password only if managed"   '( allcfg; [[ "$(render_app_pihole)" == *PIHOLE_PASSWORD* ]] && unset "SECRETS[PIHOLE_PASSWORD]" && [[ "$(render_app_pihole)" != *PIHOLE_PASSWORD* ]] )'
     st "pihole: extra env + no web port"    '( allcfg; CFG[PIHOLE_WEB_PORT]=""; c=$(render_app_pihole); [[ "$c" == *"FTLCONF_dns_listeningMode: \"all\""* && "$c" != *":80/tcp"* && "$c" == *"\"53:53/udp\""* ]] )'
     st "monitoring: blank port unpublished" '( allcfg; CFG[NODEEXP_PORT]=""; c=$(render_app_monitoring); [[ "$c" != *"9100\""* && "$c" == *"\"3030:3000\""* && "$c" == *"GF_SERVER_ROOT_URL: \"https://grafana.example.net/\""* ]] )'
+    st "speedtest health check uses IPv4"   '( allcfg; c=$(render_app_monitoring | sed -n "/^  speedtest:/,/^  [a-z]*:$/p"); [[ "$c" == *"http://127.0.0.1:9798/"* && "$c" != *localhost* ]] )'
     st "guacamole: 1.6 env + secret ref"    '( allcfg; c=$(render_app_guacamole); [[ "$c" == *POSTGRESQL_USERNAME* && "$c" == *"\${GUAC_DB_PASSWORD:?err}"* && "$c" == *"WEBAPP_CONTEXT: \"ROOT\""* ]] )'
     st "meshcentral: agents port -> 443"    '( allcfg; [[ "$(render_app_meshcentral)" == *"\"3000:443\""* ]] )'
     st "gvm override drops host ports"      '( allcfg; c=$(render_app_gvm_override); [[ "$c" == *"ports: !reset []"* && "$c" == *gvm-web* ]] )'
