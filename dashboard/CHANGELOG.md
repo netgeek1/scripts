@@ -3,6 +3,25 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.2.0 — 2026-10-26 — Custom apps and host health
+
+### Added
+- **Custom apps** live in `/opt/stacks/custom/<name>/` (`compose.yaml` + `app.conf`). Each one gets:
+  - its own proxy name and the certificate
+  - a card with a status dot, a place in the DNS list and the port check
+  - update-all and export/import
+- Custom apps are added from **Apps → C** (from an existing compose file or from an image) or by hand. Your compose
+  file is never modified: the container is attached to the proxy network after each start, and re-attached by the
+  health run if it was recreated elsewhere.
+- `UPSTREAM_URL` covers host-networking apps. Names must be unique, and one broken custom app is skipped without
+  blocking the rest.
+- **Host panel** on the page: CPU (busy %, load per core), memory, swap, each filesystem, uptime, and containers
+  (listing unhealthy, restarting and failed ones).
+  - Values show OK / HIGH / CRITICAL against thresholds you set.
+  - The data is collected by the existing health timer and needs no agent.
+- `--host` (menu H) prints the same in the terminal. `--custom-apps` opens the custom apps menu.
+- Self-test: 65 checks.
+
 ## v2.1.1 — 2026-10-26 — Progress output
 
 ### Fixed
