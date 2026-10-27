@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.3.0"
+readonly SCRIPT_VERSION="2.4.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -117,6 +117,7 @@ LOG_FILE=""
 REAL_USER="${SUDO_USER:-root}"
 CONFIG_LOADED=0
 DET_IP="" DET_IFACE=""
+US=$'\x1f'   # field separator for records with empty fields (read collapses repeated tabs)
 UPDATE_FAILS=0
 CERT_FETCH_FAILED=0
 DEPLOY_DIR="" STACKS_DIR=""
@@ -1252,7 +1253,7 @@ dns_records() {
 # Your compose file is never modified: after each start the script attaches the app's
 # container to the proxy network under the alias dd-c-<name>.
 # -----------------------------------------------------------------------------
-CUSTOM_KEYS=( TITLE ENABLED MANAGED PROJECT SUBDOMAIN SERVICE PORT TLS FLAGS UPSTREAM_URL FALLBACK_URL DESCRIPTION )
+CUSTOM_KEYS=( TITLE ENABLED MANAGED PROJECT CONTAINER SUBDOMAIN SERVICE PORT TLS FLAGS UPSTREAM_URL FALLBACK_URL DESCRIPTION )
 declare -A CA=()
 
 custom_root()     { printf '%s/custom' "$STACKS_DIR"; }
@@ -1284,7 +1285,7 @@ custom_names() {   # every folder with an app.conf
 }
 
 custom_defaults() {
-    CA=( [TITLE]="$1" [ENABLED]="yes" [MANAGED]="yes" [PROJECT]="" [SUBDOMAIN]="$1" [SERVICE]="" [PORT]="" [TLS]="no" [FLAGS]="ws"
+    CA=( [TITLE]="$1" [ENABLED]="yes" [MANAGED]="yes" [PROJECT]="" [CONTAINER]="" [SUBDOMAIN]="$1" [SERVICE]="" [PORT]="" [TLS]="no" [FLAGS]="ws"
          [UPSTREAM_URL]="" [FALLBACK_URL]="" [DESCRIPTION]="" )
 }
 
@@ -1310,7 +1311,7 @@ custom_save() {   # custom_save NAME  (from CA[])
         printf '# UPSTREAM_URL: instead of SERVICE/PORT, e.g. for network_mode: host apps (http://192.168.0.190:8080)\n'
         printf '# FLAGS: any of ws (websockets), stream (no buffering), big (large uploads)\n'
         printf '# MANAGED=no: started/updated by its own script; docker-dashboard only proxies and checks it\n'
-        printf '# PROJECT: its compose project name (empty = %sc-<folder>)\n' "$APP_PREFIX"
+        printf '# PROJECT: its compose project name (empty = %sc-<folder>); CONTAINER: a plain docker-run container instead\n' "$APP_PREFIX"
         for k in "${CUSTOM_KEYS[@]}"; do printf '%s=%s\n' "$k" "$(conf_quote "${CA[$k]:-}")"; done
     } | write_file "$d/app.conf" 644 root:root
 }
@@ -1323,7 +1324,10 @@ custom_compose_file() {
     done
     return 1
 }
-custom_on() { custom_load "$1" && [[ "${CA[ENABLED]}" == yes ]] && custom_compose_file "$1" >/dev/null; }
+custom_on() {
+    custom_load "$1" && [[ "${CA[ENABLED]}" == yes ]] || return 1
+    [[ "${CA[MANAGED]}" == no ]] || custom_compose_file "$1" >/dev/null
+}
 
 # folders under custom/ that have a compose file but no app.conf yet (e.g. put there by another installer)
 custom_unconfigured() {
@@ -1394,8 +1398,10 @@ custom_host_ports() {   # only apps this script starts; an external app's ports 
 custom_validate() {   # custom_validate NAME -> 0 ok, messages on failure
     local n=$1 d sub bad=0 svcs
     d=$(custom_dir "$n")
-    custom_compose_file "$n" >/dev/null || { log_error "$n: no compose file (compose.yaml or docker-compose.yml) in $d."; return 1; }
     custom_load "$n"
+    if [[ "${CA[MANAGED]}" != no ]]; then
+        custom_compose_file "$n" >/dev/null || { log_error "$n: no compose file (compose.yaml or docker-compose.yml) in $d."; return 1; }
+    fi
     v_sub "${CA[SUBDOMAIN]}" || { log_error "$n: SUBDOMAIN '${CA[SUBDOMAIN]}' is not a valid name."; bad=1; }
     while IFS= read -r sub; do
         [[ "$sub" == "${CA[SUBDOMAIN]}" ]] && { log_error "$n: name '${CA[SUBDOMAIN]}' is already used by another app."; bad=1; break; }
@@ -1467,6 +1473,7 @@ custom_up() {   # custom_up NAME [pull]
 
 custom_service_ids() {   # custom_service_ids NAME [running]  (CA[] loaded)
     local -a filt=( --filter "label=com.docker.compose.project=$(ca_project "$1")" --filter "label=com.docker.compose.service=${CA[SERVICE]}" )
+    [[ -n "${CA[CONTAINER]}" ]] && filt=( --filter "name=^${CA[CONTAINER]}\$" )
     [[ "${2:-}" == running ]] && filt+=( --filter status=running )
     docker ps -aq "${filt[@]}" 2>/dev/null
 }
@@ -1488,7 +1495,7 @@ custom_buildable() { custom_compose "$1" config --format json 2>/dev/null | tr -
 
 custom_down() {   # custom_down NAME [REASON]
     local n=$1
-    docker ps -aq --filter "label=com.docker.compose.project=$(custom_project "$n")" 2>/dev/null | grep -q . || return 0
+    custom_ids_all "$n" | grep -q . || return 0
     custom_load "$n"
     if [[ "${CA[MANAGED]}" == no ]]; then
         log_info "${CA[TITLE]}: started by its own script -- taken off the proxy, left running"
@@ -1523,7 +1530,8 @@ custom_prompt() {   # custom_prompt NAME -- edit CA[] interactively
     svcs=$(custom_services "$n")
     [[ -z "${CA[SERVICE]}" && -n "$svcs" && "$svcs" != *" "* ]] && CA[SERVICE]=$svcs
     log_info "Services: ${svcs:-unknown}"
-    ask v "Service the proxy talks to" "${CA[SERVICE]}"; CA[SERVICE]=$v
+    if [[ -n "${CA[CONTAINER]}" ]]; then log_info "Container: ${CA[CONTAINER]}"
+    else ask v "Service the proxy talks to" "${CA[SERVICE]}"; CA[SERVICE]=$v; fi
     ask v "Its container port" "${CA[PORT]}"; CA[PORT]=$v
     ask v "Does that port speak HTTPS itself? (yes/no)" "${CA[TLS]}"; CA[TLS]=$v
     ask v "Flags: ws,stream,big (- for none)" "${CA[FLAGS]}"; [[ "$v" == - ]] && v=""; CA[FLAGS]=$v
@@ -1573,9 +1581,15 @@ custom_add() {
     custom_validate "$n" && log_ok "Custom app '$n' saved. Apply (A) to start it." || log_warn "Saved, but fix the problems above before applying."
 }
 
+custom_ids_all() {   # every container of the app (compose project, or its one named container)
+    local c; c=$(custom_conf_get "$1" CONTAINER)
+    if [[ -n "$c" ]]; then docker ps -aq --filter "name=^${c}\$" 2>/dev/null
+    else docker ps -aq --filter "label=com.docker.compose.project=$(custom_project "$1")" 2>/dev/null; fi
+}
+
 custom_detach() {   # take the app's containers off the proxy network
     local n=$1 id
-    for id in $(docker ps -aq --filter "label=com.docker.compose.project=$(custom_project "$n")" 2>/dev/null); do
+    for id in $(custom_ids_all "$n"); do
         docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$id" 2>/dev/null | grep -qw "$PROXY_NET" \
             && run docker network disconnect "$PROXY_NET" "$id" >/dev/null 2>&1
     done
@@ -1593,7 +1607,7 @@ custom_remove() {   # three levels: unregister / stop + unregister / delete ever
     printf '   0) Cancel\n'
     read -rp "  Choice: " ch || return 0
     case "$ch" in
-        1) local proj; proj=$(custom_project "$n")
+        1) local proj; proj=$(custom_project "$n"); [[ -n "${CA[CONTAINER]}" ]] && proj="container ${CA[CONTAINER]}"
            custom_detach "$n"
            run rm -f "$d/app.conf"
            log_ok "Unregistered $n. Its containers still run (project $proj); docker-dashboard no longer proxies or updates them."
@@ -1609,6 +1623,66 @@ custom_remove() {   # three levels: unregister / stop + unregister / delete ever
     esac
     [[ "$ch" =~ ^[123]$ ]] && log_info "Apply (A) to update the proxy, page and DNS list."
     return 0
+}
+
+# custom_candidates -> running containers not run or proxied by docker-dashboard, fields separated by $US:
+#   container image project service workdir ports   (project/service/workdir empty for docker run;
+#   $US, not a tab: read collapses repeated tabs and would shift the empty fields)
+custom_candidates() {
+    docker_up || return 0
+    local known_p known_c n
+    known_p=" $( { custom_managed_projects; custom_external_projects; } | xargs) "
+    known_c=" $(for n in $(custom_names); do custom_conf_get "$n" CONTAINER; echo; done | xargs) "
+    local fmt
+    fmt=$(printf "%s$US" '{{.Names}}' '{{.Image}}' '{{.Label "com.docker.compose.project"}}' '{{.Label "com.docker.compose.service"}}' \
+        '{{.Label "com.docker.compose.project.working_dir"}}')'{{.Ports}}'
+    docker ps --format "$fmt" 2>/dev/null \
+    | while IFS=$US read -r c img proj svc wd ports; do
+        [[ "$c" == "$CONTAINER_NAME" || "$c" == "$WATCHTOWER_NAME" ]] && continue
+        [[ -n "$proj" ]] && { is_own_project "$proj" && continue; [[ "$known_p" == *" $proj "* ]] && continue; }
+        [[ "$known_c" == *" $c "* ]] && continue
+        printf "%s$US%s$US%s$US%s$US%s$US%s\n" "$c" "$img" "$proj" "$svc" "$wd" "$ports"
+    done
+}
+
+# first container port of a container: published ones first, then exposed ones
+container_port_guess() {
+    local p
+    p=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Ports}}{{if $v}}{{$k}} {{end}}{{end}}' "$1" 2>/dev/null | tr ' ' '\n' | sed -n 's#/tcp$##p' | sort -n | head -n1)
+    [[ -n "$p" ]] || p=$(docker inspect -f '{{range $k, $v := .Config.ExposedPorts}}{{$k}} {{end}}' "$1" 2>/dev/null | tr ' ' '\n' | sed -n 's#/tcp$##p' | sort -n | head -n1)
+    printf '%s' "$p"
+}
+
+custom_add_running() {   # register a running container (any folder, compose or docker run) -- started by its own script
+    local -a rows; local i c img proj svc wd ports n d
+    mapfile -t rows < <(custom_candidates)
+    (( ${#rows[@]} )) || { log_info "Every running container is already run or proxied by docker-dashboard."; return 0; }
+    printf '\n  Running containers docker-dashboard does not know yet:\n'
+    for i in "${!rows[@]}"; do
+        IFS=$US read -r c img proj svc wd ports <<<"${rows[$i]}"
+        printf '   %d) %-24s %-32s %s\n' "$((i + 1))" "$c" "${img:0:32}" "${proj:+compose: $proj ($wd)}${proj:-docker run}"
+    done
+    read -rp "  Number: " i || return 0
+    [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#rows[@]} )) || { log_warn "No such container"; return 0; }
+    IFS=$US read -r c img proj svc wd ports <<<"${rows[$((i - 1))]}"
+    n=$(tr '[:upper:]_. ' '[:lower:]---' <<<"${proj:-$c}" | sed 's/[^a-z0-9-]//g; s/^-*//; s/-*$//' | cut -c1-32)
+    ask n "Short name for it (folder custom/<name> holds only its app.conf)" "$n"
+    valid_app_name "$n" || { log_warn "Invalid name"; return 0; }
+    d=$(custom_dir "$n")
+    [[ -e "$d/app.conf" ]] && { log_warn "$n is already set up; use Edit."; return 0; }
+    custom_defaults "$n"
+    CA[MANAGED]=no
+    if [[ -n "$proj" ]]; then CA[PROJECT]=$proj; CA[SERVICE]=$svc
+    else CA[CONTAINER]=$c; CA[SERVICE]=$c; fi
+    CA[PORT]=$(container_port_guess "$c")
+    [[ "${CA[PORT]}" =~ ^(443|8443|9443)$ ]] && CA[TLS]=yes
+    log_info "Its own script keeps starting and updating it; docker-dashboard adds the name, card, DNS entry and checks."
+    [[ -n "$wd" ]] && log_info "Its files stay in $wd."
+    custom_prompt "$n"
+    run mkdir -p "$d"
+    custom_save "$n"
+    custom_validate "$n" && log_ok "Custom app '$n' saved. Apply (A) to put it behind the proxy." \
+        || log_warn "Saved, but fix the problems above before applying."
 }
 
 custom_edit() { custom_load "$1"; custom_prompt "$1"; custom_save "$1"; custom_validate "$1" || true; }
@@ -1649,18 +1723,23 @@ menu_custom() {
         mapfile -t names < <(custom_names)
         printf '\n  %sCustom apps%s  (%s)\n' "$B" "$NC" "$(custom_root)"
         (( ${#names[@]} )) || printf '   none yet\n'
-        local pending; pending=$(custom_unconfigured | xargs)
+        local pending running
+        pending=$(custom_unconfigured | xargs)
         [[ -n "$pending" ]] && printf '   %snot set up yet:%s %s  (F to set up)\n' "$Y" "$NC" "$pending"
+        running=$(custom_candidates | cut -d"$US" -f1 | xargs)
+        [[ -n "$running" ]] && printf '   %srunning, not added:%s %s  (D to add)\n' "$Y" "$NC" "$running"
         for i in "${!names[@]}"; do
             n=${names[$i]}; custom_load "$n"
             printf '   %d) %-22s %-34s %b%s\n' "$((i + 1))" "${CA[TITLE]}" "$(fqdn "${CA[SUBDOMAIN]}")" \
                 "$( [[ "${CA[ENABLED]}" == yes ]] && echo "${G}on${NC}" || echo "${D}off${NC}")" \
                 "$( [[ "${CA[MANAGED]}" == no ]] && echo "  (started by its own script)")"
         done
-        printf '\n   N) New   F) Set up a folder already in custom/   E) Edit   T) Toggle on/off   R) Remove   A) Apply   0) Back\n'
+        printf '\n   N) New   F) Set up a folder already in custom/   D) Add a container that is already running (any folder)\n'
+        printf '   E) Edit   T) Toggle on/off   R) Remove   A) Apply   0) Back\n'
         read -rp "  Choice: " ch || return 0
         case "${ch,,}" in
             n) menu_action custom_add ;;
+            d) menu_action custom_add_running ;;
             f) menu_action custom_adopt ;;
             e|t|r)
                 read -rp "  Number: " i || continue
@@ -2211,7 +2290,10 @@ host_prepare() {
 # -----------------------------------------------------------------------------
 is_own_project() {
     [[ "$1" == "$PROJECT_NAME" || "$1" == "$APP_PREFIX"* ]] && return 0
-    [[ -n "$STACKS_DIR" && -n "$1" ]] && custom_managed_projects | grep -qxF -- "$1"
+    # list captured first: `producer | grep -q` fails under pipefail when grep exits early (SIGPIPE)
+    [[ -n "$STACKS_DIR" && -n "$1" ]] || return 1
+    local l; l=$(custom_managed_projects)
+    [[ $'\n'"$l"$'\n' == *$'\n'"$1"$'\n'* ]]
 }
 
 # docker_ps_port_users PORT PROTO  (stdin: "name<TAB>ports<TAB>project") -> foreign container names
@@ -2723,9 +2805,8 @@ host_report() {   # terminal version (menu 9, --host); assumes host_collect ran
 # -----------------------------------------------------------------------------
 # UPDATES
 # -----------------------------------------------------------------------------
-# running_containers -> name, image, imageid, project, autoremove, workdir, configfiles separated by $US.
-# US (0x1f) is not IFS whitespace, so empty fields (no compose project) are kept by `read`.
-US=$'\x1f'
+# running_containers -> name, image, imageid, project, autoremove, workdir, configfiles separated by $US
+# (defined near the top: 0x1f is not IFS whitespace, so empty fields are kept by `read`).
 running_containers() {
     local fmt
     fmt=$(printf "%s$US" '{{.Name}}' '{{.Config.Image}}' '{{.Image}}' '{{index .Config.Labels "com.docker.compose.project"}}' \
@@ -2812,13 +2893,17 @@ update_all() {
         else log_error "Dashboard update failed"; fails=$((fails + 1)); fi
     fi
 
+    local ext_projects ext_containers n
+    ext_projects=$(custom_external_projects)
+    ext_containers=" $(for n in $(custom_names); do custom_conf_get "$n" CONTAINER; echo; done | xargs) "
+
     # 1. Other compose projects -- pull + up from their own folder (or their installer)
     while IFS=$US read -r name img id proj autorm dir files; do
         [[ -n "$proj" ]] || continue
         [[ "$done_projects" == *" $proj "* ]] && continue
         done_projects+="$proj "
         is_own_project "$proj" && continue
-        custom_external_projects | grep -qxF -- "$proj" && continue   # reported in the custom-app pass
+        [[ $'\n'"$ext_projects"$'\n' == *$'\n'"$proj"$'\n'* ]] && continue   # reported in the custom-app pass
         if is_excluded "$name" "$proj"; then log_info "Project '$proj': excluded"; continue; fi
         cmd=$(delegate_for "$proj")
         if [[ -n "$cmd" ]]; then
@@ -2852,6 +2937,7 @@ update_all() {
         [[ -n "$name" && -z "$proj" ]] || continue
         [[ "$autorm" == true ]] && { log_info "${D}$name: --rm container, skipped${NC}"; continue; }
         [[ "$name" == "$WATCHTOWER_NAME" ]] && continue
+        [[ "$ext_containers" == *" $name "* ]] && continue   # a custom app started by its own script
         is_excluded "$name" && { log_info "$name: excluded"; continue; }
         standalone+=("$name")
     done < <(running_containers)
@@ -3491,7 +3577,7 @@ show_status() {
     for a in $(custom_names); do
         custom_load "$a"
         if [[ "${CA[ENABLED]}" == yes ]]; then
-            if docker_up; then n=$(docker ps -q --filter "label=com.docker.compose.project=$(custom_project "$a")" | wc -l); st="${G}on${NC}, $n running"
+            if docker_up; then n=$(custom_ids_all "$a" | xargs -r docker inspect -f '{{.State.Running}}' 2>/dev/null | grep -c true); st="${G}on${NC}, $n running"
             else st="${G}on${NC}"; fi
         else st="${D}off${NC}"; fi
         printf '  %-44s %b\n' "${CA[TITLE]} (custom)" "$st"
@@ -3986,7 +4072,7 @@ self_test() {
     st "custom app conf round-trip"         '( DRY_RUN=0; STACKS_DIR="$t/stacks"; custom_defaults hp; CA[TITLE]="HP Switches"; CA[SERVICE]=web; CA[PORT]=8443; CA[TLS]=yes; CA[SUBDOMAIN]=switches
                                                custom_save hp && touch "$t/stacks/custom/hp/compose.yaml" && CA=() && custom_load hp && [[ "${CA[TITLE]}" == "HP Switches" && "${CA[PORT]}" == 8443 ]] && [[ "$(enabled_customs)" == hp ]] )'
     st "custom app endpoint record"         '( allcfg; STACKS_DIR="$t/stacks"; IFS="|" read -r k ti su up fl fb de < <(custom_endpoint hp); [[ "$k" == c-hp && "$su" == switches && "$up" == https://dd-c-hp:8443 && "$fl" == ws,tls ]] )'
-    st "custom app proxied, linked, in DNS" '( allcfg; STACKS_DIR="$t/stacks"; c=$(render_nginx); [[ "$c" == *"server_name switches.example.net;"* && "$c" == *"set \$upstream https://dd-c-hp:8443;"* ]] && [[ "$(render_dns_hosts)" == *switches.example.net* ]] && render_services_json | grep -q "HP Switches" )'
+    st "custom app proxied, linked, in DNS" '( allcfg; STACKS_DIR="$t/stacks"; c=$(render_nginx); [[ "$c" == *"server_name switches.example.net;"* && "$c" == *"set \$upstream https://dd-c-hp:8443;"* ]] && [[ "$(render_dns_hosts)" == *switches.example.net* ]] && [[ "$(render_services_json)" == *"HP Switches"* ]] )'
     st "custom app off -> not proxied"      '( allcfg; STACKS_DIR="$t/stacks"; DRY_RUN=0; custom_load hp; CA[ENABLED]=no; custom_save hp; [[ "$(render_nginx)" != *switches* ]] )'
     st "custom app name clash rejected"     '( allcfg; STACKS_DIR="$t/stacks"; DRY_RUN=0; docker_up() { false; }; custom_load hp; CA[ENABLED]=yes; CA[SUBDOMAIN]=grafana; custom_save hp; ! custom_validate hp )'
     st "custom app needs service + port"    '( allcfg; STACKS_DIR="$t/stacks"; DRY_RUN=0; docker_up() { false; }; custom_load hp; CA[SUBDOMAIN]=switches; CA[PORT]=x; custom_save hp; ! custom_validate hp; CA[PORT]=8443; CA[UPSTREAM_URL]=""; custom_save hp; custom_validate hp )'
@@ -3994,9 +4080,13 @@ self_test() {
     st "custom: folders without app.conf"   '( STACKS_DIR="$t/s4"; mkdir -p "$t/s4/custom/"{a,b,c}; touch "$t/s4/custom/a/docker-compose.yml" "$t/s4/custom/b/compose.yaml" "$t/s4/custom/b/app.conf"; [[ "$(custom_unconfigured | xargs)" == a && "$(custom_names | xargs)" == b ]] )'
     st "custom: external app project"       '( STACKS_DIR="$t/s5"; mkdir -p "$t/s5/custom/hp"; printf "MANAGED='"'"'no'"'"'\nPROJECT='"'"'hp1810-dashboard'"'"'\n" >"$t/s5/custom/hp/app.conf"; touch "$t/s5/custom/hp/docker-compose.yml"
                                                [[ "$(custom_project hp)" == hp1810-dashboard ]] && ! custom_managed hp && [[ "$(custom_external_projects)" == hp1810-dashboard ]] && ! is_own_project hp1810-dashboard && [[ -z "$(custom_managed_projects)" ]] )'
+    st "external project check (pipefail)"   '( set -o pipefail; STACKS_DIR="$t/s7"; for i in 1 2 3; do mkdir -p "$t/s7/custom/a$i"; printf "MANAGED='"'"'no'"'"'\nPROJECT='"'"'p$i'"'"'\n" >"$t/s7/custom/a$i/app.conf"; done
+                                               mkdir -p "$t/s7/custom/m"; printf "PROJECT='"'"'mp'"'"'\n" >"$t/s7/custom/m/app.conf"; touch "$t/s7/custom/m/compose.yaml"
+                                               is_own_project mp && ! is_own_project p1 && e=$(custom_external_projects) && [[ $'"'"'\n'"'"'"$e"$'"'"'\n'"'"' == *$'"'"'\n'"'"'p1$'"'"'\n'"'"'* ]] )'
     st "custom: adopted managed project"    '( STACKS_DIR="$t/s6"; mkdir -p "$t/s6/custom/hp"; printf "PROJECT='"'"'hp1810-dashboard'"'"'\n" >"$t/s6/custom/hp/app.conf"; touch "$t/s6/custom/hp/compose.yaml"
                                                custom_managed hp && is_own_project hp1810-dashboard && is_own_project dd-c-x && ! is_own_project other )'
     st "custom: project before app.conf"    '( custom_defaults hp; [[ "$(ca_project hp)" == dd-c-hp ]] && CA[PROJECT]=mine && [[ "$(ca_project hp)" == mine ]] )'
+    st "candidates keep empty fields"       '( r=$(printf "netbox-lite${US}img${US}${US}${US}${US}0.0.0.0:8001->8000/tcp"); IFS=$US read -r c img proj svc wd ports <<<"$r"; [[ "$c" == netbox-lite && -z "$proj" && -z "$svc" && -z "$wd" && "$ports" == "0.0.0.0:8001->8000/tcp" ]] )'
     st "custom app names validated"         'valid_app_name hp-1810 && ! valid_app_name HP && ! valid_app_name -x && ! valid_app_name "a b"'
     st "compose json: no ports is fine"     '[[ -z "$(printf %s "{\"services\":{\"w\":{}}}" | compose_json_ports X)" ]]'
     st "compose json ports parsed"          '[[ "$(printf %s "{\"services\":{\"w\":{\"ports\":[{\"mode\":\"ingress\",\"target\":443,\"published\":\"8444\",\"protocol\":\"tcp\"},{\"target\":53,\"published\":\"5353\",\"protocol\":\"udp\"}]}}}" | compose_json_ports X | cut -f1 | xargs)" == "8444/tcp 5353/udp" ]]'
