@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.1.1"
+readonly SCRIPT_VERSION="2.2.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -84,6 +84,7 @@ CONF_KEYS=( DASH_TITLE DOMAIN DASH_SUBDOMAIN HOST_ADDR EXTRA_NAMES HTTP_PORT HTT
             DEPLOY_DIR STACKS_DIR NGINX_IMAGE
             CERT_MODE CERT_FILE CERT_KEY_FILE CERT_DAYS CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY
             FILES_DIR FILES_HTTP HEALTH_CHECK HEALTH_INTERVAL
+            HOST_PANEL HOST_DISK_WARN HOST_DISK_CRIT HOST_MEM_WARN HOST_MEM_CRIT HOST_LOAD_WARN HOST_LOAD_CRIT
             UPDATE_SCHEDULE UPDATE_DAY UPDATE_TIME UPDATE_PRUNE UPDATE_EXCLUDE UPDATE_DELEGATE WATCHTOWER_IMAGE
             SECRETS_BACKEND
             APP_PIHOLE PIHOLE_IMAGE PIHOLE_SUBDOMAIN PIHOLE_WEB_PORT PIHOLE_DNS_PORT PIHOLE_LOCAL_DNS PIHOLE_EXTRA_ENV
@@ -346,6 +347,13 @@ set_default_config() {
         [FILES_HTTP]="yes"
         [HEALTH_CHECK]="yes"
         [HEALTH_INTERVAL]="2"
+        [HOST_PANEL]="yes"
+        [HOST_DISK_WARN]="80"
+        [HOST_DISK_CRIT]="90"
+        [HOST_MEM_WARN]="85"
+        [HOST_MEM_CRIT]="95"
+        [HOST_LOAD_WARN]="1.0"
+        [HOST_LOAD_CRIT]="2.0"
         [UPDATE_SCHEDULE]="off"
         [UPDATE_DAY]="Sun"
         [UPDATE_TIME]="04:00"
@@ -826,7 +834,12 @@ app_endpoints() {
     esac
 }
 
-all_endpoints() { local a; for a in $(enabled_apps); do app_endpoints "$a"; done; }
+all_endpoints() {
+    local a
+    for a in $(enabled_apps); do app_endpoints "$a"; done
+    [[ -n "$STACKS_DIR" ]] && for a in $(enabled_customs); do custom_endpoint "$a"; done
+    return 0
+}
 
 # Host ports an app publishes (or that the dashboard publishes for it): "port/proto<TAB>label"
 app_host_ports() {
@@ -1235,6 +1248,269 @@ dns_records() {
 }
 
 # -----------------------------------------------------------------------------
+# CUSTOM APPS: $STACKS_DIR/custom/<name>/compose.yaml + app.conf
+# Your compose file is never modified: after each start the script attaches the app's
+# container to the proxy network under the alias dd-c-<name>.
+# -----------------------------------------------------------------------------
+CUSTOM_KEYS=( TITLE ENABLED SUBDOMAIN SERVICE PORT TLS FLAGS UPSTREAM_URL FALLBACK_URL DESCRIPTION )
+declare -A CA=()
+
+custom_root()     { printf '%s/custom' "$STACKS_DIR"; }
+custom_dir()      { printf '%s/custom/%s' "$STACKS_DIR" "$1"; }
+custom_project()  { printf '%sc-%s' "$APP_PREFIX" "$1"; }
+custom_alias()    { printf '%sc-%s' "$APP_PREFIX" "$1"; }
+valid_app_name()  { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; }
+
+custom_names() {   # every folder with an app.conf
+    local d
+    [[ -d "$(custom_root)" ]] || return 0
+    for d in "$(custom_root)"/*/; do
+        [[ -f "${d}app.conf" ]] || continue
+        d=${d%/}; d=${d##*/}
+        valid_app_name "$d" && printf '%s\n' "$d"
+    done
+    return 0
+}
+
+custom_defaults() {
+    CA=( [TITLE]="$1" [ENABLED]="yes" [SUBDOMAIN]="$1" [SERVICE]="" [PORT]="" [TLS]="no" [FLAGS]="ws"
+         [UPSTREAM_URL]="" [FALLBACK_URL]="" [DESCRIPTION]="" )
+}
+
+custom_load() {   # custom_load NAME -> CA[]
+    local f line
+    custom_defaults "$1"
+    f="$(custom_dir "$1")/app.conf"
+    [[ -f "$f" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
+        in_list "${BASH_REMATCH[1]}" "${CUSTOM_KEYS[@]}" || continue
+        CA[${BASH_REMATCH[1]}]=$(conf_unquote "${BASH_REMATCH[2]}")
+    done <"$f"
+    return 0
+}
+
+custom_save() {   # custom_save NAME  (from CA[])
+    local k d; d=$(custom_dir "$1")
+    run mkdir -p "$d"
+    {
+        printf '# %s custom app -- edit here or in the Apps menu, then: sudo docker-dashboard --apply\n' "$SCRIPT_NAME"
+        printf '# SERVICE/PORT: compose service and container port the proxy talks to (PORT speaks https: TLS=yes)\n'
+        printf '# UPSTREAM_URL: instead of SERVICE/PORT, e.g. for network_mode: host apps (http://192.168.0.190:8080)\n'
+        printf '# FLAGS: any of ws (websockets), stream (no buffering), big (large uploads)\n'
+        for k in "${CUSTOM_KEYS[@]}"; do printf '%s=%s\n' "$k" "$(conf_quote "${CA[$k]:-}")"; done
+    } | write_file "$d/app.conf" 644 root:root
+}
+
+custom_on() { custom_load "$1" && [[ "${CA[ENABLED]}" == yes && -f "$(custom_dir "$1")/compose.yaml" ]]; }
+enabled_customs() { local n; for n in $(custom_names); do custom_on "$n" && printf '%s\n' "$n"; done; return 0; }
+
+custom_upstream() {   # from CA[] of NAME
+    if [[ -n "${CA[UPSTREAM_URL]}" ]]; then printf '%s' "${CA[UPSTREAM_URL]%/}"
+    else printf '%s://%s:%s' "$( [[ "${CA[TLS]}" == yes ]] && echo https || echo http)" "$(custom_alias "$1")" "${CA[PORT]}"; fi
+}
+
+custom_endpoint() {   # custom_endpoint NAME -> endpoint record (same shape as app_endpoints)
+    custom_load "$1" || return 0
+    local flags=${CA[FLAGS]//[[:space:]]/}
+    [[ "${CA[TLS]}" == yes || "${CA[UPSTREAM_URL]}" == https://* ]] && flags+="${flags:+,}tls"
+    printf 'c-%s|%s|%s|%s|%s|%s|%s\n' "$1" "${CA[TITLE]}" "${CA[SUBDOMAIN]}" "$(custom_upstream "$1")" \
+        "$flags" "${CA[FALLBACK_URL]}" "${CA[DESCRIPTION]}"
+}
+
+# every subdomain in use, except the one for EXCLUDE (an app key or c-<name>)
+used_subdomains() {
+    local key title sub _r a n
+    for a in $(enabled_apps); do
+        while IFS='|' read -r key title sub _r; do [[ "$key" == "${1:-}" ]] || printf '%s\n' "$sub"; done < <(app_endpoints "$a")
+    done
+    for n in $(custom_names); do
+        [[ "c-$n" == "${1:-}" ]] && continue
+        custom_load "$n" && printf '%s\n' "${CA[SUBDOMAIN]}"
+    done
+    printf '%s\n' "${CFG[DASH_SUBDOMAIN]}"
+}
+
+custom_compose() {   # custom_compose NAME ARGS...  (runs in the app folder so its .env is used)
+    local n=$1; shift
+    ( cd "$(custom_dir "$n")" && docker compose -p "$(custom_project "$n")" -f compose.yaml "$@" )
+}
+
+# published host ports from 'docker compose config --format json' -> "port/proto<TAB>label"
+compose_json_ports() {   # stdin: compose config JSON; $1 label
+    { grep -o '{[^{}]*"published":"[0-9]*"[^{}]*}' || true; } | while IFS= read -r o; do
+        local p proto
+        p=$(sed -n 's/.*"published":"\([0-9]*\)".*/\1/p' <<<"$o")
+        proto=$(sed -n 's/.*"protocol":"\([a-z]*\)".*/\1/p' <<<"$o")
+        printf '%s/%s\t%s\n' "$p" "${proto:-tcp}" "$1"
+    done
+}
+
+custom_host_ports() {
+    local n
+    docker_up || return 0
+    for n in $(enabled_customs); do
+        custom_load "$n"
+        custom_compose "$n" config --format json 2>/dev/null | tr -d '\n ' | compose_json_ports "${CA[TITLE]} (custom)"
+    done
+    return 0
+}
+
+custom_validate() {   # custom_validate NAME -> 0 ok, messages on failure
+    local n=$1 d sub bad=0 svcs
+    d=$(custom_dir "$n")
+    [[ -f "$d/compose.yaml" ]] || { log_error "$n: $d/compose.yaml is missing."; return 1; }
+    custom_load "$n"
+    v_sub "${CA[SUBDOMAIN]}" || { log_error "$n: SUBDOMAIN '${CA[SUBDOMAIN]}' is not a valid name."; bad=1; }
+    while IFS= read -r sub; do
+        [[ "$sub" == "${CA[SUBDOMAIN]}" ]] && { log_error "$n: name '${CA[SUBDOMAIN]}' is already used by another app."; bad=1; break; }
+    done < <(used_subdomains "c-$n")
+    if [[ -n "${CA[UPSTREAM_URL]}" ]]; then
+        valid_url "${CA[UPSTREAM_URL]}" || { log_error "$n: UPSTREAM_URL is not an http(s) URL."; bad=1; }
+    else
+        valid_port "${CA[PORT]}" || { log_error "$n: PORT '${CA[PORT]}' is not a port number."; bad=1; }
+        if docker_up; then
+            svcs=$(custom_compose "$n" config --services 2>/dev/null) || { log_error "$n: docker compose config fails in $d."; return 1; }
+            in_list "${CA[SERVICE]}" $svcs || { log_error "$n: SERVICE '${CA[SERVICE]}' is not in compose.yaml (services: $(xargs <<<"$svcs"))."; bad=1; }
+        fi
+    fi
+    valid_field "${CA[TITLE]}" && valid_field "${CA[DESCRIPTION]}" || { log_error "$n: TITLE/DESCRIPTION may not contain '|'."; bad=1; }
+    return $bad
+}
+
+custom_attach() {   # put the service's container(s) on the proxy network (idempotent)
+    local n=$1 id nets
+    custom_load "$n"
+    [[ -z "${CA[UPSTREAM_URL]}" ]] || return 0
+    for id in $(custom_compose "$n" ps -q "${CA[SERVICE]}" 2>/dev/null); do
+        nets=$(docker inspect -f '{{.HostConfig.NetworkMode}} {{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$id" 2>/dev/null)
+        [[ " $nets " == *" $PROXY_NET "* ]] && continue
+        if [[ "$nets" == host* ]]; then
+            log_warn "$n: '${CA[SERVICE]}' uses host networking; set UPSTREAM_URL=http://$(eff_host):<port> in its app.conf."
+            continue
+        fi
+        run docker network connect --alias "$(custom_alias "$n")" "$PROXY_NET" "$id" >/dev/null \
+            && _log_file INFO "attached $id ($n) to $PROXY_NET"
+    done
+    return 0
+}
+
+custom_up() {   # custom_up NAME [pull]
+    local n=$1 mode=${2:-nopull}
+    custom_load "$n"
+    log_step "${CA[TITLE]} (custom: $(custom_dir "$n"))"
+    custom_validate "$n" || die "Fix $(custom_dir "$n")/app.conf, then apply again."
+    if (( DRY_RUN )); then
+        [[ "$mode" == pull ]] && run custom_compose "$n" pull
+        run custom_compose "$n" up -d --remove-orphans
+        return 0
+    fi
+    [[ "$mode" == pull ]] && { run_logged custom_compose "$n" pull --ignore-pull-failures || true; }
+    run_logged custom_compose "$n" up -d --remove-orphans
+    custom_attach "$n"
+    log_ok "${CA[TITLE]} is up"
+}
+
+custom_down() {   # custom_down NAME [REASON]
+    local n=$1
+    docker ps -aq --filter "label=com.docker.compose.project=$(custom_project "$n")" 2>/dev/null | grep -q . || return 0
+    custom_load "$n"
+    log_info "Stopping ${CA[TITLE]} (${2:-disabled; data kept in $(custom_dir "$n")})"
+    run_logged custom_compose "$n" down --remove-orphans || true
+}
+
+# ---- Apps menu: add / edit / toggle / remove ---------------------------------
+custom_prompt() {   # custom_prompt NAME -- edit CA[] interactively
+    local n=$1 v svcs
+    ask v "Title on the page" "${CA[TITLE]}"; CA[TITLE]=$v
+    ask v "Name (-> $(fqdn "${CA[SUBDOMAIN]}"))" "${CA[SUBDOMAIN]}"; CA[SUBDOMAIN]=$v
+    svcs=$(custom_compose "$n" config --services 2>/dev/null | xargs)
+    [[ -z "${CA[SERVICE]}" && "$svcs" != *" "* ]] && CA[SERVICE]=$svcs
+    log_info "Services in compose.yaml: ${svcs:-?}"
+    ask v "Service the proxy talks to" "${CA[SERVICE]}"; CA[SERVICE]=$v
+    ask v "Its container port" "${CA[PORT]}"; CA[PORT]=$v
+    ask v "Does that port speak HTTPS itself? (yes/no)" "${CA[TLS]}"; CA[TLS]=$v
+    ask v "Flags: ws,stream,big (- for none)" "${CA[FLAGS]}"; [[ "$v" == - ]] && v=""; CA[FLAGS]=$v
+    ask v "Direct link shown under the card, e.g. https://$(eff_host):8444/ (- for none)" "${CA[FALLBACK_URL]}"; [[ "$v" == - ]] && v=""; CA[FALLBACK_URL]=$v
+    ask v "Description (- for none)" "${CA[DESCRIPTION]}"; [[ "$v" == - ]] && v=""; CA[DESCRIPTION]=$v
+}
+
+custom_add() {
+    local n src v d img cport hport
+    read -rp "  Short name (a-z, 0-9, -; folder and project name): " n || return 0
+    valid_app_name "$n" || { log_warn "Invalid name"; return 0; }
+    d=$(custom_dir "$n")
+    [[ -e "$d" ]] && { log_warn "$d already exists; use Edit."; return 0; }
+    printf '   1) Use an existing compose file\n   2) Make one from an image\n'
+    read -rp "  Choice: " src || return 0
+    run mkdir -p "$d"
+    case "$src" in
+        1) read -rp "  Path to the compose file: " v || return 0
+           [[ -f "$v" ]] || { log_warn "Not found: $v"; rmdir "$d" 2>/dev/null; return 0; }
+           run cp "$v" "$d/compose.yaml"
+           [[ -f "$(dirname "$v")/.env" ]] && run cp "$(dirname "$v")/.env" "$d/.env" && run chmod 600 "$d/.env"
+           log_info "Copied. Relative paths in it (./data ...) now resolve inside $d -- copy those folders there too." ;;
+        2) ask img "Image" ""
+           [[ "$img" =~ ^[a-z0-9][a-z0-9._/:@-]*$ ]] || { log_warn "Invalid image"; rmdir "$d" 2>/dev/null; return 0; }
+           ask cport "Container port of its web UI" ""
+           valid_port "$cport" || { log_warn "Invalid port"; rmdir "$d" 2>/dev/null; return 0; }
+           ask hport "Also publish on host port (- for proxy only)" "-"; [[ "$hport" == - ]] && hport=""
+           {
+               printf '# Created by %s -- yours to edit (volumes, environment, ...)\n' "$SCRIPT_NAME"
+               printf 'services:\n  %s:\n    image: %s\n    container_name: %s\n    restart: unless-stopped\n' "$n" "$(yaml_str "$img")" "$n"
+               [[ -n "$hport" ]] && printf '    ports:\n      - "%s:%s"\n' "$hport" "$cport"
+               printf '    volumes:\n      - "./data:/data"\n'
+           } | write_file "$d/compose.yaml" 644 root:root
+           run mkdir -p "$d/data"
+           custom_defaults "$n"; CA[SERVICE]=$n; CA[PORT]=$cport
+           [[ -n "$hport" ]] && CA[FALLBACK_URL]="http://$(eff_host):$hport/" ;;
+        *) rmdir "$d" 2>/dev/null; return 0 ;;
+    esac
+    [[ "$src" == 1 ]] && custom_defaults "$n"
+    custom_prompt "$n"
+    custom_save "$n"
+    custom_validate "$n" && log_ok "Custom app '$n' saved. Apply (A) to start it." || log_warn "Saved, but fix the problems above before applying."
+}
+
+menu_custom() {
+    ensure_config
+    local n ch i
+    local -a names
+    while :; do
+        mapfile -t names < <(custom_names)
+        printf '\n  %sCustom apps%s  (%s)\n' "$B" "$NC" "$(custom_root)"
+        (( ${#names[@]} )) || printf '   none yet\n'
+        for i in "${!names[@]}"; do
+            n=${names[$i]}; custom_load "$n"
+            printf '   %d) %-22s %-34s %b\n' "$((i + 1))" "${CA[TITLE]}" "$(fqdn "${CA[SUBDOMAIN]}")" \
+                "$( [[ "${CA[ENABLED]}" == yes ]] && echo "${G}on${NC}" || echo "${D}off${NC}")"
+        done
+        printf '\n   N) New   E) Edit   T) Toggle on/off   R) Remove   A) Apply   0) Back\n'
+        read -rp "  Choice: " ch || return 0
+        case "${ch,,}" in
+            n) custom_add ;;
+            e|t|r)
+                read -rp "  Number: " i || continue
+                [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#names[@]} )) || { log_warn "No such app"; continue; }
+                n=${names[$((i - 1))]}; custom_load "$n"
+                case "${ch,,}" in
+                    e) custom_prompt "$n"; custom_save "$n"; custom_validate "$n" || true ;;
+                    t) [[ "${CA[ENABLED]}" == yes ]] && CA[ENABLED]=no || CA[ENABLED]=yes
+                       custom_save "$n"; log_info "${CA[TITLE]}: ${CA[ENABLED]} (takes effect on apply)" ;;
+                    r) if confirm "Stop '$n' and delete $(custom_dir "$n") with its data?" n && confirm_typed DELETE-APP; then
+                           custom_down "$n" "removing"
+                           safe_path "$(custom_dir "$n")" && run rm -rf -- "$(custom_dir "$n")"
+                           log_ok "Removed $n"
+                       fi ;;
+                esac ;;
+            a) menu_action stack_apply ;;
+            0|q) return 0 ;;
+            *) printf '  %sInvalid choice%s\n' "$R" "$NC" ;;
+        esac
+    done
+}
+
+# -----------------------------------------------------------------------------
 # DASHBOARD RENDERERS (stdout; no side effects -- covered by the self-test)
 # -----------------------------------------------------------------------------
 dash_host() { fqdn "${CFG[DASH_SUBDOMAIN]}"; }
@@ -1416,12 +1692,12 @@ render_index() {
 <style>
   :root {
     --bg:#f4f5f7; --card:#fff; --text:#1d2330; --muted:#5f6b7a; --border:#dfe3e8;
-    --accent:#1f6feb; --ok:#2da44e; --bad:#cf222e; --unk:#9aa4b2; --code:#eef1f4;
+    --accent:#1f6feb; --ok:#2da44e; --bad:#cf222e; --unk:#9aa4b2; --code:#eef1f4; --warn:#bf8700; --track:#e6e9ee;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg:#0f1218; --card:#171b23; --text:#e6e9ef; --muted:#8b95a5; --border:#262c37;
-      --accent:#58a6ff; --ok:#3fb950; --bad:#f85149; --unk:#5b6575; --code:#11151c;
+      --accent:#58a6ff; --ok:#3fb950; --bad:#f85149; --unk:#5b6575; --code:#11151c; --warn:#d29922; --track:#262c37;
     }
   }
   * { box-sizing: border-box; }
@@ -1454,6 +1730,17 @@ render_index() {
   .empty { color:var(--muted); font-size:13px; }
   footer { color:var(--muted); font-size:12px; text-align:center; padding:28px 16px; }
   .tablewrap { overflow-x:auto; }
+  .tiles { display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); }
+  .tile { background:var(--card); border:1px solid var(--border); border-left:4px solid var(--ok); border-radius:10px; padding:11px 14px; }
+  .tile.warn { border-left-color:var(--warn); } .tile.crit { border-left-color:var(--bad); }
+  .t-head { display:flex; justify-content:space-between; align-items:baseline; gap:8px; font-size:12px; color:var(--muted); }
+  .badge { font-size:11px; font-weight:600; letter-spacing:.04em; color:var(--ok); }
+  .warn .badge { color:var(--warn); } .crit .badge { color:var(--bad); }
+  .t-val { font-size:20px; font-weight:600; margin-top:2px; }
+  .t-sub { font-size:12px; color:var(--muted); margin-top:2px; overflow-wrap:anywhere; }
+  .bar { height:6px; background:var(--track); border-radius:3px; margin-top:8px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--ok); }
+  .warn .bar i { background:var(--warn); } .crit .bar i { background:var(--bad); }
   td a { color:var(--accent); }
   td.size { white-space:nowrap; }
 </style>
@@ -1490,6 +1777,7 @@ function render(cfg) {
   $("#sub").textContent = cfg.host + (cfg.health ? " · checking status…" : "");
   const main = $("#main");
   main.replaceChildren();
+  const hs = el("section"); hs.id = "host"; hs.hidden = true; main.append(hs);
   if (!cfg.groups.length) main.append(el("p", "empty", "Nothing here yet. Turn apps on in the docker-dashboard menu (3) or add links (4)."));
   for (const g of cfg.groups) {
     const sec = el("section"); sec.dataset.group = "1";
@@ -1547,6 +1835,39 @@ async function loadStatus() {
   }
 }
 
+const WORD = { ok: "OK", warn: "HIGH", crit: "CRITICAL" };
+function fmtKb(k) { return k >= 1073741824 ? (k / 1073741824).toFixed(1) + " TB" : k >= 1048576 ? (k / 1048576).toFixed(1) + " GB" : Math.round(k / 1024) + " MB"; }
+function fmtUp(s) { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + "d " : "") + h + "h " + m + "m"; }
+function tile(label, level, value, sub, pct) {
+  const t = el("div", "tile " + (level || "ok"));
+  const head = el("div", "t-head"); head.append(el("span", null, label), el("span", "badge", WORD[level] || ""));
+  t.append(head, el("div", "t-val", value));
+  if (sub) t.append(el("div", "t-sub", sub));
+  if (pct != null) { const b = el("div", "bar"), i = el("i"); i.style.width = Math.min(100, Math.max(0, pct)) + "%"; b.append(i); t.append(b); }
+  return t;
+}
+async function loadHost() {
+  const sec = $("#host");
+  if (!sec) return;
+  try {
+    const r = await fetch("host.json", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    const h = await r.json();
+    const grid = el("div", "tiles");
+    grid.append(tile("CPU", h.cpu.level, h.cpu.busy + "%", "load " + h.cpu.load[1] + " \u00b7 " + h.cpu.cores + " cores", h.cpu.busy));
+    grid.append(tile("Memory", h.memory.level, h.memory.pct + "%", fmtKb(h.memory.usedKb) + " of " + fmtKb(h.memory.totalKb), h.memory.pct));
+    if (h.swap.totalKb > 0) grid.append(tile("Swap", h.swap.level, h.swap.pct + "%", fmtKb(h.swap.usedKb) + " of " + fmtKb(h.swap.totalKb), h.swap.pct));
+    for (const d of h.disks) grid.append(tile("Disk " + d.mount, d.level, d.pct + "%", fmtKb(d.usedKb) + " of " + fmtKb(d.sizeKb), d.pct));
+    const ct = tile("Containers", h.containers.level, h.containers.running + " / " + h.containers.total,
+                    h.containers.problems.length ? h.containers.problems.join(" \u00b7 ") : "all running or cleanly stopped", null);
+    grid.append(ct);
+    grid.append(tile("Uptime", "ok", fmtUp(h.uptime), h.os, null));
+    const head = el("h2", null, "Host \u00b7 " + h.hostname + " \u00b7 checked " + ago(h.generated));
+    sec.replaceChildren(head, grid);
+    sec.hidden = false;
+  } catch (e) { sec.hidden = true; }
+}
+
 function copyBtn(text) {
   const b = el("button", null, "Copy");
   b.type = "button";
@@ -1594,7 +1915,7 @@ async function loadFiles() {
 $("#filter").addEventListener("input", applyFilter);
 fetch("services.json", { cache: "no-store" })
   .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
-  .then(cfg => { render(cfg); loadStatus(); setInterval(loadStatus, 60000); })
+  .then(cfg => { render(cfg); loadStatus(); loadHost(); setInterval(() => { loadStatus(); loadHost(); }, 60000); })
   .catch(() => { $("#sub").textContent = "services.json could not be loaded -- run docker-dashboard --apply"; });
 </script>
 </body>
@@ -1775,6 +2096,7 @@ check_ports() {
     done < <(
         printf '%s/tcp\tdashboard HTTP\n%s/tcp\tdashboard HTTPS\n' "${CFG[HTTP_PORT]}" "${CFG[HTTPS_PORT]}"
         for a in $(enabled_apps); do app_host_ports "$a"; done
+        custom_host_ports
     )
     (( rc == 0 )) || die "Free the port(s) above, or change them in Settings / Apps, then run this again."
     PORTS_CHECKED=1
@@ -2031,6 +2353,8 @@ stack_apply() {   # stack_apply [pull] -- converge everything: apps, proxy, page
     for a in "${APPS[@]}"; do app_on "$a" || app_down "$a"; done
     write_pihole_dns
     for a in $(enabled_apps); do app_up "$a" "$mode"; done
+    for a in $(custom_names); do custom_on "$a" || custom_down "$a"; done
+    for a in $(enabled_customs); do ( custom_up "$a" "$mode" ) || log_error "Custom app '$a' was not started (see above)."; done
     dashboard_up
     (( DRY_RUN )) && return 0
     state_set deployed "$(date -Iseconds)"
@@ -2071,14 +2395,16 @@ health_check() {   # health_check [quiet]
     ensure_config
     detect_network
     load_services
-    local quiet=${1:-} t i url via
+    local quiet=${1:-} t i url via n
     local -a urls=() vias=()
+    # custom apps recreated outside this script lose their proxy network: re-attach before probing
+    if (( ! DRY_RUN )) && docker_up; then for n in $(enabled_customs); do custom_attach "$n"; done; fi
     while IFS=$'\t' read -r url via; do
         [[ -n "$url" ]] || continue
         in_list "$url" ${urls[@]+"${urls[@]}"} && continue
         urls+=("$url"); vias+=("$via")
     done < <(health_targets)
-    (( ${#urls[@]} )) || { [[ -n "$quiet" ]] || log_info "No links to check."; return 0; }
+    (( ${#urls[@]} )) || { [[ -n "$quiet" ]] || log_info "No links to check."; host_health "$quiet"; return 0; }
     t=$(mktemp -d)
     for i in "${!urls[@]}"; do
         ( printf '%s\t%s\n' "${urls[$i]}" "$(probe_url "${urls[$i]}" "${vias[$i]}")" >"$t/$i" ) &
@@ -2097,8 +2423,131 @@ health_check() {   # health_check [quiet]
     if [[ -d "$DEPLOY_DIR/html" ]] && (( ! DRY_RUN )); then
         render_status_json <<<"$results" | write_file "$DEPLOY_DIR/html/status.json" 644 root:root
     fi
+    host_health "$quiet"
     return 0
 }
+
+host_health() {   # host_health [quiet] -- page panel + (optionally) terminal report
+    [[ "${CFG[HOST_PANEL]}" == yes ]] || { [[ -n "${1:-}" ]] || { host_collect; host_report; }; return 0; }
+    host_collect
+    [[ -n "${1:-}" ]] || host_report
+    if [[ -d "$DEPLOY_DIR/html" ]] && (( ! DRY_RUN )); then
+        render_host_json | write_file "$DEPLOY_DIR/html/host.json" 644 root:root
+    fi
+    return 0
+}
+# -----------------------------------------------------------------------------
+# HOST HEALTH (CPU, memory, swap, disks, uptime, containers)
+# One collector feeds both html/host.json (the page's Host panel) and the terminal report.
+# Run by the health timer, so the page needs no agent or extra container.
+# -----------------------------------------------------------------------------
+level_for() {   # level_for VALUE WARN CRIT -> ok|warn|crit (decimals allowed)
+    awk -v v="$1" -v w="$2" -v c="$3" 'BEGIN { print (v + 0 >= c + 0) ? "crit" : (v + 0 >= w + 0) ? "warn" : "ok" }'
+}
+level_worst() { case " $* " in *" crit "*) echo crit ;; *" warn "*) echo warn ;; *) echo ok ;; esac; }
+
+# /proc/stat "cpu" line -> "total idle" (idle includes iowait)
+cpu_sample() { awk '/^cpu / { t = 0; for (i = 2; i <= 9; i++) t += $i; print t, $5 + $6 }' "${1:-/proc/stat}"; }
+cpu_pct() {   # cpu_pct "total idle" "total idle" -> busy %
+    awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, " "); split(b, y, " "); dt = y[1] - x[1]; di = y[2] - x[2]
+                                     printf "%.0f", (dt > 0) ? 100 * (dt - di) / dt : 0 }'
+}
+
+# host_disks -> "mount<TAB>fstype<TAB>size_kb<TAB>used_kb<TAB>pct" for real filesystems, one per device
+host_disks() {
+    df -P -T -k -x tmpfs -x devtmpfs -x overlay -x squashfs -x efivarfs -x ramfs -x nsfs -x fuse.lxcfs 2>/dev/null \
+        | awk 'NR > 1 && $1 !~ /^(none|udev|shm|overlay)$/ && $7 !~ /^\/(run|snap|var\/lib\/docker|proc|sys|dev)(\/|$)/ && !seen[$1]++ {
+                 gsub("%", "", $6); printf "%s\t%s\t%s\t%s\t%s\n", $7, $2, $3, $4, $6 }'
+}
+
+H_CORES=1 H_CPU=0 H_LOAD1=0 H_LOAD5=0 H_LOAD15=0 H_LOADPC=0 H_CPU_LVL=ok
+H_MEM_T=0 H_MEM_U=0 H_MEM_P=0 H_MEM_LVL=ok H_SW_T=0 H_SW_U=0 H_SW_P=0 H_SW_LVL=ok
+H_UP=0 H_RUN=0 H_TOT=0 H_CT_LVL=ok H_DISKS="" H_DISK_LVL=ok
+H_PROBLEMS=()
+
+host_collect() {
+    local a b mt ma st sf m fs size used pct
+    read -r H_LOAD1 H_LOAD5 H_LOAD15 _ </proc/loadavg
+    H_CORES=$(nproc 2>/dev/null || echo 1)
+    a=$(cpu_sample); sleep 1; b=$(cpu_sample)
+    H_CPU=$(cpu_pct "$a" "$b")
+    H_LOADPC=$(awk -v l="$H_LOAD5" -v c="$H_CORES" 'BEGIN { printf "%.2f", l / c }')
+    H_CPU_LVL=$(level_worst "$(level_for "$H_LOADPC" "${CFG[HOST_LOAD_WARN]}" "${CFG[HOST_LOAD_CRIT]}")" \
+                            "$( [[ "$(level_for "$H_CPU" 95 999)" == crit ]] && echo warn)")
+    mt=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo); ma=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    st=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo); sf=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)
+    H_MEM_T=${mt:-0}; H_MEM_U=$(( ${mt:-0} - ${ma:-0} ))
+    H_MEM_P=$(awk -v t="$H_MEM_T" -v u="$H_MEM_U" 'BEGIN { printf "%.0f", (t > 0) ? 100 * u / t : 0 }')
+    H_MEM_LVL=$(level_for "$H_MEM_P" "${CFG[HOST_MEM_WARN]}" "${CFG[HOST_MEM_CRIT]}")
+    H_SW_T=${st:-0}; H_SW_U=$(( ${st:-0} - ${sf:-0} ))
+    H_SW_P=$(awk -v t="$H_SW_T" -v u="$H_SW_U" 'BEGIN { printf "%.0f", (t > 0) ? 100 * u / t : 0 }')
+    H_SW_LVL=$(level_for "$H_SW_P" 50 80)
+    H_UP=$(awk '{printf "%d", $1}' /proc/uptime)
+    H_DISKS=$(host_disks)
+    local -a lv=()
+    while IFS=$'\t' read -r m fs size used pct; do
+        [[ -n "$m" ]] && lv+=("$(level_for "$pct" "${CFG[HOST_DISK_WARN]}" "${CFG[HOST_DISK_CRIT]}")")
+    done <<<"$H_DISKS"
+    H_DISK_LVL=$(level_worst ${lv[@]+"${lv[@]}"})
+    local name state status
+    H_RUN=0 H_TOT=0 H_PROBLEMS=()
+    while IFS=$'\t' read -r name state status; do
+        [[ -n "$name" ]] || continue
+        H_TOT=$((H_TOT + 1))
+        [[ "$state" == running ]] && H_RUN=$((H_RUN + 1))
+        if [[ "$status" == *"(unhealthy)"* ]]; then H_PROBLEMS+=("$name: unhealthy")
+        elif [[ "$state" == restarting ]]; then H_PROBLEMS+=("$name: restarting")
+        elif [[ "$state" == exited && "$status" != "Exited (0)"* ]]; then H_PROBLEMS+=("$name: ${status%% ago*} ago")
+        fi
+    done < <(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}' 2>/dev/null)
+    (( ${#H_PROBLEMS[@]} )) && H_CT_LVL=warn || H_CT_LVL=ok
+    return 0
+}
+
+render_host_json() {   # from H_* (host_collect first)
+    local first=1 m fs size used pct p
+    printf '{\n  "generated": %s,\n  "hostname": %s,\n  "os": %s,\n  "kernel": %s,\n  "uptime": %s,\n' \
+        "$(json_str "$(date -Iseconds)")" "$(json_str "$(hostname -f 2>/dev/null || hostname)")" \
+        "$(json_str "$( . /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-Linux}")")" "$(json_str "$(uname -r)")" "$H_UP"
+    printf '  "cpu": {"cores": %s, "busy": %s, "load": [%s, %s, %s], "loadPerCore": %s, "level": "%s"},\n' \
+        "$H_CORES" "$H_CPU" "$H_LOAD1" "$H_LOAD5" "$H_LOAD15" "$H_LOADPC" "$H_CPU_LVL"
+    printf '  "memory": {"totalKb": %s, "usedKb": %s, "pct": %s, "level": "%s"},\n' "$H_MEM_T" "$H_MEM_U" "$H_MEM_P" "$H_MEM_LVL"
+    printf '  "swap": {"totalKb": %s, "usedKb": %s, "pct": %s, "level": "%s"},\n' "$H_SW_T" "$H_SW_U" "$H_SW_P" "$H_SW_LVL"
+    printf '  "disks": ['
+    while IFS=$'\t' read -r m fs size used pct; do
+        [[ -n "$m" ]] || continue
+        (( first )) || printf ','
+        first=0
+        printf '\n    {"mount": %s, "fs": %s, "sizeKb": %s, "usedKb": %s, "pct": %s, "level": "%s"}' \
+            "$(json_str "$m")" "$(json_str "$fs")" "$size" "$used" "$pct" "$(level_for "$pct" "${CFG[HOST_DISK_WARN]}" "${CFG[HOST_DISK_CRIT]}")"
+    done <<<"$H_DISKS"
+    printf '\n  ],\n  "containers": {"running": %s, "total": %s, "level": "%s", "problems": [' "$H_RUN" "$H_TOT" "$H_CT_LVL"
+    first=1
+    for p in ${H_PROBLEMS[@]+"${H_PROBLEMS[@]}"}; do (( first )) || printf ', '; first=0; printf '%s' "$(json_str "$p")"; done
+    printf ']},\n  "level": "%s"\n}\n' "$(level_worst "$H_CPU_LVL" "$H_MEM_LVL" "$H_DISK_LVL" "$H_CT_LVL")"
+}
+
+fmt_kb() { awk -v k="$1" 'BEGIN { if (k >= 1073741824) printf "%.1f TB", k/1073741824; else if (k >= 1048576) printf "%.1f GB", k/1048576; else printf "%.0f MB", k/1024 }'; }
+level_word() { case "$1" in ok) printf '%sOK      %s' "$G" "$NC" ;; warn) printf '%sHIGH    %s' "$Y" "$NC" ;; *) printf '%sCRITICAL%s' "$R" "$NC" ;; esac; }
+
+host_report() {   # terminal version (menu 9, --host); assumes host_collect ran
+    local m fs size used pct
+    log_step "Host health ($(hostname -s))"
+    printf '  %-11s %b  %s%% busy, load %s (%s per core, %s cores)\n' CPU "$(level_word "$H_CPU_LVL")" "$H_CPU" "$H_LOAD5" "$H_LOADPC" "$H_CORES"
+    printf '  %-11s %b  %s%% (%s of %s)\n' Memory "$(level_word "$H_MEM_LVL")" "$H_MEM_P" "$(fmt_kb "$H_MEM_U")" "$(fmt_kb "$H_MEM_T")"
+    if (( H_SW_T > 0 )); then printf '  %-11s %b  %s%% (%s of %s)\n' Swap "$(level_word "$H_SW_LVL")" "$H_SW_P" "$(fmt_kb "$H_SW_U")" "$(fmt_kb "$H_SW_T")"
+    else printf '  %-11s %s\n' Swap "none"; fi
+    while IFS=$'\t' read -r m fs size used pct; do
+        [[ -n "$m" ]] || continue
+        printf '  %-11s %b  %s%% (%s of %s) %s\n' Disk "$(level_word "$(level_for "$pct" "${CFG[HOST_DISK_WARN]}" "${CFG[HOST_DISK_CRIT]}")")" \
+            "$pct" "$(fmt_kb "$used")" "$(fmt_kb "$size")" "$m"
+    done <<<"$H_DISKS"
+    printf '  %-11s %s\n' Uptime "$(awk -v s="$H_UP" 'BEGIN { printf "%dd %dh %dm", s/86400, (s%86400)/3600, (s%3600)/60 }')"
+    printf '  %-11s %b  %s of %s running\n' Containers "$(level_word "$H_CT_LVL")" "$H_RUN" "$H_TOT"
+    local p; for p in ${H_PROBLEMS[@]+"${H_PROBLEMS[@]}"}; do printf '  %-11s           %s\n' "" "$p"; done
+    return 0
+}
+
 # -----------------------------------------------------------------------------
 # UPDATES
 # -----------------------------------------------------------------------------
@@ -2167,6 +2616,15 @@ update_all() {
             log_ok "App '$a' up to date"
         else
             log_error "App '$a' update failed"; fails=$((fails + 1))
+        fi
+    done
+    for a in $(enabled_customs); do
+        if is_excluded "$a" "$(custom_project "$a")"; then log_info "Custom app '$a': excluded"; continue; fi
+        log_info "Custom app '$a' ($(custom_dir "$a"))"
+        if run_logged custom_compose "$a" pull --ignore-pull-failures && run_logged custom_compose "$a" up -d --remove-orphans; then
+            custom_attach "$a"; log_ok "Custom app '$a' up to date"
+        else
+            log_error "Custom app '$a' update failed"; fails=$((fails + 1))
         fi
     done
     if [[ -f "$DEPLOY_DIR/docker-compose.yml" ]] && ! is_excluded "$CONTAINER_NAME" "$PROJECT_NAME"; then
@@ -2308,7 +2766,9 @@ unit_set() {   # unit_set NAME ENABLE(yes/no) SERVICE_CONTENT TIMER_CONTENT
 ensure_units() {
     log_step "Scheduled jobs"
     install_self
-    unit_set "$UNIT_HEALTH" "${CFG[HEALTH_CHECK]}" \
+    local health_on=no
+    [[ "${CFG[HEALTH_CHECK]}" == yes || "${CFG[HOST_PANEL]}" == yes ]] && health_on=yes
+    unit_set "$UNIT_HEALTH" "$health_on" \
 "[Unit]
 Description=docker-dashboard service health check
 After=docker.service
@@ -2637,6 +3097,16 @@ export_bundle() {
     [[ -n "$guac" ]]      && export_guacamole "$guac" "$guacd" "$pg" "$tlsport"
     [[ -n "$mesh" ]]      && export_meshcentral "$mesh"
 
+    if [[ -f "$CONF_FILE" ]]; then
+        load_config
+        local n cid
+        for n in $(custom_names); do
+            log_step "Custom app $n"
+            for cid in $(docker ps -q --filter "label=com.docker.compose.project=$(custom_project "$n")"); do ex_stop "$(c_inspect "$cid" '{{.Name}}' | sed 's#^/##')"; done
+            ex_tar "$(custom_dir "$n")" "custom/$n" "custom/$n"
+        done
+    fi
+
     local files_src; files_src="$(getent passwd "$REAL_USER" | cut -d: -f6)/web-site-content"
     if [[ -d "$files_src" ]]; then
         log_step "File share ($files_src)"
@@ -2837,6 +3307,14 @@ show_status() {
         else st="${D}off${NC}"; fi
         printf '  %-44s %b\n' "${APP_TITLE[$a]}" "$st"
     done
+    for a in $(custom_names); do
+        custom_load "$a"
+        if [[ "${CA[ENABLED]}" == yes ]]; then
+            if docker_up; then n=$(docker ps -q --filter "label=com.docker.compose.project=$(custom_project "$a")" | wc -l); st="${G}on${NC}, $n running"
+            else st="${G}on${NC}"; fi
+        else st="${D}off${NC}"; fi
+        printf '  %-44s %b\n' "${CA[TITLE]} (custom)" "$st"
+    done
     if command -v systemctl >/dev/null 2>&1; then
         local tl; tl=$(systemctl list-timers "$UNIT_HEALTH.timer" "$UNIT_UPDATE.timer" "$UNIT_CERT.timer" --no-legend 2>/dev/null | awk '{print "    " $0}')
         [[ -n "$tl" ]] && printf '\n  Timers:\n%s\n' "$tl"
@@ -2895,6 +3373,8 @@ v_kv()        { local e IFS=';'; for e in $1; do e=$(trim "$e"); [[ -z "$e" || "
 v_fetchsrc()  { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.:_-]+:/[^[:space:]\']*$ ]]; }
 v_fname()     { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 v_url()       { valid_url "$1"; }
+v_pct()       { [[ "$1" =~ ^[0-9]{1,3}$ ]] && (( $1 >= 1 && $1 <= 100 )); }
+v_load()      { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 section() { printf '\n  %s%s%s\n' "$B" "$1" "$NC"; }
 
 cfg_page() {
@@ -2943,6 +3423,15 @@ cfg_health() {
     section "Health checks (status dots on the page)"
     ask_valid HEALTH_CHECK "Check links from this host (yes/no)" v_yesno
     [[ "${CFG[HEALTH_CHECK]}" == yes ]] && ask_valid HEALTH_INTERVAL "Interval in minutes (1-60)" v_minutes
+    ask_valid HOST_PANEL "Show host health (CPU, memory, disks, containers) on the page (yes/no)" v_yesno
+    if [[ "${CFG[HOST_PANEL]}" == yes ]]; then
+        ask_valid HOST_DISK_WARN "Disk use warning at %" v_pct
+        ask_valid HOST_DISK_CRIT "Disk use critical at %" v_pct
+        ask_valid HOST_MEM_WARN "Memory use warning at %" v_pct
+        ask_valid HOST_MEM_CRIT "Memory use critical at %" v_pct
+        ask_valid HOST_LOAD_WARN "5-min load per CPU core, warning at" v_load
+        ask_valid HOST_LOAD_CRIT "5-min load per CPU core, critical at" v_load
+    fi
     return 0
 }
 cfg_updates() {
@@ -3080,9 +3569,11 @@ menu_apps() {
             a=${APPS[$i]}
             printf '   %d) %-44s %b\n' "$((i + 1))" "${APP_TITLE[$a]}" "$(app_on "$a" && echo "${G}on${NC}" || echo "${D}off${NC}")"
         done
+        printf '   C) Custom apps (%s)\n' "$(custom_names | wc -l)"
         printf '\n   T) Toggle on/off   E) Edit settings   S) Save   A) Save + apply   0) Back (unsaved changes are discarded)\n'
         read -rp "  Choice: " ch || return 0
         case "${ch,,}" in
+            c) menu_custom ;;
             t|e) read -rp "  App number: " i || continue
                  [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#APPS[@]} )) || { log_warn "No such app"; continue; }
                  a=${APPS[$((i - 1))]}
@@ -3164,6 +3655,8 @@ print_summary() {
     return 0
 }
 
+host_now() { ensure_config; host_health ""; }   # report + refresh the page data
+
 gvm_password() {
     require_config; load_secrets
     app_on gvm || die "Greenbone is not enabled."
@@ -3187,6 +3680,7 @@ uninstall_dashboard() {
     confirm_typed UNINSTALL || { log_info "Cancelled"; return 0; }
     local a
     for a in "${APPS[@]}"; do app_down "$a" "uninstall"; done
+    for a in $(custom_names); do custom_down "$a" "uninstall"; done
     if docker_up && [[ -f "$DEPLOY_DIR/docker-compose.yml" ]]; then run_logged compose_dd down || log_warn "compose down reported errors"; fi
     docker network inspect "$PROXY_NET" >/dev/null 2>&1 && run docker network rm "$PROXY_NET" >/dev/null 2>&1 || true
     CFG[HEALTH_CHECK]=no; CFG[UPDATE_SCHEDULE]=off
@@ -3308,6 +3802,26 @@ self_test() {
     st "resolved stub rolled back on DNS failure" '( DRY_RUN=0; ASSUME_YES=1; LOG_FILE=""; DD_STATE_DIR="$t/s2"; DD_RESOLVED_DIR="$t/rd2"; DD_RESOLV_CONF="$t/resolv2.conf"
                                                ln -s "$t/run/stub" "$DD_RESOLV_CONF"; systemctl() { :; }; sleep() { :; }; host_dns_ok() { false; }
                                                ! ( free_resolved_stub ) && [[ ! -f "$t/rd2/docker-dashboard-no-stub.conf" && "$(readlink "$DD_RESOLV_CONF")" == "$t/run/stub" ]] )'
+    st "custom app conf round-trip"         '( DRY_RUN=0; STACKS_DIR="$t/stacks"; custom_defaults hp; CA[TITLE]="HP Switches"; CA[SERVICE]=web; CA[PORT]=8443; CA[TLS]=yes; CA[SUBDOMAIN]=switches
+                                               custom_save hp && touch "$t/stacks/custom/hp/compose.yaml" && CA=() && custom_load hp && [[ "${CA[TITLE]}" == "HP Switches" && "${CA[PORT]}" == 8443 ]] && [[ "$(enabled_customs)" == hp ]] )'
+    st "custom app endpoint record"         '( allcfg; STACKS_DIR="$t/stacks"; IFS="|" read -r k ti su up fl fb de < <(custom_endpoint hp); [[ "$k" == c-hp && "$su" == switches && "$up" == https://dd-c-hp:8443 && "$fl" == ws,tls ]] )'
+    st "custom app proxied, linked, in DNS" '( allcfg; STACKS_DIR="$t/stacks"; c=$(render_nginx); [[ "$c" == *"server_name switches.example.net;"* && "$c" == *"set \$upstream https://dd-c-hp:8443;"* ]] && [[ "$(render_dns_hosts)" == *switches.example.net* ]] && render_services_json | grep -q "HP Switches" )'
+    st "custom app off -> not proxied"      '( allcfg; STACKS_DIR="$t/stacks"; DRY_RUN=0; custom_load hp; CA[ENABLED]=no; custom_save hp; [[ "$(render_nginx)" != *switches* ]] )'
+    st "custom app name clash rejected"     '( allcfg; STACKS_DIR="$t/stacks"; DRY_RUN=0; docker_up() { false; }; custom_load hp; CA[ENABLED]=yes; CA[SUBDOMAIN]=grafana; custom_save hp; ! custom_validate hp )'
+    st "custom app needs service + port"    '( allcfg; STACKS_DIR="$t/stacks"; DRY_RUN=0; docker_up() { false; }; custom_load hp; CA[SUBDOMAIN]=switches; CA[PORT]=x; custom_save hp; ! custom_validate hp; CA[PORT]=8443; CA[UPSTREAM_URL]=""; custom_save hp; custom_validate hp )'
+    st "custom app names validated"         'valid_app_name hp-1810 && ! valid_app_name HP && ! valid_app_name -x && ! valid_app_name "a b"'
+    st "compose json: no ports is fine"     '[[ -z "$(printf %s "{\"services\":{\"w\":{}}}" | compose_json_ports X)" ]]'
+    st "compose json ports parsed"          '[[ "$(printf %s "{\"services\":{\"w\":{\"ports\":[{\"mode\":\"ingress\",\"target\":443,\"published\":\"8444\",\"protocol\":\"tcp\"},{\"target\":53,\"published\":\"5353\",\"protocol\":\"udp\"}]}}}" | compose_json_ports X | cut -f1 | xargs)" == "8444/tcp 5353/udp" ]]'
+    st "levels: thresholds and worst-of"    '[[ $(level_for 79 80 90) == ok && $(level_for 80 80 90) == warn && $(level_for 95 80 90) == crit && $(level_for 90 80 90) == crit && $(level_for 1.5 1.0 2.0) == warn && $(level_worst ok warn ok) == warn && $(level_worst ok crit warn) == crit && $(level_worst) == ok ]]'
+    st "cpu % from /proc/stat samples"      '[[ "$(cpu_pct "1000 800" "1100 850")" == 50 && "$(cpu_pct "5 5" "5 5")" == 0 ]]'
+    if (( have_py )); then
+        st "host.json is valid JSON"        '( set_default_config; H_CORES=4; H_CPU=12; H_LOAD1=0.5; H_LOAD5=0.4; H_LOAD15=0.3; H_LOADPC=0.10; H_CPU_LVL=ok; H_MEM_T=8000000; H_MEM_U=6900000; H_MEM_P=86; H_MEM_LVL=warn
+                                               H_SW_T=0; H_SW_U=0; H_SW_P=0; H_SW_LVL=ok; H_UP=93784; H_RUN=11; H_TOT=12; H_CT_LVL=warn; H_PROBLEMS=("pihole: unhealthy"); H_DISKS=$(printf "/	ext4	100	91	91
+/data	xfs	200	20	10
+"); H_DISK_LVL=crit
+                                               render_host_json | python3 -c "import json,sys; d=json.load(sys.stdin); assert d[\"level\"]==\"crit\" and d[\"disks\"][0][\"level\"]==\"crit\" and d[\"memory\"][\"level\"]==\"warn\" and d[\"containers\"][\"problems\"]==[\"pihole: unhealthy\"]" )'
+    fi
+    st "page loads the host panel"          'render_index | grep -q "fetch(\"host.json\""'
     st "index.html loads nothing external"  '! render_index | grep -Eq "(src|href)=\"(https?:)?//"'
     rm -rf "$t"
     printf '\n  Result: %s%d passed%s, %s%d failed%s\n' "$G" "$pass" "$NC" "$( ((fail)) && echo "$R" || echo "$G")" "$fail" "$NC"
@@ -3352,7 +3866,7 @@ main_menu() {
         printf '   5) Apply everything             (render, validate, start)\n'
         printf '   6) Update ALL containers        (apps, compose projects, docker-run containers)\n'
         printf '   7) Check for updates            (pull images, report, change nothing)\n'
-        printf '   8) Status   9) Health check   D) DNS records   L) Logs\n'
+        printf '   8) Status   9) Health check (links + host)   H) Host health   D) DNS records   L) Logs\n'
         printf '  %sMigrate%s\n' "$B" "$NC"
         printf '   E) Export this host to a bundle   I) Import a bundle\n'
         printf '  %sMaintenance%s\n' "$B" "$NC"
@@ -3370,6 +3884,7 @@ main_menu() {
             7) menu_action check_updates ;;
             8) menu_action show_status ;;
             9) menu_action health_check ;;
+            h) menu_action host_now ;;
             d) menu_action dns_records ;;
             l) menu_logs ;;
             e) menu_action export_bundle ;;
@@ -3406,6 +3921,8 @@ Actions (default: interactive menu)
   --health [--quiet]         Check every link now and refresh the page's status dots
   --status                   Show configuration, apps, timers and last update
   --dns-records              Print the DNS names the proxy serves (and Windows DNS commands)
+  --host                     Host health now: CPU, memory, swap, disks, uptime, containers
+  --custom-apps              Custom apps menu (your own compose apps behind the proxy)
   --cert-refresh             Fetch / re-read the certificate and reload nginx if it changed
   --cert-fetch-key           Create (or show) the SSH key used by certificate fetch mode
   --gvm-password             Set the Greenbone admin password from the vault
@@ -3461,6 +3978,8 @@ main() {
             --quiet)           quiet=quiet ;;
             --status)          action=status ;;
             --dns-records)     action=dns ;;
+            --host)            action=host ;;
+            --custom-apps)     action=customs ;;
             --cert-refresh)    action=certrefresh ;;
             --cert-fetch-key)  action=certkey ;;
             --gvm-password)    action=gvmpw ;;
@@ -3517,6 +4036,8 @@ main() {
         export)      export_bundle ;;
         status)      show_status ;;
         dns)         dns_records ;;
+        host)        host_now ;;
+        customs)     is_tty || die "Custom apps menu needs a terminal."; menu_custom ;;
         certrefresh) cert_refresh ;;
         certkey)     ensure_config; cert_fetch_key ;;
         gvmpw)       gvm_password ;;
