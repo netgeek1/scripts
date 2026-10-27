@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.2.1"
+readonly SCRIPT_VERSION="2.2.2"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1512,6 +1512,42 @@ custom_add() {
     custom_validate "$n" && log_ok "Custom app '$n' saved. Apply (A) to start it." || log_warn "Saved, but fix the problems above before applying."
 }
 
+custom_detach() {   # take the app's containers off the proxy network
+    local n=$1 id
+    for id in $(docker ps -aq --filter "label=com.docker.compose.project=$(custom_project "$n")" 2>/dev/null); do
+        docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$id" 2>/dev/null | grep -qw "$PROXY_NET" \
+            && run docker network disconnect "$PROXY_NET" "$id" >/dev/null 2>&1
+    done
+    return 0
+}
+
+custom_remove() {   # three levels: unregister / stop + unregister / delete everything
+    local n=$1 d ch
+    d=$(custom_dir "$n"); custom_load "$n"
+    printf '\n  Remove %s (%s):\n' "${CA[TITLE]}" "$d"
+    printf '   1) Unregister only    -- off the proxy, page and DNS list; containers keep running, folder untouched\n'
+    printf '   2) Stop + unregister  -- containers stopped and removed; folder and data kept\n'
+    printf '   3) Delete everything  -- containers stopped, folder deleted with its data\n'
+    printf '   0) Cancel\n'
+    read -rp "  Choice: " ch || return 0
+    case "$ch" in
+        1) custom_detach "$n"
+           run rm -f "$d/app.conf"
+           log_ok "Unregistered $n. Its containers still run (project $(custom_project "$n")) but are no longer managed or updated."
+           log_info "Set it up again any time with F (it is listed under 'not set up yet')." ;;
+        2) custom_down "$n" "unregistering"
+           run rm -f "$d/app.conf"
+           log_ok "Stopped and unregistered $n; $d is kept (set up again with F)." ;;
+        3) confirm "Stop '$n' and delete $d with all its data?" n && confirm_typed DELETE-APP || { log_info "Cancelled"; return 0; }
+           custom_down "$n" "removing"
+           safe_path "$d" && run rm -rf -- "$d"
+           log_ok "Removed $n and its folder" ;;
+        *) log_info "Cancelled" ;;
+    esac
+    [[ "$ch" =~ ^[123]$ ]] && log_info "Apply (A) to update the proxy, page and DNS list."
+    return 0
+}
+
 custom_adopt() {   # give a folder that already has a compose file (and maybe a build) its app.conf
     local -a cand; local i n
     mapfile -t cand < <(custom_unconfigured)
@@ -1555,11 +1591,7 @@ menu_custom() {
                     e) custom_prompt "$n"; custom_save "$n"; custom_validate "$n" || true ;;
                     t) [[ "${CA[ENABLED]}" == yes ]] && CA[ENABLED]=no || CA[ENABLED]=yes
                        custom_save "$n"; log_info "${CA[TITLE]}: ${CA[ENABLED]} (takes effect on apply)" ;;
-                    r) if confirm "Stop '$n' and delete $(custom_dir "$n") with its data?" n && confirm_typed DELETE-APP; then
-                           custom_down "$n" "removing"
-                           safe_path "$(custom_dir "$n")" && run rm -rf -- "$(custom_dir "$n")"
-                           log_ok "Removed $n"
-                       fi ;;
+                    r) custom_remove "$n" ;;
                 esac ;;
             a) menu_action stack_apply ;;
             0|q) return 0 ;;
