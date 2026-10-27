@@ -3,6 +3,14 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.4.1 — 2026-10-26 — Speedtest health check
+
+### Fixed
+- The speedtest exporter showed `unhealthy` while working. Its image checks `http://localhost:9798/`, but the
+  exporter listens on IPv4 only, so the check fails wherever `localhost` resolves to `::1` first. The monitoring app
+  now probes `http://127.0.0.1:9798/`; a stopped or broken exporter still fails the check.
+- Self-test: 73 checks.
+
 ## v2.4.0 — 2026-10-26 — Add any running container
 
 ### Added
