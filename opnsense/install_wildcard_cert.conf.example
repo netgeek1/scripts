@@ -1,0 +1,114 @@
+# install_wildcard_cert.conf  -  site configuration (EXAMPLE)
+#
+# Copy this file to the location the script reads by default:
+#
+#     cp install_wildcard_cert.conf.example /root/ssl_certs/install_wildcard_cert.conf
+#     chmod 600 /root/ssl_certs/install_wildcard_cert.conf
+#     $EDITOR /root/ssl_certs/install_wildcard_cert.conf
+#
+# then replace the example values below with your own. The script sources this
+# file OVER its built-in defaults, so you can update the script itself (git pull
+# / download over the old copy) without ever touching your settings.
+#
+# Point the script at a different location with:  -c /path/to.conf   or the
+# CERT_DEPLOY_CONF environment variable.
+#
+# This file is plain POSIX sh: KEY="value", no spaces around '='. It is sourced,
+# so only put assignments here. It is NOT secret by policy, but it lists your
+# internal addresses - keep it out of git (see .gitignore) and chmod 600.
+#
+# SECRETS (API keys) do NOT go here. They live in  <LOG_DIR>/.env  :
+#     API_KEY_FGT="..."
+#     API_KEY_FMG="..."
+#     API_KEY_FAZ="..."
+#     API_KEY_TRUENAS="..."
+#
+# The example IPs are RFC 5737 documentation ranges. The script refuses to run
+# against them for an enabled device, so an unedited copy fails loudly.
+###############################################################################
+
+# --- Paths --------------------------------------------------------------------
+# Where logs and the .env secrets file live. Created with mode 700 if absent.
+LOG_DIR="/root/ssl_certs"
+
+# --- Identity -----------------------------------------------------------------
+# DOMAIN is the certificate OBJECT name as it appears on the Fortinet/TrueNAS
+# devices (no dots; acme.sh/OPNsense typically use underscores).
+DOMAIN="wildcard_example_com"
+# The DNS SAN to match inside the issued certificate when auto-discovering it
+# from the ACME plugin output. This is the real wildcard name, with dots.
+ACME_MATCH_SAN="*.example.com"
+
+# --- Which devices to deploy to -----------------------------------------------
+# 1 = deploy, 0 = skip entirely (no probe, no API/SSH). A disabled device shows
+# as DISABLED in the summary/digest and never affects the exit code or email.
+DEPLOY_FGT=1          # FortiGate
+DEPLOY_UCG=1          # Ubiquiti Cloud Gateway
+DEPLOY_RM1=1          # GL-Net RM1 / GL-KVM
+DEPLOY_TRUENAS=1      # TrueNAS SCALE
+DEPLOY_FMG=0          # FortiManager
+DEPLOY_FAZ=0          # FortiAnalyzer
+
+# --- Device addresses ---------------------------------------------------------
+FGT_IP="192.0.2.10"           # FortiGate            (REST API, bearer token)
+
+FMG_IP="192.0.2.20"           # FortiManager         (JSON-RPC, bearer token)
+FAZ_IP="192.0.2.21"           # FortiAnalyzer        (JSON-RPC, bearer token)
+
+UCG_IP="192.0.2.30"           # Ubiquiti Cloud Gateway (SSH + scp)
+UCG_SSH_USER="certdeploy"
+UCG_SSH_PORT="22"
+UCG_SSH_KEY="/root/.ssh/ucg_ed25519"
+
+RM1_IP="192.0.2.40"           # GL-Net RM1           (SSH + scp, restarts nginx)
+RM1_SSH_USER="root"
+RM1_SSH_PORT="22"
+RM1_SSH_KEY="/root/.ssh/rm1_ed25519"
+
+TRUENAS_IP="192.0.2.50"       # TrueNAS SCALE        (v2.0 REST API, bearer token)
+TRUENAS_CERT_NAME=""          # defaults to $DOMAIN if left empty
+
+# --- Certificate source (OPNsense ACME client plugin) -------------------------
+# The plugin writes certs under an opaque, changing <CERT_ID> directory, so the
+# script auto-discovers the right one by matching ACME_MATCH_SAN. Leave
+# CERTIFICATE_FILE / PRIVATE_KEY_FILE empty to auto-discover (recommended on
+# OPNsense). On another host, set both to absolute paths to bypass discovery.
+ACME_DIR="/var/etc/acme-client"
+ACME_CERT_FILE="cert.pem"     # or "fullchain.pem" to also ship the intermediate
+ACME_KEY_FILE="private.key"
+CERTIFICATE_FILE=""
+PRIVATE_KEY_FILE=""
+
+# --- Email notification -------------------------------------------------------
+# Sent via curl's smtp:// (no mailer package needed). Aimed at an internal,
+# unauthenticated relay. For an authenticated relay, add --user in send_mail().
+NOTIFY_EMAIL=1
+# changes = mail on any failure/expiry AND on any actual deployment; silent on a
+#           quiet all-CURRENT night (recommended).
+# failure = only on problems.   always = every run.   never = off.
+NOTIFY_ON="changes"
+SMTP_HOST="192.0.2.25"        # your internal SMTP forwarder
+SMTP_PORT=25
+MAIL_FROM="cert-deploy@example.com"
+MAIL_TO="admin@example.com"
+SMTP_TIMEOUT=20
+
+# --- Expiry monitoring --------------------------------------------------------
+# Warn (and, on a normal run, force a notification) when a device's LIVE cert is
+# within this many days of expiry. ~90-day LE certs renew with weeks of lead, so
+# a cert this close means deployment to that device has been quietly failing.
+CERT_WARN_DAYS=21
+
+# --- Timeouts (seconds) -------------------------------------------------------
+CURL_CONNECT_TIMEOUT=10
+CURL_MAX_TIME=120
+TLS_TIMEOUT=10
+VERIFY_RETRIES=15             # post-deploy re-probes before declaring failure
+VERIFY_INTERVAL=2             # seconds between re-probes
+SSH_CONNECT_TIMEOUT=10
+
+# --- SSH host-key policy ------------------------------------------------------
+# "yes"        = require the host key in known_hosts (safe; seed it once with
+#                ssh-keyscan -p <port> <ip> >> /root/.ssh/known_hosts).
+# "accept-new" = trust on first use (convenient, less safe).
+SSH_HOST_KEY_CHECKING="yes"
