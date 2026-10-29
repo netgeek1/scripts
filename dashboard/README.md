@@ -107,7 +107,7 @@ The export recognises apps by image, not by name or path. It reads each app's se
 | Pi-hole | `/etc/pihole` (gravity, settings, local DNS records, query log), web password, `FTLCONF_*` settings, ports |
 | Portainer | `/data` (users, endpoints, stacks), ports |
 | Internet monitoring | Prometheus config and **history**, Grafana database and provisioning, blackbox config, the exact image tags you run, retention, plugins, admin password, ports |
-| Guacamole | The database via `pg_dump`, which restores into a current PostgreSQL. The 1.6 schema upgrade is applied automatically. Also drive/recording folders and the old HTTPS port |
+| Guacamole | The database via `pg_dump`, which restores into a current PostgreSQL in one transaction. The 1.6 schema upgrade is applied automatically. A stock schema already on the new host, with no connections or extra users, is replaced; real data is never overwritten. Also drive/recording folders and the old HTTPS port |
 | MeshCentral | `meshcentral-data` (config, **server certificates** — your agents keep connecting), `-files`, `-backups`, `-web`. This works even when the data was never in a volume and lived inside the container |
 | File share | `~/web-site-content` of the user running the export |
 
@@ -426,7 +426,8 @@ covered:
 - export from a replica of an old Debian 11 layout, including MeshCentral data inside a container
 - wipe, then import
 - every name served through the proxy with the wildcard certificate, including websocket upgrade
-- the Guacamole data restored onto the new PostgreSQL, with the 1.6 schema upgrade applied
+- the Guacamole data restored onto the new PostgreSQL, with the 1.6 schema upgrade applied, including over a stale
+  `init/initdb.sql` or a stock schema left by an earlier attempt
 - ownership kept for Grafana (472) and Prometheus (65534)
 - the Pi-hole local DNS file written, with existing records untouched
 - idempotent re-apply, with no containers recreated
