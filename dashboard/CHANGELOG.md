@@ -3,6 +3,35 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.0 — 2026-10-28 — Certificate push mode
+
+### Added
+- **`CERT_MODE=push`**: another machine pushes the certificate over SSH when it renews, such as the OPNsense
+  `install_wildcard_cert_api.sh` deployer. Unlike `fetch`, the new certificate is live within seconds, and the
+  pushing side gets a pass/fail answer.
+  - `--cert-receive` reads the chain and key (PEM) on stdin, validates them like every other mode, stores them in
+    `/etc/docker-dashboard/certs-pushed/`, reloads nginx and waits until the proxy serves the new certificate.
+    The last line is machine-readable: `DD-CERT-RECEIVE OK changed|unchanged sha256=… notafter=… live=yes|no`, or
+    `DD-CERT-RECEIVE FAIL <reason>`.
+  - The read is capped (64 KB, 30 s), so a stalled or wrong client can't hold the lock. A push waits up to 5 minutes
+    for a running menu or apply instead of failing.
+  - `--cert-push-setup [PUBKEY_FILE|-]` (Certificate menu → 4) creates the push user (`CERT_PUSH_USER`, default
+    `ddcertpush`), an `authorized_keys` line restricted to that one command (`restrict`, optional `from=` from
+    `CERT_PUSH_FROM`), and a sudoers rule for that exact command, checked with `visudo`.
+  - Until the first push, the proxy serves a temporary self-signed certificate.
+- Self-test: 79 checks.
+
+### Fixed
+- A new certificate could stay unserved after `--apply`. Apply skipped the nginx reload whenever it rewrote the
+  compose file, on the assumption that compose would recreate the container. A rewrite that compose sees as no
+  change leaves the old container running with the old certificate. Apply now compares the container ID before and
+  after, and reloads whenever it's the same container.
+- `--cert-refresh` trusted its own record of the last reload. It now asks the proxy which certificate it is serving,
+  so a missed reload is repaired by the next refresh.
+
+### Notes
+- The push user's password field is `*`, not `!`. With `UsePAM no`, sshd refuses key logins to `!` (locked) accounts.
+
 ## v2.4.1 — 2026-10-26 — Speedtest health check
 
 ### Fixed
