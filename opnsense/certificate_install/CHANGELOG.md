@@ -4,6 +4,27 @@ All notable changes to this project are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [3.1.0] - 2026-10-28
+
+### Added
+- **Docker host target** (`docker-dashboard --cert-receive`), a seventh device.
+  Uses docker-dashboard's certificate push model: the deployer streams the
+  certificate chain followed by the private key over SSH to a forced command —
+  no scp, no remote command (both are rejected for the `ddcertpush` user).
+  - Sends `fullchain.pem` when present beside the leaf, else `cert + chain.pem`,
+    else the leaf alone with a warning; verifies the chain's first certificate
+    matches the local leaf before sending.
+  - Parses the receiver's `DD-CERT-RECEIVE OK …` status line, confirms its
+    `sha256` matches the local leaf, then verifies over TLS like every other
+    device. The private key is never logged and never written to a temp file.
+  - New config: `DEPLOY_DOCKER`, `DOCKER_IP`, `DOCKER_HTTPS_PORT`,
+    `DOCKER_SSH_USER` (default `ddcertpush`), `DOCKER_SSH_PORT`,
+    `DOCKER_SSH_KEY`. Included in `validate_config`, `preflight`, the `--digest`
+    report, and the run summary. `validate_config` also checks the SSH/HTTPS
+    ports are numeric.
+  - Ships disabled (`DEPLOY_DOCKER=0`). See the README section
+    "Docker host (docker-dashboard)" for one-time setup.
+
 ## [3.0.0] - 2026-10-28
 
 ### Changed (breaking)
