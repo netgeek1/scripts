@@ -158,6 +158,7 @@ With a domain set, each app endpoint gets `https://<name>.<domain>`, and the lan
 | `selfsigned` | Generated for the host IP, `*.<domain>` and `<domain>`. Browsers warn once |
 | `custom` | Your full-chain PEM + key on this host. A systemd path unit redeploys them whenever the files change |
 | `fetch` | Copied over `scp` every day from another machine, such as **OPNsense running acme.sh**, then deployed if changed |
+| `push` | Another machine pushes it over SSH when it renews, such as the OPNsense `install_wildcard_cert_api.sh` deployer. Deployed at once, and the push gets a pass/fail answer |
 
 Every mode is checked before it is used. The key must match, the certificate must not be expired, and every name the
 proxy serves is checked against it (a warning names any that aren't covered). A bad certificate is refused and the
@@ -175,6 +176,33 @@ running one stays in place. nginx reloads without dropping connections.
 If a fetch fails, the last good certificate keeps being served, and the timer run exits non-zero so the failure shows
 in the journal.
 
+**Push mode setup:**
+
+1. On the pushing machine, create a key pair. On OPNsense:
+   `ssh-keygen -t ed25519 -N '' -f /root/ssl_certs/docker_push_ed25519`
+2. Here, choose `push` (Settings → Certificate) and let it set up the receiver, or run
+   `sudo docker-dashboard --cert-push-setup /path/to/docker_push_ed25519.pub` (or paste the key when asked).
+   This creates:
+   - a system user, `ddcertpush` by default (`CERT_PUSH_USER`), with no password and no shell access
+   - its `authorized_keys` line, which pins the key to one command:
+     `restrict,from="<CERT_PUSH_FROM>",command="sudo -n /usr/local/sbin/docker-dashboard --cert-receive"`
+   - `/etc/sudoers.d/docker-dashboard-certpush`, which allows that user that one command and nothing else
+3. Set `CERT_PUSH_FROM` to the pushing machine's IP so the key works only from there.
+4. Push: `cat fullchain.pem privkey.pem | ssh -i docker_push_ed25519 ddcertpush@<this host>`
+
+The receiver reads at most 64 KB within 30 seconds. It expects the certificate chain followed by exactly one private
+key, and runs the same checks as the other modes before anything is replaced. It waits up to 5 minutes for a menu or
+apply run to finish, reloads nginx, and waits until the proxy really serves the new certificate. Its last output line
+is meant for scripts:
+
+```
+DD-CERT-RECEIVE OK changed|unchanged sha256=<fingerprint> notafter=<date> live=yes|no
+DD-CERT-RECEIVE FAIL <reason>
+```
+
+The exit code is 0 for OK and non-zero otherwise. Until the first push arrives, the proxy serves a temporary
+self-signed certificate. The pushed pair is kept in `/etc/docker-dashboard/certs-pushed/`.
+
 ## Menu and CLI
 
 | Menu | CLI | What it does |
@@ -183,7 +211,7 @@ in the journal.
 | 2 / 3 | `--settings` / `--apps` | Settings menu / turn apps on or off and edit their images, names and ports |
 | 4 | `--services`, `--add-service`, `--remove-service`, `--detect` | Custom links on the page |
 | K | `--secrets` | View or change stored passwords |
-| C | `--cert-refresh`, `--cert-fetch-key` | Certificate actions |
+| C | `--cert-refresh`, `--cert-fetch-key`, `--cert-push-setup`, `--cert-receive` | Certificate actions |
 | 5 | `--apply` | Converge everything: compose files, proxy config, page, DNS file, timers |
 | 6 | `--update-all` | Update every running container on the host |
 | 7 | `--check-updates` | Pull newer images and report which containers are behind; changes nothing |
@@ -324,9 +352,11 @@ All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menu
 | `HTTP_PORT` / `HTTPS_PORT` | `80` / `443` | Proxy ports |
 | `TIMEZONE` | host's | `TZ` for the apps |
 | `STACKS_DIR` / `DEPLOY_DIR` | `/opt/stacks` / `/opt/docker-dashboard` | App folders / proxy + page |
-| `CERT_MODE` | `selfsigned` | `selfsigned`, `custom` or `fetch` |
+| `CERT_MODE` | `selfsigned` | `selfsigned`, `custom`, `fetch` or `push` |
 | `CERT_FILE`, `CERT_KEY_FILE` | — | `custom` mode |
 | `CERT_FETCH_SOURCE`, `CERT_FETCH_CERT`, `CERT_FETCH_KEY` | — | `fetch` mode |
+| `CERT_PUSH_USER` | `ddcertpush` | `push` mode: the local user the pushing machine logs in as |
+| `CERT_PUSH_FROM` | — | `push` mode: IPs/CIDRs the push key is accepted from (sshd `from=`); empty = any |
 | `FILES_DIR`, `FILES_HTTP` | —, `yes` | `/files/` share, plus plain-HTTP downloads |
 | `HEALTH_CHECK`, `HEALTH_INTERVAL` | `yes`, `2` | Status dots |
 | `HOST_PANEL` | `yes` | Host panel on the page |
@@ -358,6 +388,8 @@ All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menu
 | `/etc/docker-dashboard/secrets.enc` | Encrypted secrets |
 | `/etc/docker-dashboard/services.conf` | Custom links |
 | `/etc/docker-dashboard/certfetch_ed25519` | Fetch-mode SSH key |
+| `/etc/docker-dashboard/certs-pushed/` | Push mode: the last pushed certificate and key |
+| `/etc/sudoers.d/docker-dashboard-certpush` | Push mode: allows only `docker-dashboard --cert-receive` |
 | `/opt/stacks/<app>/` | `compose.yaml` + the app's data |
 | `/opt/stacks/guacamole/.restore/` | Imported database dump (kept after restore) |
 | `/opt/docker-dashboard/` | Proxy compose, `nginx/`, `html/` (page, `services.json`, `status.json`), `certs/` |
@@ -381,7 +413,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 72 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 79 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
@@ -399,6 +431,6 @@ covered:
 - the Pi-hole local DNS file written, with existing records untouched
 - idempotent re-apply, with no containers recreated
 - update-all recreating only the changed image
-- app off/on, certificate renewal, a mismatched key refused, a fetch over scp, a fetch failure fallback
+- app off/on, certificate renewal, a mismatched key refused, a fetch over scp, a fetch failure fallback, a push over a forced-command SSH key (renewal, unchanged, garbage, wrong key, shell and scp attempts refused, wrong source IP refused, lock wait)
 - port-conflict and overwrite guards, the menus, uninstall, and a fresh install without a bundle
 - the Greenbone override validated against Greenbone's real `compose.yaml`
