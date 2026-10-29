@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.4.1"
+readonly SCRIPT_VERSION="2.5.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -39,6 +39,7 @@ DD_INSTALL_BIN="${DD_INSTALL_BIN:-/usr/local/sbin/docker-dashboard}"
 DD_LOCK_FILE="${DD_LOCK_FILE:-/run/docker-dashboard.lock}"
 DD_HEALTH_LOCK="${DD_HEALTH_LOCK:-/run/docker-dashboard-health.lock}"
 DD_UNIT_DIR="${DD_UNIT_DIR:-/etc/systemd/system}"
+DD_SUDOERS_DIR="${DD_SUDOERS_DIR:-/etc/sudoers.d}"
 DD_RESOLV_CONF="${DD_RESOLV_CONF:-/etc/resolv.conf}"
 DD_RESOLVED_DIR="${DD_RESOLVED_DIR:-/etc/systemd/resolved.conf.d}"
 DD_RESOLVED_UPSTREAM="${DD_RESOLVED_UPSTREAM:-/run/systemd/resolve/resolv.conf}"
@@ -49,6 +50,8 @@ SECRETS_FILE="$DD_CONF_DIR/secrets.enc"
 KEY_FILE="$DD_CONF_DIR/.secrets.key"
 FETCH_KEY="$DD_CONF_DIR/certfetch_ed25519"
 FETCH_KNOWN_HOSTS="$DD_CONF_DIR/certfetch_known_hosts"
+PUSH_DIR="$DD_CONF_DIR/certs-pushed"
+PUSH_MAX_BYTES=65536
 LOG_KEEP=30
 
 readonly PROJECT_NAME="docker-dashboard"
@@ -83,6 +86,7 @@ SECRET_KEYS=( PIHOLE_PASSWORD GRAFANA_ADMIN_PASSWORD GUAC_DB_PASSWORD GVM_ADMIN_
 CONF_KEYS=( DASH_TITLE DOMAIN DASH_SUBDOMAIN HOST_ADDR EXTRA_NAMES HTTP_PORT HTTPS_PORT TIMEZONE
             DEPLOY_DIR STACKS_DIR NGINX_IMAGE
             CERT_MODE CERT_FILE CERT_KEY_FILE CERT_DAYS CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY
+            CERT_PUSH_USER CERT_PUSH_FROM
             FILES_DIR FILES_HTTP HEALTH_CHECK HEALTH_INTERVAL
             HOST_PANEL HOST_DISK_WARN HOST_DISK_CRIT HOST_MEM_WARN HOST_MEM_CRIT HOST_LOAD_WARN HOST_LOAD_CRIT
             UPDATE_SCHEDULE UPDATE_DAY UPDATE_TIME UPDATE_PRUNE UPDATE_EXCLUDE UPDATE_DELEGATE WATCHTOWER_IMAGE
@@ -344,6 +348,8 @@ set_default_config() {
         [CERT_FETCH_SOURCE]=""
         [CERT_FETCH_CERT]="fullchain.pem"
         [CERT_FETCH_KEY]="privkey.pem"
+        [CERT_PUSH_USER]="ddcertpush"
+        [CERT_PUSH_FROM]=""
         [FILES_DIR]=""
         [FILES_HTTP]="yes"
         [HEALTH_CHECK]="yes"
@@ -2429,13 +2435,141 @@ cert_fetch_key() {
     printf '\n    %s\n\n' "$(cat "$FETCH_KEY.pub" 2>/dev/null)"
 }
 
+# -----------------------------------------------------------------------------
+# CERTIFICATE PUSH (CERT_MODE=push): another host (e.g. the OPNsense deployer) pushes the pair
+#   cat fullchain.pem privkey.pem | ssh ddcertpush@host
+# The push user's key is forced to "sudo -n docker-dashboard --cert-receive" (no shell, no forwarding),
+# and sudoers allows only that exact command. The last stdout line is machine-readable:
+#   DD-CERT-RECEIVE OK changed|unchanged sha256=<FP> notafter=<DATE>
+#   DD-CERT-RECEIVE FAIL <reason>
+# -----------------------------------------------------------------------------
+pem_split() {   # pem_split IN CRT_OUT KEY_OUT -> certificates (in order) and the one private key
+    awk -v c="$2" -v k="$3" '
+        /^-----BEGIN CERTIFICATE-----/            { o = c; nc++ }
+        /^-----BEGIN ([A-Z]+ )?PRIVATE KEY-----/  { o = k; nk++ }
+        o != ""                                   { print > o }
+        /^-----END /                              { o = "" }
+        END { exit (nc >= 1 && nk == 1) ? 0 : 1 }' "$1"
+}
+
+live_cert_fp() {   # what the proxy serves on this host right now
+    local sni; sni=$(dash_host 2>/dev/null || true)
+    echo | timeout 5 openssl s_client -connect "127.0.0.1:${CFG[HTTPS_PORT]:-443}" ${sni:+-servername "$sni"} 2>/dev/null \
+        | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//'
+}
+cert_fp() { openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//'; }
+cert_not_live() {   # 0 when the proxy answers with a different certificate than the deployed file
+    local live; live=$(live_cert_fp)
+    [[ -n "$live" && "$live" != "$(cert_fp "$DEPLOY_DIR/certs/dashboard.crt")" ]]
+}
+
+cert_receive_fail() { printf 'DD-CERT-RECEIVE FAIL %s\n' "$*"; _log_file ERROR "cert-receive: $*"; exit 1; }
+
+cert_receive() {
+    require_config
+    [[ "${CFG[CERT_MODE]}" == push ]] || cert_receive_fail "CERT_MODE is ${CFG[CERT_MODE]}, not push"
+    (( DRY_RUN )) && { log_info "Dry run: would validate stdin and install it into $PUSH_DIR"; return 0; }
+    local t n before after state=unchanged
+    t=$(mktemp -d); chmod 700 "$t"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$t'" EXIT
+    # bounded read: a stalled or wrong client (e.g. scp/sftp) must not hold the lock
+    timeout 30 head -c $((PUSH_MAX_BYTES + 1)) >"$t/in" || [[ $? != 124 ]] || cert_receive_fail "timed out waiting for input"
+    n=$(wc -c <"$t/in")
+    (( n > 0 )) || cert_receive_fail "nothing received on stdin"
+    (( n <= PUSH_MAX_BYTES )) || cert_receive_fail "input larger than $PUSH_MAX_BYTES bytes"
+    pem_split "$t/in" "$t/crt" "$t/key" || cert_receive_fail "expected certificate(s) followed by exactly one private key (PEM)"
+    openssl x509 -in "$t/crt" -noout 2>/dev/null || cert_receive_fail "certificate does not parse"
+    cert_check "$t/crt" "$t/key" >&2 || cert_receive_fail "certificate rejected (key mismatch or expired)"
+    mkdir -p "$PUSH_DIR"; chmod 700 "$PUSH_DIR"
+    if ! cmp -s "$t/crt" "$PUSH_DIR/fullchain.pem" || ! cmp -s "$t/key" "$PUSH_DIR/privkey.pem"; then
+        install -m 600 -o root -g root "$t/key" "$PUSH_DIR/privkey.pem.new"
+        install -m 644 -o root -g root "$t/crt" "$PUSH_DIR/fullchain.pem.new"
+        mv -f "$PUSH_DIR/privkey.pem.new" "$PUSH_DIR/privkey.pem"
+        mv -f "$PUSH_DIR/fullchain.pem.new" "$PUSH_DIR/fullchain.pem"
+        log_ok "Stored the pushed certificate in $PUSH_DIR" >&2
+    fi
+    before=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
+    ensure_cert >&2
+    after=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
+    if [[ "$before" != "$after" ]] || cert_not_live; then
+        dashboard_reload >&2; state=changed
+    fi
+    # nginx reloads asynchronously: wait until the proxy really serves it, so the caller's TLS check passes
+    local fp live=no i
+    fp=$(cert_fp "$DEPLOY_DIR/certs/dashboard.crt")
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [[ "$(live_cert_fp)" == "$fp" ]] && { live=yes; break; }
+        sleep 1
+    done
+    [[ "$live" == yes ]] || log_warn "nginx is not serving the new certificate yet (is $CONTAINER_NAME running?)" >&2
+    printf 'DD-CERT-RECEIVE OK %s sha256=%s notafter=%s live=%s\n' "$state" "$fp" \
+        "$(openssl x509 -in "$DEPLOY_DIR/certs/dashboard.crt" -noout -enddate 2>/dev/null | sed 's/^notAfter=//; s/ /_/g')" "$live"
+    _log_file INFO "cert-receive: $state $(cert_fp "$DEPLOY_DIR/certs/dashboard.crt")"
+}
+
+push_authorized_line() {   # push_authorized_line PUBKEY_LINE [FROM]
+    local opts="restrict"
+    [[ -n "${2:-}" ]] && opts+=",from=\"$2\""
+    printf '%s,command="sudo -n %s --cert-receive" %s\n' "$opts" "$DD_INSTALL_BIN" "$1"
+}
+push_sudoers_line() { printf '%s ALL=(root) NOPASSWD: %s --cert-receive\n' "$1" "$DD_INSTALL_BIN"; }
+
+cert_push_setup() {   # cert_push_setup [PUBKEY_FILE|-]  -- create the push user, forced command and sudoers rule
+    require_config
+    local u=${CFG[CERT_PUSH_USER]} from=${CFG[CERT_PUSH_FROM]} src=${1:-} key home sud
+    log_step "Certificate push receiver (user $u)"
+    if [[ -n "$src" && "$src" != - ]]; then key=$(grep -m1 -E '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9-]+) ' "$src" 2>/dev/null || true)
+    elif [[ "$src" == - ]] || ! is_tty; then key=$(grep -m1 -E '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9-]+) ' || true)
+    else
+        log_info "Paste the deployer's PUBLIC key (one line: ssh-ed25519 AAAA... comment)."
+        log_info "On OPNsense, create it with: ssh-keygen -t ed25519 -N '' -f /root/ssl_certs/docker_push_ed25519"
+        read -rp "  Public key: " key || true
+    fi
+    key=$(trim "${key:-}")
+    [[ -n "$key" ]] && ssh-keygen -l -f /dev/stdin <<<"$key" >/dev/null 2>&1 || die "That is not an SSH public key."
+    command -v sudo >/dev/null 2>&1 || { log_info "Installing sudo"; run apt-get install -y -qq sudo; }
+    if ! id "$u" >/dev/null 2>&1; then
+        run useradd --system --create-home --shell /bin/sh --comment "docker-dashboard certificate push" "$u"
+        log_ok "Created system user $u (no password; key login only)"
+    fi
+    # "!" (locked) makes sshd refuse even key logins when UsePAM is off; "*" = no password, keys still work
+    [[ "$(getent shadow "$u" 2>/dev/null | cut -d: -f2)" == "*" ]] || run usermod -p '*' "$u"
+    home=$(getent passwd "$u" | cut -d: -f6); [[ -n "$home" ]] || home="/home/$u"
+    run install -d -m 700 -o "$u" -g "$u" "$home/.ssh"
+    push_authorized_line "$key" "$from" | write_file "$home/.ssh/authorized_keys" 600 "$u:$u"
+    sud="$DD_SUDOERS_DIR/docker-dashboard-certpush"
+    if (( DRY_RUN )); then run write "$sud"
+    else
+        local tmp; tmp=$(mktemp)
+        push_sudoers_line "$u" >"$tmp"
+        visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "visudo rejected the sudoers rule."; }
+        mkdir -p "$DD_SUDOERS_DIR"; install -m 440 -o root -g root "$tmp" "$sud"; rm -f "$tmp"
+        log_ok "Wrote $sud"
+    fi
+    [[ -x "$DD_INSTALL_BIN" ]] || log_warn "$DD_INSTALL_BIN is missing: run --install or --apply once so the forced command exists."
+    if [[ "${CFG[CERT_MODE]}" != push ]]; then
+        log_warn "CERT_MODE is ${CFG[CERT_MODE]}: pushes are refused until it is 'push' (Settings -> Certificate)."
+    fi
+    log_info "Deployer side: DOCKER_SSH_USER=$u, DOCKER_IP=$(eff_host), key = the private half of the key above."
+    log_info "Test from the deployer:  cat fullchain.pem privkey.pem | ssh -i KEY $u@$(eff_host)"
+    [[ -n "$from" ]] || log_info "Tip: set CERT_PUSH_FROM to the deployer's IP so the key only works from there."
+}
+
 ensure_cert() {
     log_step "TLS certificate (${CFG[CERT_MODE]})"
     local dir="$DEPLOY_DIR/certs" crt key src_c src_k
     crt="$dir/dashboard.crt"; key="$dir/dashboard.key"
-    case "${CFG[CERT_MODE]}" in
-        custom|fetch)
-            if [[ "${CFG[CERT_MODE]}" == fetch ]]; then
+    local mode=${CFG[CERT_MODE]}
+    if [[ "$mode" == push && ! ( -s "$PUSH_DIR/fullchain.pem" && -s "$PUSH_DIR/privkey.pem" ) ]]; then
+        log_warn "No certificate pushed yet: serving a temporary self-signed one until the first push (--cert-receive)."
+        mode=selfsigned
+    fi
+    case "$mode" in
+        custom|fetch|push)
+            if [[ "$mode" == push ]]; then
+                src_c="$PUSH_DIR/fullchain.pem"; src_k="$PUSH_DIR/privkey.pem"
+            elif [[ "$mode" == fetch ]]; then
                 if ! cert_fetch; then
                     CERT_FETCH_FAILED=1
                     [[ -s "$DD_CONF_DIR/certs-fetched/fullchain.pem" ]] || die "No certificate available yet."
@@ -2489,7 +2623,7 @@ cert_refresh() {
     before=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
     ensure_cert
     after=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
-    if [[ "$before" != "$after" ]]; then dashboard_reload; log_ok "New certificate is live"
+    if [[ "$before" != "$after" ]] || cert_not_live; then dashboard_reload; log_ok "New certificate is live"
     else log_info "Certificate unchanged"; fi
     (( CERT_FETCH_FAILED == 0 ))   # non-zero for the timer's journal when the fetch itself failed
 }
@@ -2572,9 +2706,9 @@ app_down() {   # app_down APP [REASON] -- stop and remove containers; data kept
 dashboard_up() {
     log_step "Dashboard ($DEPLOY_DIR)"
     run mkdir -p "$DEPLOY_DIR/html" "$DEPLOY_DIR/nginx" "$DEPLOY_DIR/certs"
-    local conf_changed=0 running=0
-    docker ps -q --filter "name=^${CONTAINER_NAME}$" 2>/dev/null | grep -q . && running=1
-    WROTE=0; write_file "$DEPLOY_DIR/docker-compose.yml" 644 root:root < <(render_compose); local compose_changed=$WROTE
+    local conf_changed=0 id_before id_after
+    id_before=$(docker ps -q --no-trunc --filter "name=^${CONTAINER_NAME}$" 2>/dev/null || true)
+    write_file "$DEPLOY_DIR/docker-compose.yml" 644 root:root < <(render_compose)
     WROTE=0; write_file "$DEPLOY_DIR/nginx/default.conf" 644 root:root < <(render_nginx); conf_changed=$WROTE
     write_file "$DEPLOY_DIR/html/index.html" 644 root:root < <(render_index)
     write_services_json
@@ -2585,8 +2719,10 @@ dashboard_up() {
     nginx_test || die "nginx -t failed; the running dashboard was left as it was."
     log_ok "nginx configuration valid"
     run_logged compose_dd up -d
-    # a recreated container already has everything; a running one needs a reload for new config/cert
-    if (( running && ! compose_changed )) && \
+    # a new container already has everything; the same one still running needs a reload for new config/cert.
+    # Compare container IDs: a rewritten compose file does not always make compose recreate the container.
+    id_after=$(docker ps -q --no-trunc --filter "name=^${CONTAINER_NAME}$" 2>/dev/null || true)
+    if [[ -n "$id_before" && "$id_before" == "$id_after" ]] && \
        { (( conf_changed )) || [[ "$(state_get cert_applied)" != "$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" | cut -c1-16)" ]]; }; then
         dashboard_reload
     fi
@@ -3629,7 +3765,9 @@ v_path()      { valid_abs_path "$1"; }
 v_path_opt()  { [[ -z "$1" ]] || valid_abs_path "$1"; }
 v_file_opt()  { [[ -z "$1" ]] || [[ "$1" == /* && -r "$1" ]]; }
 v_image()     { [[ "$1" =~ ^[a-z0-9][a-z0-9._/:@-]*$ ]]; }
-v_certmode()  { [[ "$1" =~ ^(selfsigned|custom|fetch)$ ]]; }
+v_certmode()  { [[ "$1" =~ ^(selfsigned|custom|fetch|push)$ ]]; }
+v_user()      { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]; }
+v_from_opt()  { [[ -z "$1" || "$1" =~ ^[0-9A-Fa-f.:/,*?]+$ ]]; }
 v_days()      { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 30 && $1 <= 3650 )); }
 v_yesno()     { [[ "$1" =~ ^(yes|no)$ ]]; }
 v_minutes()   { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 60 )); }
@@ -3667,6 +3805,7 @@ cfg_ports() {
 cfg_cert() {
     section "Certificate"
     log_info "selfsigned = generated here | custom = files on this host | fetch = copy over scp daily (e.g. from OPNsense acme.sh)"
+    log_info "push = another host pushes it over SSH when it renews (e.g. the OPNsense install_wildcard_cert_api.sh deployer)"
     ask_valid CERT_MODE "Mode" v_certmode
     case "${CFG[CERT_MODE]}" in
         custom)
@@ -3679,6 +3818,11 @@ cfg_cert() {
             ask_valid CERT_FETCH_KEY "Key file name in that folder" v_fname
             [[ -n "${CFG[CERT_FETCH_SOURCE]}" ]] || { log_warn "A source is required"; cfg_cert; return 0; }
             [[ -f "$FETCH_KEY" ]] || { confirm "Create the SSH key used for fetching now?" y && cert_fetch_key; } ;;
+        push)
+            ask_valid CERT_PUSH_USER "Local user the deployer logs in as" v_user
+            ask_valid CERT_PUSH_FROM "Only accept pushes from (IP/CIDR list, - for any)" v_from_opt
+            confirm "Set up the push user and its key now?" y && { save_config; cert_push_setup; }
+            ask_valid EXTRA_NAMES "Extra names for the temporary self-signed cert (- to clear)" v_names ;;
         *)  ask_valid CERT_DAYS "Self-signed validity in days (30-3650)" v_days
             ask_valid EXTRA_NAMES "Extra names for the certificate (- to clear)" v_names ;;
     esac
@@ -3888,11 +4032,12 @@ menu_secrets() {
 
 menu_cert() {
     ensure_config
-    printf '\n  %sCertificate%s (%s)\n   1) Refresh now (fetch/re-read, reload if changed)\n   2) Create / show fetch SSH key\n   3) Show certificate\n   0) Back\n' "$B" "$NC" "${CFG[CERT_MODE]}"
+    printf '\n  %sCertificate%s (%s)\n   1) Refresh now (fetch/re-read, reload if changed)\n   2) Create / show fetch SSH key\n   3) Show certificate\n   4) Set up push receiver (user, key, sudoers)\n   0) Back\n' "$B" "$NC" "${CFG[CERT_MODE]}"
     local ch; read -rp "  Choice: " ch || return 0
     case "$ch" in
         1) menu_action cert_refresh ;;
         2) menu_action cert_fetch_key ;;
+        4) menu_action cert_push_setup ;;
         3) openssl x509 -in "$DEPLOY_DIR/certs/dashboard.crt" -noout -subject -issuer -enddate -ext subjectAltName 2>&1 | sed 's/^/  /' ;;
     esac
 }
@@ -4055,6 +4200,19 @@ self_test() {
     st "host ports per app"                 '( allcfg; [[ "$(app_host_ports pihole | cut -f1 | xargs)" == "53/tcp 53/udp 8081/tcp" && "$(app_host_ports guacamole | cut -f1)" == 8443/tcp ]] )'
     st "port parser skips own projects"     '[[ "$(printf "pihole\t0.0.0.0:53->53/udp, 0.0.0.0:80->80/tcp\tpi-hole\npihole2\t0.0.0.0:53->53/udp\tdd-pihole\ndocker-dashboard\t0.0.0.0:80->80/tcp\tdocker-dashboard\n" | docker_ps_port_users 53 udp | xargs)" == pihole ]]'
     st "port parser respects protocol"      '[[ -z "$(printf "x\t0.0.0.0:53->53/udp\tp\n" | docker_ps_port_users 53 tcp)" ]]'
+    if command -v openssl >/dev/null 2>&1; then
+        openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 2 -subj /CN=t.example.net \
+            -keyout "$t/pk" -out "$t/pc" >/dev/null 2>&1
+        cat "$t/pc" "$t/pc" "$t/pk" >"$t/bundle"; cat "$t/pc" "$t/pk" "$t/pk" >"$t/twokeys"
+        st "push: split chain + key"            'pem_split "$t/bundle" "$t/sc" "$t/sk" && [[ $(grep -c "BEGIN CERT" "$t/sc") == 2 ]] && grep -q "PRIVATE KEY" "$t/sk" && ! grep -q "PRIVATE" "$t/sc"'
+        st "push: rejects two keys / no key"    '! pem_split "$t/twokeys" "$t/x1" "$t/x2" && ! pem_split "$t/pc" "$t/x3" "$t/x4"'
+        st "push: split pair passes cert_check" 'set_default_config; pem_split "$t/bundle" "$t/sc2" "$t/sk2" && cert_check "$t/sc2" "$t/sk2"'
+    fi
+    st "push: forced-command key line"      '[[ "$(push_authorized_line "ssh-ed25519 AAAA c" 192.168.0.1)" == "restrict,from=\"192.168.0.1\",command=\"sudo -n $DD_INSTALL_BIN --cert-receive\" ssh-ed25519 AAAA c" ]]'
+    if command -v visudo >/dev/null 2>&1; then
+        st "push: sudoers rule passes visudo"   'push_sudoers_line ddcertpush >"$t/sud" && visudo -cf "$t/sud"'
+    fi
+    st "push: mode and user validators"     'v_certmode push && v_user ddcertpush && ! v_user "a b" && v_from_opt "" && v_from_opt 192.168.0.1/32 && ! v_from_opt "x;y"'
     st "cert SANs include wildcard"         '( set_default_config; CFG[DOMAIN]=example.net; s=$(cert_sans 192.168.0.190 "docker01.lan"); [[ "$s" == "IP:192.168.0.190,DNS:*.example.net,DNS:example.net,"* && "$s" == *"DNS:docker01.lan" ]] )'
     st "image version compare"              'image_version_ge guacamole/guacamole:1.6.0 1.6 && image_version_ge x/y:latest 1.6 && image_version_ge x/y 1.6 && ! image_version_ge g/g:1.5.5 1.6 && image_version_ge g/g:2.0 1.6'
     st "image_repo normalises names"        '[[ "$(image_repo docker.io/library/Postgres:13.4)" == postgres && "$(image_repo pihole/pihole@sha256:ab)" == pihole/pihole && "$(image_repo reg:5000/a/b:1)" == reg:5000/a/b ]]'
@@ -4208,6 +4366,8 @@ Actions (default: interactive menu)
   --custom-apps              Custom apps menu (your own compose apps behind the proxy)
   --cert-refresh             Fetch / re-read the certificate and reload nginx if it changed
   --cert-fetch-key           Create (or show) the SSH key used by certificate fetch mode
+  --cert-receive             Push mode: read cert chain + key (PEM) on stdin, validate, deploy (forced SSH command)
+  --cert-push-setup [FILE|-] Push mode: create the push user, its forced-command key and the sudoers rule
   --gvm-password             Set the Greenbone admin password from the vault
   --settings | --apps | --services | --secrets   Menus
   --list-services            Print the custom links
@@ -4265,6 +4425,8 @@ main() {
             --custom-apps)     action=customs ;;
             --cert-refresh)    action=certrefresh ;;
             --cert-fetch-key)  action=certkey ;;
+            --cert-receive)    action=certreceive ;;
+            --cert-push-setup) action=certpush; [[ -n "${2:-}" && "${2:-}" != --* ]] && { arg=$2; shift; } ;;
             --gvm-password)    action=gvmpw ;;
             --settings)        action=settings ;;
             --apps)            action=apps ;;
@@ -4303,7 +4465,11 @@ main() {
     fi
 
     init_logging "$action"
-    acquire_lock "$DD_LOCK_FILE"
+    if [[ "$action" == certreceive ]]; then   # a push waits for a menu/apply run instead of failing
+        exec 9>"$DD_LOCK_FILE"; flock -w 300 9 || cert_receive_fail "busy: another run held the lock for 5 minutes"
+    else
+        acquire_lock "$DD_LOCK_FILE"
+    fi
     _log_file INFO "================================================"
     _log_file INFO "$SCRIPT_NAME v$SCRIPT_VERSION started action=$action dry_run=$DRY_RUN"
     _log_file INFO "User: $(id -un) (real: $REAL_USER)  PID: $$"
@@ -4323,6 +4489,8 @@ main() {
         customs)     is_tty || die "Custom apps menu needs a terminal."; menu_custom ;;
         certrefresh) cert_refresh ;;
         certkey)     ensure_config; cert_fetch_key ;;
+        certreceive) cert_receive ;;
+        certpush)    cert_push_setup "$arg" ;;
         gvmpw)       gvm_password ;;
         settings)    is_tty || die "Settings menu needs a terminal."; menu_settings ;;
         apps)        is_tty || die "Apps menu needs a terminal."; menu_apps ;;
