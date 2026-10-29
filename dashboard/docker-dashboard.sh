@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.0"
+readonly SCRIPT_VERSION="2.5.1"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1172,12 +1172,33 @@ ensure_proxy_net() {
 guac_psql() { docker exec -i guacamole-postgres psql -v ON_ERROR_STOP=1 -U "${CFG[GUAC_DB_USER]}" -d "${CFG[GUAC_DB_NAME]}" "$@"; }
 
 wait_guac_db() {
+    # Ask over TCP, not the socket: on first start the postgres entrypoint runs a temporary socket-only server
+    # while it executes docker-entrypoint-initdb.d, and a socket check reports "ready" in the middle of that.
     local i
-    for (( i = 0; i < 60; i++ )); do
-        docker exec guacamole-postgres pg_isready -q -U "${CFG[GUAC_DB_USER]}" -d "${CFG[GUAC_DB_NAME]}" >/dev/null 2>&1 && return 0
+    for (( i = 0; i < 90; i++ )); do
+        docker exec guacamole-postgres pg_isready -q -h 127.0.0.1 -U "${CFG[GUAC_DB_USER]}" -d "${CFG[GUAC_DB_NAME]}" >/dev/null 2>&1 && return 0
         sleep 2
     done
     return 1
+}
+
+# guac_db_pristine -> true when the database holds nothing worth keeping: no connections, no connection groups,
+# and no users other than the stock guacadmin (what a fresh schema or a half-finished restore leaves)
+guac_db_pristine() {
+    local tbl where c total=0
+    for tbl in guacamole_connection guacamole_connection_group "guacamole_entity|type = 'USER' AND name <> 'guacadmin'"; do
+        where=""; [[ "$tbl" == *"|"* ]] && { where=" WHERE ${tbl#*|}"; tbl=${tbl%%|*}; }
+        c=$(guac_psql -tAc "SELECT to_regclass('public.$tbl') IS NOT NULL" </dev/null 2>/dev/null || echo error)
+        [[ "$c" == f ]] && continue                     # table not there (empty or half-restored database)
+        c=$(guac_psql -tAc "SELECT count(*) FROM $tbl$where" </dev/null 2>/dev/null || echo error)
+        [[ "$c" =~ ^[0-9]+$ ]] || return 1              # can't tell: treat as data worth keeping
+        total=$((total + c))
+    done
+    (( total == 0 ))
+}
+
+guac_db_reset() {   # drop everything in the guacamole database (schema public), keeping the database and role
+    guac_psql -q </dev/null -c "SET client_min_messages = warning; DROP SCHEMA public CASCADE; CREATE SCHEMA public AUTHORIZATION \"${CFG[GUAC_DB_USER]}\";" >/dev/null
 }
 
 # image_version_ge IMAGE MAJOR.MINOR -> true if the tag is >= or not a version (latest, stable...)
@@ -1194,16 +1215,29 @@ guac_db_prepare() {   # run before the rest of the guacamole project starts
     local d dump n
     d=$(app_dir guacamole); dump="$d/.restore/guacamole.dump"
     (( DRY_RUN )) && { [[ -f "$dump" ]] && run pg_restore "$dump"; return 0; }
+    # A pending dump replaces the stock schema: an initdb.sql (generated earlier, or carried over from the old host)
+    # would otherwise be run by postgres on first start and collide with the restore.
+    if [[ -f "$dump" && ! -f "$d/data/postgres/PG_VERSION" && -f "$d/init/initdb.sql" ]]; then
+        mv -f "$d/init/initdb.sql" "$d/.restore/initdb.sql.not-used"
+        log_info "Set aside init/initdb.sql: the imported database replaces it"
+    fi
     compose_app guacamole up -d postgres >/dev/null 2>&1 || compose_app guacamole up -d postgres
     wait_guac_db || die "Guacamole PostgreSQL did not become ready (docker logs guacamole-postgres)."
     n=$(guac_psql -tAc "SELECT count(*) FROM information_schema.tables WHERE table_name = 'guacamole_user'" </dev/null 2>/dev/null || echo 0)
     if [[ -f "$dump" ]]; then
-        if [[ "$n" != 0 ]]; then
-            log_warn "Guacamole database already has data; imported dump NOT restored (kept at $dump)."
-        else
+        local restore=1
+        if ! guac_db_pristine; then
+            log_warn "Guacamole database already has connections or users; imported dump NOT restored (kept at $dump)."
+            restore=0
+        elif guac_psql -tAc "SELECT count(*) FROM pg_type t JOIN pg_namespace s ON s.oid = t.typnamespace WHERE s.nspname = 'public' AND t.typname LIKE 'guacamole_%'" </dev/null 2>/dev/null | grep -qv '^0$'; then
+            log_info "Clearing the stock/partial Guacamole schema (no connections or users in it) before the restore"
+            guac_db_reset || die "Could not clear the Guacamole database before the restore."
+        fi
+        if (( restore )); then
             log_info "Restoring imported Guacamole database ($(du -h "$dump" | cut -f1))"
+            # one transaction: a failure leaves the database empty, so the next run can simply try again
             docker exec -i guacamole-postgres pg_restore -U "${CFG[GUAC_DB_USER]}" -d "${CFG[GUAC_DB_NAME]}" \
-                --no-owner --role="${CFG[GUAC_DB_USER]}" --exit-on-error <"$dump" \
+                --no-owner --role="${CFG[GUAC_DB_USER]}" --exit-on-error --single-transaction <"$dump" \
                 || die "pg_restore failed; the dump is kept at $dump"
             mv "$dump" "$d/.restore/restored-$(date +%F_%H%M%S).dump"
             log_ok "Guacamole database restored"
