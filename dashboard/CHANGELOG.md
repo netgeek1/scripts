@@ -3,6 +3,21 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.1 — 2026-10-28 — Guacamole import restore
+
+### Fixed
+- An import could fail with `pg_restore: type "guacamole_connection_group_type" already exists`, or worse, skip the
+  imported database without failing and start Guacamole with the stock schema. There were two causes:
+  - An `init/initdb.sql`, left by an earlier fresh install or attempt, was still in the folder. PostgreSQL runs it
+    on first start, so the stock schema was created alongside the restore.
+  - The readiness check asked over the socket. While the postgres entrypoint runs the init scripts, its temporary
+    server answers only there, so the restore started in the middle of that run.
+- With a dump pending and no database yet, `init/initdb.sql` is now set aside (to `.restore/initdb.sql.not-used`).
+- Readiness is now checked over TCP, which only the real server answers.
+- If the database holds only a stock or half-restored schema (no connections, no connection groups, no users other
+  than `guacadmin`), it is cleared before the restore. A database with real data is still never overwritten.
+- `pg_restore` runs in a single transaction, so a failure leaves an empty database and the next run can simply retry.
+
 ## v2.5.0 — 2026-10-28 — Certificate push mode
 
 ### Added
