@@ -18,6 +18,7 @@ cert to devices that can't get it themselves.
 | FortiAnalyzer | JSON-RPC (bearer token) |
 | Ubiquiti Cloud Gateway (UCG) | SSH + scp, restart `unifi-core` |
 | GL-Net RM1 / GL-KVM | SSH + scp, restart `nginx` |
+| Docker host (docker-dashboard) | SSH stdin push to a forced command (`--cert-receive`) |
 | TrueNAS SCALE | v2.0 REST API (bearer token) |
 
 Each device can be enabled or disabled independently in the config file.
@@ -100,6 +101,43 @@ chmod 600 /root/.ssh/known_hosts
 ```
 
 Only enabled devices are validated, so you can start with a subset.
+
+### Docker host (docker-dashboard)
+
+This target uses docker-dashboard's certificate **push** mode: the deployer
+streams the chain + key over SSH to a forced command on the host. No scp, no
+remote command (both are rejected for this user). One-time setup:
+
+1. **Create the key on OPNsense:**
+   ```sh
+   ssh-keygen -t ed25519 -N '' -f /root/ssl_certs/docker_push_ed25519
+   chmod 600 /root/ssl_certs/docker_push_ed25519
+   ```
+2. **On the Docker host:**
+   - copy `docker_push_ed25519.pub` over;
+   - `sudo docker-dashboard --cert-push-setup docker_push_ed25519.pub`
+     (creates the `ddcertpush` user, its restricted `authorized_keys`, and the
+     sudoers rule);
+   - in **Settings → Certificate**, set `CERT_MODE=push` and
+     `CERT_PUSH_FROM=<OPNsense LAN IP>`.
+3. **Seed the host key on OPNsense:**
+   ```sh
+   ssh-keyscan -p 22 <DOCKER_IP> >> /root/.ssh/known_hosts
+   ```
+4. In your config, set `DEPLOY_DOCKER=1` and `DOCKER_IP` (and, if non-default,
+   the port/user/key vars).
+5. Test: `install_wildcard_cert_api.sh --dry-run`, then a real run.
+6. **Manual sanity check** from OPNsense — should print a `DD-CERT-RECEIVE OK`
+   line:
+   ```sh
+   cat fullchain.pem private.key | \
+     ssh -i /root/ssl_certs/docker_push_ed25519 ddcertpush@<DOCKER_IP>
+   ```
+
+The deployer sends `fullchain.pem` when it sits beside the leaf (falling back to
+`cert + chain.pem`, then leaf-only with a warning), checks the chain's first
+certificate matches the local leaf before sending, and confirms the receiver's
+reported `sha256` matches — then verifies over TLS like every other device.
 
 ## Usage
 
