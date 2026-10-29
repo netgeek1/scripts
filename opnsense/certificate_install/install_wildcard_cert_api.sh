@@ -57,6 +57,7 @@ ACME_MATCH_SAN=""                                # DNS SAN to match, e.g. *.exam
 DEPLOY_FGT=1          # FortiGate
 DEPLOY_UCG=1          # Ubiquiti Cloud Gateway
 DEPLOY_RM1=1          # GL-Net RM1
+DEPLOY_DOCKER=0       # Docker host (docker-dashboard --cert-receive)
 DEPLOY_TRUENAS=1      # TrueNAS SCALE
 DEPLOY_FMG=0          # FortiManager
 DEPLOY_FAZ=0          # FortiAnalyzer
@@ -76,6 +77,15 @@ RM1_IP=""
 RM1_SSH_USER=""
 RM1_SSH_PORT="22"
 RM1_SSH_KEY=""
+
+# Docker host running docker-dashboard (cert PUSH mode). The cert chain + key
+# are streamed on stdin to a forced command (docker-dashboard --cert-receive);
+# no remote command, no scp. DOCKER_SSH_USER is fixed by --cert-push-setup.
+DOCKER_IP=""
+DOCKER_HTTPS_PORT="443"
+DOCKER_SSH_USER="ddcertpush"
+DOCKER_SSH_PORT="22"
+DOCKER_SSH_KEY="/root/ssl_certs/docker_push_ed25519"
 
 TRUENAS_IP=""
 TRUENAS_CERT_NAME=""                             # defaults to $DOMAIN if left empty
@@ -148,7 +158,7 @@ API_KEY_TRUENAS=""
 # LOGGING / DEBUG / CLI
 ###############################################################################
 
-SCRIPT_VERSION="3.0.0"          # bump on every change
+SCRIPT_VERSION="3.1.0"          # bump on every change
 VERBOSITY=1                     # 0=quiet(warn/error)  1=info(default)  2=debug
 DRY_RUN=0                       # 1 = report intended actions, change nothing
 MODE="deploy"                   # "deploy" (default) or "digest" (--digest)
@@ -287,6 +297,7 @@ fi
 TRUENAS_API_KEY="${API_KEY_TRUENAS:-}"
 UCG_SSH_CMD=""
 RM1_SSH_CMD=""
+DOCKER_SSH_CMD=""
 CERT_CONTENT=""
 KEY_CONTENT=""
 DEVICE_RESULTS=""
@@ -651,6 +662,7 @@ validate_config() {
     _vreq_ip FortiAnalyzer "$DEPLOY_FAZ"     "$FAZ_IP"
     _vreq_ip UCG           "$DEPLOY_UCG"     "$UCG_IP"
     _vreq_ip RM1           "$DEPLOY_RM1"     "$RM1_IP"
+    _vreq_ip Docker        "$DEPLOY_DOCKER"  "$DOCKER_IP"
     _vreq_ip TrueNAS       "$DEPLOY_TRUENAS" "$TRUENAS_IP"
 
     # SSH devices also need a user + key when enabled.
@@ -661,6 +673,12 @@ validate_config() {
     if [ "$DEPLOY_RM1" = 1 ]; then
         [ -n "$RM1_SSH_USER" ] || die "RM1 enabled but RM1_SSH_USER is empty - set it in $CONF_FILE"
         [ -n "$RM1_SSH_KEY"  ] || die "RM1 enabled but RM1_SSH_KEY is empty - set it in $CONF_FILE"
+    fi
+    if [ "$DEPLOY_DOCKER" = 1 ]; then
+        [ -n "$DOCKER_SSH_USER" ] || die "Docker enabled but DOCKER_SSH_USER is empty - set it in $CONF_FILE"
+        [ -n "$DOCKER_SSH_KEY"  ] || die "Docker enabled but DOCKER_SSH_KEY is empty - set it in $CONF_FILE"
+        case "$DOCKER_SSH_PORT"   in ''|*[!0-9]*) die "Docker: DOCKER_SSH_PORT ($DOCKER_SSH_PORT) is not numeric - fix it in $CONF_FILE" ;; esac
+        case "$DOCKER_HTTPS_PORT" in ''|*[!0-9]*) die "Docker: DOCKER_HTTPS_PORT ($DOCKER_HTTPS_PORT) is not numeric - fix it in $CONF_FILE" ;; esac
     fi
 
     if [ "$NOTIFY_EMAIL" = 1 ]; then
@@ -684,11 +702,15 @@ preflight_common() {
     for bin in openssl curl jq; do
         command -v "$bin" >/dev/null 2>&1 || missing="$missing $bin"
     done
-    # ssh/scp are only needed when an SSH device (UCG/RM1) is enabled.
+    # scp is needed for the scp-based SSH devices (UCG/RM1).
     if [ "$DEPLOY_UCG" = 1 ] || [ "$DEPLOY_RM1" = 1 ]; then
         for bin in ssh scp; do
             command -v "$bin" >/dev/null 2>&1 || missing="$missing $bin"
         done
+    fi
+    # Docker uses ssh only (stdin push, no scp).
+    if [ "$DEPLOY_DOCKER" = 1 ]; then
+        command -v ssh >/dev/null 2>&1 || case "$missing" in *" ssh"*) : ;; *) missing="$missing ssh" ;; esac
     fi
     # if/then (not '&& die'): as the function's last command, a false '[ -n ]'
     # test would otherwise make preflight_common return 1 and trip 'set -e' at
@@ -719,6 +741,7 @@ preflight() {
 
     if [ "$DEPLOY_UCG" = 1 ]; then check_ssh_target "UCG" "$UCG_SSH_KEY" "$UCG_IP" "$UCG_SSH_PORT"; fi
     if [ "$DEPLOY_RM1" = 1 ]; then check_ssh_target "RM1" "$RM1_SSH_KEY" "$RM1_IP" "$RM1_SSH_PORT"; fi
+    if [ "$DEPLOY_DOCKER" = 1 ]; then check_ssh_target "Docker" "$DOCKER_SSH_KEY" "$DOCKER_IP" "$DOCKER_SSH_PORT"; fi
 
     log_info "Preflight OK"
 }
@@ -922,6 +945,112 @@ install_rm1_cert() {
     deploy_rm1_cert
 
     verify_deployed "$RM1_IP" 443 "RM1" || return 1
+}
+
+###############################################################################
+# Docker host (docker-dashboard --cert-receive)
+#
+# PUSH model: the cert chain followed by exactly one private key is streamed on
+# stdin to a forced command over SSH. No remote command, no scp (the forced
+# command ignores any command and scp hangs for this user). The receiver
+# validates, installs, reloads nginx, and prints a machine-readable last line:
+#   DD-CERT-RECEIVE OK changed|unchanged sha256=AA:..:FF notafter=... live=yes|no
+#   DD-CERT-RECEIVE FAIL <reason>
+###############################################################################
+install_docker_cert() {
+    log_info "--- Docker host (docker-dashboard) ---"
+    [ -f "$DOCKER_SSH_KEY" ] || die "Docker SSH key missing: $DOCKER_SSH_KEY"
+    # No remote command: the server's forced command runs --cert-receive and
+    # ignores anything we would pass. stdin carries the chain + key.
+    DOCKER_SSH_CMD="ssh -T -o BatchMode=yes -o StrictHostKeyChecking=$SSH_HOST_KEY_CHECKING -o ConnectTimeout=$SSH_CONNECT_TIMEOUT -o LogLevel=ERROR -i $DOCKER_SSH_KEY -p $DOCKER_SSH_PORT $DOCKER_SSH_USER@$DOCKER_IP"
+
+    local pre=0
+    device_precheck "Docker" "$DOCKER_IP" "$DOCKER_HTTPS_PORT" \
+        "push cert chain + key over SSH (docker-dashboard --cert-receive)" || pre=$?
+    [ "$pre" -eq 0 ] || return "$pre"
+
+    # --- Build the chain to send (nginx needs the full chain, not just leaf) ---
+    local dir chain tmpchain=""
+    dir=$(dirname "$CERTIFICATE_FILE")
+    if [ -f "$dir/fullchain.pem" ]; then
+        chain="$dir/fullchain.pem"
+        log_debug "Docker: sending $chain"
+    elif [ -f "$dir/chain.pem" ]; then
+        tmpchain=$(mktemp "${TMPDIR:-/tmp}/ddchain.XXXXXX") || die "Docker: mktemp failed"
+        cat "$CERTIFICATE_FILE" "$dir/chain.pem" > "$tmpchain"
+        chain="$tmpchain"
+        log_debug "Docker: sending leaf + $dir/chain.pem"
+    else
+        chain="$CERTIFICATE_FILE"
+        log_warn "Docker: no fullchain.pem/chain.pem beside $CERTIFICATE_FILE - sending leaf only; browsers may complain about an incomplete chain"
+    fi
+
+    # The chain's FIRST certificate must be our leaf, or we would deploy the
+    # wrong cert. (openssl x509 reads only the first cert from a bundle.)
+    local chain_fp leaf_fp
+    chain_fp=$(openssl x509 -in "$chain" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' | tr 'a-f' 'A-F')
+    leaf_fp=$(file_fingerprint 2>/dev/null | sed 's/^.*=//' | tr 'a-f' 'A-F')
+    if [ -z "$chain_fp" ] || [ "$chain_fp" != "$leaf_fp" ]; then
+        if [ -n "$tmpchain" ]; then rm -f "$tmpchain"; fi
+        die "Docker: chain's first certificate does not match the leaf ($CERTIFICATE_FILE) - refusing to push"
+    fi
+
+    # --- Push chain + key on stdin; capture result without 'die' in the pipe ---
+    # The KEY is never logged and never written to a temp file - only streamed.
+    local out rc=0
+    out=$( { cat "$chain"; cat "$PRIVATE_KEY_FILE"; } | $DOCKER_SSH_CMD 2>&1 ) || rc=$?
+    if [ -n "$tmpchain" ]; then rm -f "$tmpchain"; fi
+
+    # 'out' is the RECEIVER's stdout/stderr (diagnostics + status line), not our
+    # stdin, so it is safe to log.
+    printf '%s\n' "$out" | while IFS= read -r _line; do
+        [ -n "$_line" ] && log_debug "Docker: $_line"
+    done
+
+    local status
+    status=$(printf '%s\n' "$out" | grep '^DD-CERT-RECEIVE ' | tail -n 1)
+
+    # --- Failure: non-zero rc, or no OK status line ---
+    case "$status" in
+        "DD-CERT-RECEIVE OK"*) : ;;
+        *)
+            if [ -z "$status" ]; then
+                log_error "Docker: no DD-CERT-RECEIVE status line (ssh rc=$rc). Last output:"
+            else
+                log_error "Docker: $status"
+            fi
+            printf '%s\n' "$out" | tail -n 5 | while IFS= read -r _l; do
+                [ -n "$_l" ] && log_error "Docker: | $_l"
+            done
+            return 1
+            ;;
+    esac
+    if [ "$rc" -ne 0 ]; then
+        log_error "Docker: OK status but ssh exited $rc - treating as failure"
+        return 1
+    fi
+
+    # --- Fingerprint check: receiver's sha256 must equal our leaf ---
+    local remote_fp
+    remote_fp=$(printf '%s' "$status" | sed -n 's/.*[[:space:]]sha256=\([^[:space:]]*\).*/\1/p' | tr 'a-f' 'A-F')
+    if [ -z "$remote_fp" ]; then
+        log_error "Docker: OK status had no sha256= field - cannot verify"
+        return 1
+    fi
+    if [ "$remote_fp" != "$leaf_fp" ]; then
+        log_error "Docker: received fingerprint ($remote_fp) does not match local leaf ($leaf_fp)"
+        return 1
+    fi
+
+    local changed live
+    changed=$(printf '%s' "$status" | awk '{print $3}')
+    live=$(printf '%s' "$status" | sed -n 's/.*[[:space:]]live=\([^[:space:]]*\).*/\1/p')
+    log_info "Docker: received (${changed:-?}), live=${live:-unknown}"
+    if [ "$live" = "no" ]; then
+        log_warn "Docker: receiver reports proxy not yet serving the new cert; verifying over TLS"
+    fi
+
+    verify_deployed "$DOCKER_IP" "$DOCKER_HTTPS_PORT" "Docker" || return 1
 }
 
 ###############################################################################
@@ -1375,6 +1504,7 @@ device_roster() {
 $DEPLOY_FGT|FortiGate|$FGT_IP|443
 $DEPLOY_UCG|UCG|$UCG_IP|443
 $DEPLOY_RM1|RM1|$RM1_IP|443
+$DEPLOY_DOCKER|Docker|$DOCKER_IP|$DOCKER_HTTPS_PORT
 $DEPLOY_TRUENAS|TrueNAS|$TRUENAS_IP|443
 $DEPLOY_FMG|FortiManager|$FMG_IP|443
 $DEPLOY_FAZ|FortiAnalyzer|$FAZ_IP|443
@@ -1478,6 +1608,7 @@ main() {
     run_device "$DEPLOY_FGT"     "FortiGate"     install_fgt_cert
     run_device "$DEPLOY_UCG"     "UCG"           install_ucg_cert
     run_device "$DEPLOY_RM1"     "RM1"           install_rm1_cert
+    run_device "$DEPLOY_DOCKER"  "Docker"        install_docker_cert
     run_device "$DEPLOY_TRUENAS" "TrueNAS"       install_truenas_cert
     run_device "$DEPLOY_FMG"     "FortiManager"  install_fortinet_cert "FortiManager"  "$FMG_IP" "$API_KEY_FMG"
     run_device "$DEPLOY_FAZ"     "FortiAnalyzer" install_fortinet_cert "FortiAnalyzer" "$FAZ_IP" "$API_KEY_FAZ"
