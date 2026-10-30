@@ -400,6 +400,14 @@ Or use the menu: **K → C**. It offers to apply right away.
 way to turn the login off. To turn it back on, set any value. An empty password set inside the container with
 `pihole setpassword` does not survive a container restart; this setting does.
 
+Since FTL v6.8, a Pi-hole without a password refuses cross-site browser requests and any `Host` name it doesn't
+recognise. It answers with a 403 "Oops! Access denied" page. Through the proxy the Host is `pihole.<domain>`, so
+no-password mode also sets `FTLCONF_webserver_domain` to that name, unless `PIHOLE_EXTRA_ENV` already sets it. The
+direct port, by IP, may still be refused; use the proxy name.
+
+Pi-hole added that check because, with no password, any web page opened on your network can reach Pi-hole's API
+through your browser. A password is the safer choice.
+
 The admin login of Grafana, and later Guacamole and MeshCentral accounts, are stored in each app's own database. You
 change those in the app itself.
 
@@ -480,7 +488,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 82 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 83 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
