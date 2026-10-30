@@ -337,7 +337,7 @@ Every menu item has a CLI flag. `sudo switch-dashboard --help` lists them all.
 | | `--port-name SWITCH N NAME` | Name a port (`''` clears it) |
 | | `--tls-info`, `--tls-import CERT KEY`, `--tls-mode self-signed\|off`, `--tls-names LIST`, `--tls-regen` | HTTPS |
 | | `--http-mode off\|redirect\|on` | Plain HTTP on `HTTP_PORT` next to HTTPS (restarts) |
-| B / R | `--backup`, `--restore FILE` | Restore asks for the keyword `RESTORE` |
+| B / R | `--backup [--portable]`, `--restore FILE`, `--passphrase-file FILE` | Restore asks for the keyword `RESTORE`. See [Backup and restore](#backup-and-restore) |
 | U | `--uninstall` | Keyword `UNINSTALL`. Purging data needs a second keyword, `PURGE-DATA` |
 | T | `--dry-run` | Shows every command and file write without running them |
 | S | `--self-test`, `--app-self-test` | Installer tests (no root needed); app tests inside the built image |
@@ -393,6 +393,8 @@ Change these with the menu (Settings → 5) or `--set KEY VALUE`, then run `--ap
 | `RESTART_POLICY` | `unless-stopped` | With `no`, the web UI's **Restart now** button is disabled |
 | `MEM_LIMIT`, `LOG_MAX_SIZE`, `LOG_MAX_FILE` | `128m`, `10m`, `3` | |
 | `SECRETS_BACKEND` | `auto` | `systemd-creds` (TPM2) or `openssl` |
+| `BACKUP_FORMAT` | `host` | `host` or `portable`: what `--backup` writes when neither `--portable` nor `--host-bound` is given |
+| `BACKUP_PASSPHRASE_FILE` | empty | Root-only file with the portable-backup passphrase (first line), for unattended backups |
 
 ### Dashboard general (`ctl set general.KEY`; web Settings → General / HTTPS)
 
@@ -524,24 +526,72 @@ import. `dashboard_auth` is not imported; create users instead.
 
 ## Backup and restore
 
-`--backup` writes `BACKUP_DIR/switch-dashboard-YYYYmmdd-HHMMSS.tar.gz` (mode 0600). It contains:
+There are two backup types:
 
-- the data directory, including the config, port names, audit log and TLS certificates and keys;
-- the installer settings;
-- the vault and its key file.
+| | Host backup (default) | Portable backup |
+|---|---|---|
+| Command | `--backup` | `--backup --portable` |
+| File | `switch-dashboard-<date>.tar.gz` | `switch-dashboard-<date>.swdbak` |
+| Protected by | Nothing: keep it private | Your passphrase (AES-256-CBC, PBKDF2-SHA256, 600,000 iterations) |
+| Restores on | This host when the vault uses `systemd-creds` (TPM-bound); any host with `openssl` | **Any host**, including one with nothing installed |
+| Needs at restore | — | The passphrase |
 
-**Treat the archive like the switch passwords.**
+Both contain the data directory (switches with their encrypted passwords, users, port names, audit log, TLS
+certificates and keys) and the installer settings. A host backup also holds the vault and its key file. A portable
+backup holds the app secret key instead, inside the encrypted archive, plus a checksum list that is verified on
+restore. Nothing in a `.swdbak` file is readable without the passphrase.
 
-- **With the `systemd-creds` backend:** the vault is bound to this host/TPM, so the archive restores on this host
-  only.
-- **With the `openssl` backend:** the archive restores on any host.
+The menu (**B**) asks which type you want.
 
-`--restore FILE --confirm RESTORE`:
+```bash
+sudo switch-dashboard --backup --portable                       # prompts for a passphrase (12+ characters, twice)
+sudo switch-dashboard --backup --portable --passphrase-file /root/swdash.pass   # unattended (first line of the file)
+SWDASH_BACKUP_PASSPHRASE='...' sudo -E switch-dashboard --backup --portable      # or from the environment
+```
+
+For scheduled backups, make portable the default and store the passphrase in a root-only file:
+
+```bash
+sudo install -m 600 /dev/null /root/swdash.pass && sudo nano /root/swdash.pass
+sudo switch-dashboard --set BACKUP_FORMAT portable
+sudo switch-dashboard --set BACKUP_PASSPHRASE_FILE /root/swdash.pass
+```
+
+**Keep the passphrase somewhere other than the backups.** Without it a portable backup can't be restored.
+
+### Restore
+
+```bash
+sudo switch-dashboard --restore FILE            # or, on a new machine: sudo ./switch-dashboard-installer.sh --restore FILE
+```
+
+It asks you to type `RESTORE` (or pass `--confirm RESTORE`). The current data is kept as `DATA_DIR.pre-restore-<date>`.
+
+**Host backup:**
 
 1. checks that every path in the archive is inside `DATA_DIR` or `/etc/switch-dashboard`;
-2. stops the container;
-3. moves the current data to `DATA_DIR.pre-restore-<date>`;
-4. extracts the archive, re-owns the data, and starts the container.
+2. stops the container, moves the current data aside;
+3. extracts the archive, re-owns the data, and starts the container.
+
+**Portable backup:**
+
+1. asks for the passphrase (or uses `--passphrase-file` / `SWDASH_BACKUP_PASSPHRASE` / `BACKUP_PASSPHRASE_FILE`),
+   decrypts into a private temporary folder and verifies every file's checksum. A wrong passphrase or a damaged file
+   stops here, with nothing changed;
+2. on a machine with **no install**, takes the container settings (paths, ports, names, HTTP port) from the backup,
+   except the service account's UID/GID, the vault backend and the timezone, which are this machine's; a bind
+   address that isn't on this machine becomes `0.0.0.0`. On a machine that already has an install, its own
+   settings are kept;
+3. creates the service account if needed and restores the data, owned by this machine's service account (its UID
+   may differ from the old machine's);
+4. seals the app secret key in **this** machine's vault (TPM via `systemd-creds` where available);
+5. installs prerequisites and Docker if missing, builds the image and starts the container;
+6. if the backup came from a different host and HTTPS is self-signed, re-issues the certificate for this host. It
+   keeps your DNS names (e.g. `dash.lab.lan`), drops IP addresses that don't exist here, and adds this host's names.
+   Browsers will ask you to accept the new certificate once.
+
+Moving to a new machine is therefore: copy the installer and the `.swdbak` file across, run
+`sudo ./switch-dashboard-installer.sh --restore switch-dashboard-<date>.swdbak`, enter the passphrase.
 
 ## Uninstall
 
@@ -652,7 +702,7 @@ The installer looks for the source in this order:
 ## Testing
 
 ```bash
-./switch-dashboard-installer.sh --self-test        # installer: 34 checks
+./switch-dashboard-installer.sh --self-test        # installer: 38 checks
 sudo switch-dashboard --app-self-test              # app: 59 tests inside the built image (offline, mock switches;
                                                    # the net-snmp interop test is skipped there)
 cd app && SWDASH_SECRET_KEY=x python3 switchdash.py selftest   # same suite on the host (needs 'cryptography')
