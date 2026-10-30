@@ -3,6 +3,15 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.6.1 — 2026-10-30 — Pi-hole without a password behind the proxy
+
+### Fixed
+- With no password, Pi-hole answered `https://pihole.<domain>/` with 403 "Oops! Access denied". Since FTL v6.8, a
+  passwordless Pi-hole refuses Host names it doesn't recognise, and the proxy's name isn't one of them.
+  No-password mode now also sets `FTLCONF_webserver_domain` to the proxy name, unless `PIHOLE_EXTRA_ENV` sets it.
+- README: what that check is for, and that a password remains the safer choice.
+- Self-test: 83 checks.
+
 ## v2.6.0 — 2026-10-30 — Change the IP, view passwords, Pi-hole without a password
 
 ### Added
