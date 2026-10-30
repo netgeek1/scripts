@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.1"
+readonly SCRIPT_VERSION="2.6.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -91,7 +91,7 @@ CONF_KEYS=( DASH_TITLE DOMAIN DASH_SUBDOMAIN HOST_ADDR EXTRA_NAMES HTTP_PORT HTT
             HOST_PANEL HOST_DISK_WARN HOST_DISK_CRIT HOST_MEM_WARN HOST_MEM_CRIT HOST_LOAD_WARN HOST_LOAD_CRIT
             UPDATE_SCHEDULE UPDATE_DAY UPDATE_TIME UPDATE_PRUNE UPDATE_EXCLUDE UPDATE_DELEGATE WATCHTOWER_IMAGE
             SECRETS_BACKEND
-            APP_PIHOLE PIHOLE_IMAGE PIHOLE_SUBDOMAIN PIHOLE_WEB_PORT PIHOLE_DNS_PORT PIHOLE_LOCAL_DNS PIHOLE_EXTRA_ENV
+            APP_PIHOLE PIHOLE_IMAGE PIHOLE_SUBDOMAIN PIHOLE_WEB_PORT PIHOLE_DNS_PORT PIHOLE_LOCAL_DNS PIHOLE_EXTRA_ENV PIHOLE_NO_PASSWORD
             APP_PORTAINER PORTAINER_IMAGE PORTAINER_SUBDOMAIN PORTAINER_HTTPS_PORT PORTAINER_EDGE_PORT
             APP_MONITORING GRAFANA_IMAGE PROMETHEUS_IMAGE NODEEXP_IMAGE BLACKBOX_IMAGE SPEEDTEST_IMAGE
             GRAFANA_SUBDOMAIN PROMETHEUS_SUBDOMAIN GRAFANA_PORT PROMETHEUS_PORT NODEEXP_PORT BLACKBOX_PORT SPEEDTEST_PORT
@@ -375,6 +375,7 @@ set_default_config() {
         [PIHOLE_WEB_PORT]="8081"
         [PIHOLE_DNS_PORT]="53"
         [PIHOLE_LOCAL_DNS]="yes"
+        [PIHOLE_NO_PASSWORD]="no"
         [PIHOLE_EXTRA_ENV]="FTLCONF_dns_listeningMode=all"
         [APP_PORTAINER]="no"
         [PORTAINER_IMAGE]="portainer/portainer-ce:lts"
@@ -555,6 +556,7 @@ ensure_app_secrets() {
             secret_is_set "$k" && continue
             # an existing Pi-hole keeps the password in its pihole.toml
             [[ "$k" == PIHOLE_PASSWORD && -f "$(app_dir pihole)/etc-pihole/pihole.toml" ]] && continue
+            [[ "$k" == PIHOLE_PASSWORD && "${CFG[PIHOLE_NO_PASSWORD]}" == yes ]] && continue
             SECRETS[$k]=$(gen_password); changed=1
             log_ok "Generated $k (view it in the Secrets menu: K)"
         done
@@ -880,7 +882,11 @@ render_app_pihole() {
     [[ -n "${CFG[PIHOLE_WEB_PORT]}" ]] && printf '      - "%s:80/tcp"\n' "${CFG[PIHOLE_WEB_PORT]}"
     printf '    environment:\n      TZ: %s\n' "$(yaml_str "${CFG[TIMEZONE]}")"
     # only when we manage the password: an imported Pi-hole without one keeps its pihole.toml password
-    secret_is_set PIHOLE_PASSWORD && printf '      FTLCONF_webserver_api_password: "${PIHOLE_PASSWORD:?err}"\n'
+    if [[ "${CFG[PIHOLE_NO_PASSWORD]}" == yes ]]; then
+        printf "      FTLCONF_webserver_api_password: ''\n"        # explicitly no password (Pi-hole docs)
+    elif secret_is_set PIHOLE_PASSWORD; then
+        printf '      FTLCONF_webserver_api_password: "${PIHOLE_PASSWORD:?err}"\n'
+    fi
     local k v
     while IFS=$'\t' read -r k v; do
         [[ "$k" == TZ || "$k" == FTLCONF_webserver_api_password ]] && continue
@@ -1289,6 +1295,59 @@ dns_records() {
     render_dns_hosts | while read -r ip name; do
         printf '    Add-DnsServerResourceRecordA -ZoneName "%s" -Name "%s" -IPv4Address "%s"\n' "${CFG[DOMAIN]}" "${name%."${CFG[DOMAIN]}"}" "$ip"
     done
+    return 0
+}
+
+# ---- Changing the host's IP address -----------------------------------------
+# ip_replace OLD NEW  (stdin -> stdout): whole addresses only, so .19 never matches inside .190
+ip_replace() {
+    local o=${1//./\\.}
+    sed -E "s/(^|[^0-9.])$o([^0-9.]|$)/\1$2\2/g; s/(^|[^0-9.])$o([^0-9.]|$)/\1$2\2/g"
+}
+
+change_host_ip() {   # --change-ip NEW_IP
+    require_config; detect_network
+    local new=$1 old f n=0
+    valid_ipv4 "$new" || die "Usage: --change-ip NEW_IP (an IPv4 address)."
+    old=$(eff_host)
+    log_step "Change the host address: $old -> $new"
+    if [[ "$old" == "$new" ]]; then log_info "The names already point at $new."; return 0; fi
+    log_info "This points every name, link and the Pi-hole records at $new, then applies."
+    log_info "It does NOT change the network settings of this machine (see the checklist at the end)."
+    confirm "Continue?" y || return 0
+    # links that were written with the old address (custom links, custom apps' direct links/upstreams)
+    local -a files=("$SERVICES_FILE")
+    for f in $(custom_names); do files+=("$(custom_dir "$f")/app.conf"); done
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] && grep -q -- "$old" "$f" || continue
+        WROTE=0   # not in a pipeline: write_file must run in this shell to report WROTE
+        write_file "$f" "$(stat -c %a "$f")" "$(stat -c %U:%G "$f")" < <(ip_replace "$old" "$new" <"$f")
+        (( WROTE )) && { log_ok "Updated $f"; n=$((n + 1)); }
+        WROTE=0
+    done
+    (( n )) || log_info "No saved links contained $old."
+    CFG[HOST_ADDR]=$new; save_config
+    stack_apply
+    # files we don't own: report, never edit
+    local -a others=()
+    while IFS= read -r f; do others+=("$f"); done < <(
+        find "$STACKS_DIR" -maxdepth 4 \( -name data -o -name .restore -o -name custom \) -prune -o \
+             -type f -size -1M \( -name '*.y*ml' -o -name '*.json' -o -name '*.conf' -o -name '*.toml' -o -name '*.env' -o -name '.env' \) \
+             -print0 2>/dev/null | xargs -0 -r grep -lsF -- "$old" 2>/dev/null || true)
+    log_step "Checklist for the move to $new"
+    if [[ "$DET_IP" != "$new" ]]; then
+        log_info "1. Change this machine's address ($DET_IFACE is $DET_IP now). Debian: /etc/network/interfaces"
+        log_info "   (address $new/...), then reboot from the console, or set a DHCP reservation for its MAC."
+    else
+        log_info "1. This machine already has $new."
+    fi
+    log_info "2. Clients using Pi-hole: change the DNS server handed out by DHCP (and any static clients) to $new."
+    log_info "3. DNS records elsewhere (e.g. Active Directory): see --dns-records for the new A records."
+    log_info "4. Anything that connects here by IP: firewall rules/aliases, the OPNsense cert deployer (DOCKER_IP, known_hosts)."
+    if (( ${#others[@]} )); then
+        log_warn "These app files still mention $old (check them; not changed automatically):"
+        printf '    %s\n' "${others[@]}"
+    fi
     return 0
 }
 
@@ -3913,6 +3972,7 @@ cfg_app() {   # per-app settings
             ask_valid PIHOLE_DNS_PORT "DNS port on the host" v_port
             ask_valid PIHOLE_WEB_PORT "Direct web port on the host (- for proxy only)" v_port_opt
             ask_valid PIHOLE_LOCAL_DNS "Answer the dashboard's names itself (yes/no)" v_yesno
+            ask_valid PIHOLE_NO_PASSWORD "Web login WITHOUT a password (yes/no)" v_yesno
             ask_valid PIHOLE_EXTRA_ENV "Extra FTLCONF_* settings, K=V;K=V (- to clear)" v_kv ;;
         portainer)
             ask_valid PORTAINER_IMAGE "Image" v_image
@@ -4038,27 +4098,74 @@ menu_apps() {
     done
 }
 
+secret_state() {   # what the Secrets menu shows for NAME
+    if [[ "$1" == PIHOLE_PASSWORD && "${CFG[PIHOLE_NO_PASSWORD]}" == yes ]]; then printf 'none (login without a password)'
+    elif secret_is_set "$1"; then printf 'set'
+    elif [[ "$1" == PIHOLE_PASSWORD && -f "$(app_dir pihole)/etc-pihole/pihole.toml" ]]; then printf "%snot managed (Pi-hole's own pihole.toml password)%s" "$D" "$NC"
+    else printf '%snot set%s' "$D" "$NC"; fi
+}
+
+# secret_change NAME VALUE -- VALUE "" = generate; for PIHOLE_PASSWORD, "-" = no password at all
+secret_change() {
+    local k=$1 v=$2
+    in_list "$k" "${SECRET_KEYS[@]}" || die "Unknown secret '$k' (one of: ${SECRET_KEYS[*]})."
+    load_secrets
+    if [[ "$k" == PIHOLE_PASSWORD && "$v" == - ]]; then
+        CFG[PIHOLE_NO_PASSWORD]=yes; save_config
+        unset "SECRETS[$k]"; save_secrets
+        log_ok "Pi-hole will have no web password (takes effect on apply)"
+        return 0
+    fi
+    [[ "$v" == - ]] && die "'-' (no password) is only allowed for PIHOLE_PASSWORD."
+    v=${v:-$(gen_password)}
+    if [[ "$k" == GUAC_DB_PASSWORD ]] && docker ps -q --filter name='^guacamole-postgres$' | grep -q .; then
+        printf 'ALTER USER "%s" WITH PASSWORD :%s;\n' "${CFG[GUAC_DB_USER]}" "'pw'" | guac_psql -v pw="$v" >/dev/null \
+            || die "Could not change the password in PostgreSQL; vault not changed."
+        log_ok "PostgreSQL user password changed (apply restarts Guacamole with it)"
+    fi
+    if [[ "$k" == PIHOLE_PASSWORD && "${CFG[PIHOLE_NO_PASSWORD]}" == yes ]]; then CFG[PIHOLE_NO_PASSWORD]=no; save_config; fi
+    SECRETS[$k]=$v; save_secrets
+    case "$k" in
+        PIHOLE_PASSWORD|GUAC_DB_PASSWORD) log_info "Takes effect on the next apply (menu 5, or --apply)." ;;
+        GRAFANA_ADMIN_PASSWORD) log_info "Grafana only reads this on its first start; change an existing login in the Grafana UI." ;;
+        GVM_ADMIN_PASSWORD) log_info "Run --gvm-password to set it in Greenbone." ;;
+    esac
+}
+
+show_secret() {   # --show-secret NAME
+    local k=$1
+    in_list "$k" "${SECRET_KEYS[@]}" || die "Unknown secret '$k' (one of: ${SECRET_KEYS[*]})."
+    load_secrets
+    if [[ "$k" == PIHOLE_PASSWORD && "${CFG[PIHOLE_NO_PASSWORD]}" == yes ]]; then echo "(none: Pi-hole login has no password)"; return 0; fi
+    if secret_is_set "$k"; then printf '%s\n' "${SECRETS[$k]}"; return 0; fi
+    if [[ "$k" == PIHOLE_PASSWORD ]]; then
+        log_info "Not managed here: Pi-hole uses the password in its own pihole.toml (carried over from the old host)."
+        log_info "Reset it with:  docker exec -it pihole pihole setpassword   or set one here: --set-secret PIHOLE_PASSWORD"
+    else
+        log_info "$k is not set."
+    fi
+    return 1
+}
+
 menu_secrets() {
     ensure_config; load_secrets
     local k ch v
     while :; do
         printf '\n  %sSecrets%s  (%s)\n' "$B" "$NC" "$SECRETS_FILE"
-        for k in "${SECRET_KEYS[@]}"; do printf '   %-24s %s\n' "$k" "$(secret_is_set "$k" && echo set || echo "${D}not set${NC}")"; done
+        for k in "${SECRET_KEYS[@]}"; do printf '   %-24s %b\n' "$k" "$(secret_state "$k")"; done
         printf '\n   R) Reveal one   C) Change one   0) Back\n'
         read -rp "  Choice: " ch || return 0
         case "${ch,,}" in
             r) read -rp "  Name: " k || continue; in_list "$k" "${SECRET_KEYS[@]}" || { log_warn "Unknown"; continue; }
-               printf '  %s = %s\n' "$k" "${SECRETS[$k]:-}" ;;
+               ( show_secret "$k" ) | sed 's/^/  /' || true ;;
             c) read -rp "  Name: " k || continue; in_list "$k" "${SECRET_KEYS[@]}" || { log_warn "Unknown"; continue; }
-               log_info "Pi-hole and the Guacamole database follow the stored value; Grafana/GVM admin passwords are changed in their UI."
+               [[ "$k" == PIHOLE_PASSWORD ]] && log_info "Enter - for NO password (Pi-hole login without one)."
                read -rsp "  New value (empty = generate): " v || true; echo
-               v=${v:-$(gen_password)}
-               if [[ "$k" == GUAC_DB_PASSWORD ]] && docker ps -q --filter name='^guacamole-postgres$' | grep -q .; then
-                   printf 'ALTER USER "%s" WITH PASSWORD :%s;\n' "${CFG[GUAC_DB_USER]}" "'pw'" | guac_psql -v pw="$v" >/dev/null \
-                       || { log_error "Could not change the password in PostgreSQL; vault not changed."; continue; }
-                   log_ok "PostgreSQL user password changed (apply restarts Guacamole with it)"
-               fi
-               SECRETS[$k]=$v; save_secrets ;;
+               menu_action secret_change "$k" "$v"
+               load_config; SECRETS_LOADED=0; load_secrets     # it ran in a subshell: pick up what it saved
+               if [[ "$k" == PIHOLE_PASSWORD || "$k" == GUAC_DB_PASSWORD ]] && confirm "Apply now so it takes effect?" y; then
+                   menu_action stack_apply
+               fi ;;
             0|q) return 0 ;;
         esac
     done
@@ -4214,6 +4321,9 @@ self_test() {
     st "nginx: no domain -> no app servers" '( allcfg; CFG[DOMAIN]=""; [[ $(render_nginx | grep -c "server_name .*\.") == 0 ]] )'
     st "nginx: files on https + http"       '( allcfg; CFG[FILES_DIR]=/srv/web; c=$(render_nginx); [[ $(grep -c "location /files/ {" <<<"$c") == 2 ]] )'
     st "dashboard compose maps 8443"        '( allcfg; c=$(render_compose); [[ "$c" == *"\"8443:8443\""* && "$c" == *"external: true"* ]] && CFG[APP_GUACAMOLE]=no && [[ "$(render_compose)" != *8443* ]] )'
+    st "pihole: explicit no password"       '( allcfg; CFG[PIHOLE_NO_PASSWORD]=yes; o=$(render_app_pihole); [[ "$o" == *"FTLCONF_webserver_api_password: '"''"'"* && "$o" != *PIHOLE_PASSWORD* ]] )'
+    st "change-ip: whole addresses only"    '[[ "$(printf "%s\n" "a|b|http://10.0.0.19:8080/|x 10.0.0.190 10.0.0.19" | ip_replace 10.0.0.19 10.0.0.5)" == "a|b|http://10.0.0.5:8080/|x 10.0.0.190 10.0.0.5" ]]'
+    st "change-ip: adjacent matches"        '[[ "$(echo "10.1.1.1,10.1.1.1" | ip_replace 10.1.1.1 10.2.2.2)" == "10.2.2.2,10.2.2.2" ]]'
     st "pihole: password only if managed"   '( allcfg; [[ "$(render_app_pihole)" == *PIHOLE_PASSWORD* ]] && unset "SECRETS[PIHOLE_PASSWORD]" && [[ "$(render_app_pihole)" != *PIHOLE_PASSWORD* ]] )'
     st "pihole: extra env + no web port"    '( allcfg; CFG[PIHOLE_WEB_PORT]=""; c=$(render_app_pihole); [[ "$c" == *"FTLCONF_dns_listeningMode: \"all\""* && "$c" != *":80/tcp"* && "$c" == *"\"53:53/udp\""* ]] )'
     st "monitoring: blank port unpublished" '( allcfg; CFG[NODEEXP_PORT]=""; c=$(render_app_monitoring); [[ "$c" != *"9100\""* && "$c" == *"\"3030:3000\""* && "$c" == *"GF_SERVER_ROOT_URL: \"https://grafana.example.net/\""* ]] )'
@@ -4400,6 +4510,9 @@ Actions (default: interactive menu)
   --custom-apps              Custom apps menu (your own compose apps behind the proxy)
   --cert-refresh             Fetch / re-read the certificate and reload nginx if it changed
   --cert-fetch-key           Create (or show) the SSH key used by certificate fetch mode
+  --change-ip NEW_IP         Point every name, link and Pi-hole record at a new host address, then apply
+  --show-secret NAME         Print one stored password (e.g. PIHOLE_PASSWORD)
+  --set-secret NAME          Change one (prompted, or first line of stdin; empty = generate; - = no Pi-hole password)
   --cert-receive             Push mode: read cert chain + key (PEM) on stdin, validate, deploy (forced SSH command)
   --cert-push-setup [FILE|-] Push mode: create the push user, its forced-command key and the sudoers rule
   --gvm-password             Set the Greenbone admin password from the vault
@@ -4460,6 +4573,9 @@ main() {
             --cert-refresh)    action=certrefresh ;;
             --cert-fetch-key)  action=certkey ;;
             --cert-receive)    action=certreceive ;;
+            --change-ip)       action=changeip; arg=${2:-}; shift ;;
+            --show-secret)     action=showsecret; arg=${2:-}; shift ;;
+            --set-secret)      action=setsecret; arg=${2:-}; shift ;;
             --cert-push-setup) action=certpush; [[ -n "${2:-}" && "${2:-}" != --* ]] && { arg=$2; shift; } ;;
             --gvm-password)    action=gvmpw ;;
             --settings)        action=settings ;;
@@ -4524,6 +4640,16 @@ main() {
         certrefresh) cert_refresh ;;
         certkey)     ensure_config; cert_fetch_key ;;
         certreceive) cert_receive ;;
+        changeip)    change_host_ip "$arg" ;;
+        showsecret)  ensure_config; show_secret "$arg" ;;
+        setsecret)
+            ensure_config
+            local v=""
+            if is_tty; then
+                [[ "$arg" == PIHOLE_PASSWORD ]] && log_info "Enter - for NO password."
+                read -rsp "  New value for $arg (empty = generate): " v || true; echo
+            else IFS= read -r v || true; fi
+            secret_change "$arg" "$v" ;;
         certpush)    cert_push_setup "$arg" ;;
         gvmpw)       gvm_password ;;
         settings)    is_tty || die "Settings menu needs a terminal."; menu_settings ;;
