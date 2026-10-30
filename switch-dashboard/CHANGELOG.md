@@ -7,6 +7,24 @@ All notable changes, newest first. Two components are versioned separately:
 
 Versions follow `MAJOR.MINOR.PATCH`.
 
+## installer v2.1.0 / app v3.0.0 — 2026-10-29 — portable backups
+
+### Installer 2.1.0
+- **Portable backups** (`--backup --portable`, or `BACKUP_FORMAT=portable`): `switch-dashboard-<date>.swdbak`, the whole
+  archive encrypted with a passphrase (AES-256-CBC, PBKDF2-SHA256, 600,000 iterations). It carries the app secret key
+  instead of the host-bound vault, so it restores on any host. Includes a manifest and SHA-256 checksums.
+- **Restore onto a new machine:** `--restore FILE.swdbak` works with nothing installed. It verifies the passphrase
+  and checksums before changing anything, adopts the backup's container settings on a fresh host (minus
+  UID/GID, vault backend, timezone, and a bind address the host doesn't have), restores the data owned by this
+  host's service account, seals the key in this host's vault (TPM where available), installs Docker if needed,
+  builds and starts. From a different host, the self-signed certificate is re-issued, keeping DNS names and
+  dropping IPs that aren't on the new host.
+- Passphrase sources: prompt (12+ characters, confirmed), `--passphrase-file FILE`, `SWDASH_BACKUP_PASSPHRASE`, or
+  the new `BACKUP_PASSPHRASE_FILE` setting. The menu's Backup item asks which type.
+- Restoring a host backup whose vault is TPM-bound now warns that it only restores on its own host.
+- Fix: pruning old backups failed when one of the two backup types had no files yet.
+- Self-test: 38 checks (was 34).
+
 ## installer v2.0.0 / app v3.0.0 — 2026-10-26 — renamed to switch-dashboard, optional plain HTTP
 
 ### Renamed: hp1810-dashboard → switch-dashboard
