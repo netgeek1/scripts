@@ -3,6 +3,28 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.6.0 — 2026-10-30 — Change the IP, view passwords, Pi-hole without a password
+
+### Added
+- **`--change-ip NEW_IP`**: points every name, the page's links, the Pi-hole records and the self-signed certificate
+  at a new host address, then applies.
+  - It also rewrites the old address in custom links and in custom apps' `FALLBACK_URL`/`UPSTREAM_URL`, matching
+    whole addresses only.
+  - It ends with a checklist of what it can't change: the machine's network settings, DHCP DNS option, other DNS
+    servers, firewall rules, and the OPNsense deployer.
+  - It lists app files that still mention the old address, without editing them.
+- **`--show-secret NAME`** prints one stored password. **`--set-secret NAME`** changes one: prompted, or the first
+  line of stdin; empty generates a new one.
+- **Pi-hole with no web password**:
+  - Enter `-` for `PIHOLE_PASSWORD` (menu K → C, or `--set-secret`), or set `PIHOLE_NO_PASSWORD=yes` in Apps →
+    Pi-hole.
+  - The container gets `FTLCONF_webserver_api_password: ''`, Pi-hole's documented "no password" value, so it
+    survives restarts.
+- The Secrets screen shows `none` and `not managed` (Pi-hole's own `pihole.toml` password) states, and offers to
+  apply after a Pi-hole or Guacamole change.
+- README: how to view and change passwords, and how to change the host's IP address.
+- Self-test: 82 checks.
+
 ## v2.5.1 — 2026-10-28 — Guacamole import restore
 
 ### Fixed
