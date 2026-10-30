@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.6.0"
+readonly SCRIPT_VERSION="2.6.1"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -884,6 +884,12 @@ render_app_pihole() {
     # only when we manage the password: an imported Pi-hole without one keeps its pihole.toml password
     if [[ "${CFG[PIHOLE_NO_PASSWORD]}" == yes ]]; then
         printf "      FTLCONF_webserver_api_password: ''\n"        # explicitly no password (Pi-hole docs)
+        # Without a password, FTL (v6.8+) refuses requests whose Host it doesn't recognise (403 "Access denied").
+        # Through the proxy the Host is our name for it, so tell Pi-hole that is its web domain.
+        local wd; wd=$(fqdn "${CFG[PIHOLE_SUBDOMAIN]}")
+        if [[ -n "$wd" ]] && ! kv_pairs "${CFG[PIHOLE_EXTRA_ENV]}" | cut -f1 | grep -qx FTLCONF_webserver_domain; then
+            printf '      FTLCONF_webserver_domain: %s\n' "$(yaml_str "$wd")"
+        fi
     elif secret_is_set PIHOLE_PASSWORD; then
         printf '      FTLCONF_webserver_api_password: "${PIHOLE_PASSWORD:?err}"\n'
     fi
@@ -4322,6 +4328,7 @@ self_test() {
     st "nginx: files on https + http"       '( allcfg; CFG[FILES_DIR]=/srv/web; c=$(render_nginx); [[ $(grep -c "location /files/ {" <<<"$c") == 2 ]] )'
     st "dashboard compose maps 8443"        '( allcfg; c=$(render_compose); [[ "$c" == *"\"8443:8443\""* && "$c" == *"external: true"* ]] && CFG[APP_GUACAMOLE]=no && [[ "$(render_compose)" != *8443* ]] )'
     st "pihole: explicit no password"       '( allcfg; CFG[PIHOLE_NO_PASSWORD]=yes; o=$(render_app_pihole); [[ "$o" == *"FTLCONF_webserver_api_password: '"''"'"* && "$o" != *PIHOLE_PASSWORD* ]] )'
+    st "pihole: no password sets web domain" '( allcfg; CFG[PIHOLE_NO_PASSWORD]=yes; o=$(render_app_pihole); [[ "$o" == *"FTLCONF_webserver_domain: \"pihole.example.net\""* ]] && CFG[PIHOLE_EXTRA_ENV]="FTLCONF_webserver_domain=x.lan" && o=$(render_app_pihole) && [[ $(grep -c webserver_domain <<<"$o") == 1 && "$o" == *x.lan* ]] && CFG[PIHOLE_NO_PASSWORD]=no && [[ "$(CFG[PIHOLE_EXTRA_ENV]=; render_app_pihole)" != *webserver_domain* ]] )'
     st "change-ip: whole addresses only"    '[[ "$(printf "%s\n" "a|b|http://10.0.0.19:8080/|x 10.0.0.190 10.0.0.19" | ip_replace 10.0.0.19 10.0.0.5)" == "a|b|http://10.0.0.5:8080/|x 10.0.0.190 10.0.0.5" ]]'
     st "change-ip: adjacent matches"        '[[ "$(echo "10.1.1.1,10.1.1.1" | ip_replace 10.1.1.1 10.2.2.2)" == "10.2.2.2,10.2.2.2" ]]'
     st "pihole: password only if managed"   '( allcfg; [[ "$(render_app_pihole)" == *PIHOLE_PASSWORD* ]] && unset "SECRETS[PIHOLE_PASSWORD]" && [[ "$(render_app_pihole)" != *PIHOLE_PASSWORD* ]] )'
