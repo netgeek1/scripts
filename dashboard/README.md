@@ -28,6 +28,7 @@ scripts you `curl` onto other machines.
 - [Quick start (new host)](#quick-start-new-host)
 - [Migrating from an existing host](#migrating-from-an-existing-host)
 - [Names, DNS and certificates](#names-dns-and-certificates)
+- [Changing the host's IP address](#changing-the-hosts-ip-address)
 - [Menu and CLI](#menu-and-cli)
 - [Apps](#apps)
 - [Custom apps](#custom-apps)
@@ -203,6 +204,38 @@ DD-CERT-RECEIVE FAIL <reason>
 The exit code is 0 for OK and non-zero otherwise. Until the first push arrives, the proxy serves a temporary
 self-signed certificate. The pushed pair is kept in `/etc/docker-dashboard/certs-pushed/`.
 
+## Changing the host's IP address
+
+```bash
+sudo docker-dashboard --change-ip 192.168.0.200     # add --dry-run first to see what it would change
+```
+
+This changes everything docker-dashboard controls, then runs apply:
+
+- `HOST_ADDR`, which every name points at
+- the Pi-hole records for the dashboard's names
+- the page's links
+- the self-signed certificate, if you use one
+- any custom links and custom app direct links (`FALLBACK_URL`, `UPSTREAM_URL`) that contain the old address,
+  matched as whole addresses only, so `.19` never matches inside `.190`
+
+It does **not** change the machine's own network settings. It ends with a checklist:
+
+1. **Change the machine's address.** On Debian, edit `/etc/network/interfaces` (or set a DHCP reservation for its
+   MAC address), then reboot from the console or Hyper-V, not over SSH. You can do this before or after
+   `--change-ip`.
+2. **Point DNS clients at the new address.** If clients use Pi-hole, change the DNS server your DHCP hands out, and
+   any static clients.
+3. **Update other DNS servers.** If another server, such as Active Directory, also holds the names, update its
+   records. `--dns-records` prints the commands.
+4. **Update anything that connects by IP:** firewall rules or aliases, and the OPNsense cert deployer
+   (`DOCKER_IP`, plus `ssh-keyscan` the new address into its `known_hosts`).
+
+It also lists app files under `/opt/stacks` that still mention the old address, such as a Prometheus target. It
+doesn't edit those.
+
+Wildcard certificates (`custom`, `fetch`, `push`) don't contain the IP, so they need nothing.
+
 ## Menu and CLI
 
 | Menu | CLI | What it does |
@@ -210,7 +243,8 @@ self-signed certificate. The pushed pair is kept in `/etc/docker-dashboard/certs
 | 1 | `--install [--import FILE]` | Docker, settings, ports, (import), apps, proxy, page |
 | 2 / 3 | `--settings` / `--apps` | Settings menu / turn apps on or off and edit their images, names and ports |
 | 4 | `--services`, `--add-service`, `--remove-service`, `--detect` | Custom links on the page |
-| K | `--secrets` | View or change stored passwords |
+| K | `--secrets`, `--show-secret NAME`, `--set-secret NAME` | View or change stored passwords (see **Secrets**) |
+| — | `--change-ip NEW_IP` | Point names, links and Pi-hole records at a new host address, then apply |
 | C | `--cert-refresh`, `--cert-fetch-key`, `--cert-push-setup`, `--cert-receive` | Certificate actions |
 | 5 | `--apply` | Converge everything: compose files, proxy config, page, DNS file, timers |
 | 6 | `--update-all` | Update every running container on the host |
@@ -332,10 +366,42 @@ present) or with openssl and a root-only key file. This is the same scheme as `m
 
 | Secret | Used for | Changing it later |
 |---|---|---|
-| `PIHOLE_PASSWORD` | Pi-hole web login | Applies on the next apply. If an imported Pi-hole had no password in its environment, none is set, and the one in its `pihole.toml` stays |
+| `PIHOLE_PASSWORD` | Pi-hole web login | Applies on the next apply. If an imported Pi-hole had no password in its environment, none is set, and the one in its `pihole.toml` stays. Use `-` for no password at all |
 | `GRAFANA_ADMIN_PASSWORD` | Grafana's first start only | Change it in the Grafana UI |
 | `GUAC_DB_PASSWORD` | Guacamole's PostgreSQL user | The Secrets menu changes it in PostgreSQL too |
 | `GVM_ADMIN_PASSWORD` | Greenbone admin, via `--gvm-password` | Run `--gvm-password` again |
+
+**Viewing a password:**
+
+```bash
+sudo docker-dashboard --show-secret PIHOLE_PASSWORD     # or GRAFANA_ADMIN_PASSWORD, GUAC_DB_PASSWORD, GVM_ADMIN_PASSWORD
+```
+
+Or use the menu: **K → R** and type the name. The Secrets screen shows each one's state:
+
+- `set`: the vault holds it, and the app uses it.
+- `none (login without a password)`: Pi-hole only; its web login asks for no password.
+- `not managed`: Pi-hole only. After a migration where the old container had no password in its environment,
+  Pi-hole keeps the one in its own `pihole.toml`. Set one here to take it over, or reset it with
+  `docker exec -it pihole pihole setpassword`.
+
+**Changing a password:**
+
+```bash
+sudo docker-dashboard --set-secret PIHOLE_PASSWORD      # prompts; empty = generate a new one
+echo 'new-value' | sudo docker-dashboard --set-secret PIHOLE_PASSWORD
+sudo docker-dashboard --apply                           # Pi-hole and Guacamole pick it up on apply
+```
+
+Or use the menu: **K → C**. It offers to apply right away.
+
+**Pi-hole with no password:** enter `-` as the new value (menu or `--set-secret`), then apply. This sets
+`PIHOLE_NO_PASSWORD=yes`, and the container gets `FTLCONF_webserver_api_password: ''`, which is Pi-hole's documented
+way to turn the login off. To turn it back on, set any value. An empty password set inside the container with
+`pihole setpassword` does not survive a container restart; this setting does.
+
+The admin login of Grafana, and later Guacamole and MeshCentral accounts, are stored in each app's own database. You
+change those in the app itself.
 
 ## Settings reference
 
@@ -377,6 +443,7 @@ All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menu
 | `<APP>_SUBDOMAIN` | Name on the proxy |
 | `<APP>_*_PORT` | Direct ports. Blank = not published |
 | `PIHOLE_EXTRA_ENV`, `GRAFANA_EXTRA_ENV` | Extra settings as `K=V;K=V` |
+| `PIHOLE_NO_PASSWORD` | `yes` = Pi-hole web login without a password. Default `no` |
 | `PROMETHEUS_RETENTION`, `GRAFANA_PLUGINS` | Monitoring options |
 | `GUAC_POSTGRES_IMAGE` | Default `postgres:17`. Keep the major version once data exists |
 
@@ -413,7 +480,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 79 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 82 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
