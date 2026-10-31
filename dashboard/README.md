@@ -405,6 +405,11 @@ recognise. It answers with a 403 "Oops! Access denied" page. Through the proxy t
 no-password mode also sets `FTLCONF_webserver_domain` to that name, unless `PIHOLE_EXTRA_ENV` already sets it. The
 direct port, by IP, may still be refused; use the proxy name.
 
+The same check refuses page loads marked `Sec-Fetch-Site: same-site`. Browsers send that when you click the Pi-hole
+card on the dashboard, because both names are under the same domain. The proxy passes plain page loads (`GET`/`HEAD`)
+from sibling names to Pi-hole as `same-origin`. Every other request, including all `POST`s and anything from another
+site, reaches Pi-hole unchanged, so its protection still applies.
+
 Pi-hole added that check because, with no password, any web page opened on your network can reach Pi-hole's API
 through your browser. A password is the safer choice.
 
@@ -488,7 +493,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 83 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 84 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
