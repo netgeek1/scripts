@@ -3,6 +3,16 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.6.2 — 2026-10-31 — Pi-hole card click without a password
+
+### Fixed
+- With no password, clicking the Pi-hole card gave 403 "Oops! Access denied", while typing the address worked.
+  - **Cause:** a click from `dashboard.<domain>` arrives marked `Sec-Fetch-Site: same-site`, and a passwordless
+    Pi-hole (FTL v6.8+) refuses that.
+  - **Fix:** the Pi-hole proxy now passes `GET`/`HEAD` page loads marked `same-site` as `same-origin`. `POST`s,
+    cross-site requests and everything else reach Pi-hole unchanged. Verified with a header-echo upstream.
+- Self-test: 84 checks.
+
 ## v2.6.1 — 2026-10-30 — Pi-hole without a password behind the proxy
 
 ### Fixed
