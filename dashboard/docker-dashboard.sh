@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.6.1"
+readonly SCRIPT_VERSION="2.6.2"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1919,6 +1919,7 @@ render_proxy_location() {
     printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
     printf '        proxy_set_header X-Forwarded-Proto https;\n'
     printf '        proxy_set_header X-Forwarded-Host $host;\n'
+    [[ "$flags" == *,admin,* ]] && printf '        proxy_set_header Sec-Fetch-Site $dd_fetch_site;\n'
     if [[ "$flags" == *,ws,* ]]; then
         printf '        proxy_set_header Upgrade $http_upgrade;\n'
         printf '        proxy_set_header Connection $connection_upgrade;\n'
@@ -1936,7 +1937,10 @@ render_nginx() {
     printf '# Managed by %s v%s -- regenerated on every apply.\n\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
     printf '# Docker DNS: upstreams resolve per request, so a stopped app gives 502 instead of breaking nginx\n'
     printf 'resolver 127.0.0.11 valid=10s ipv6=off;\n'
-    printf 'map $http_upgrade $connection_upgrade { default upgrade; "" close; }\n\n'
+    printf 'map $http_upgrade $connection_upgrade { default upgrade; "" close; }\n'
+    # Pi-hole without a password refuses navigations marked "same-site", e.g. a click on its card here.
+    # Plain page loads (GET/HEAD) from our sibling names are passed on as same-origin; anything else is untouched.
+    printf 'map "$request_method:$http_sec_fetch_site" $dd_fetch_site { "~^(GET|HEAD):same-site$" same-origin; default $http_sec_fetch_site; }\n\n'
     printf 'server {\n    listen 80 default_server;\n    server_name _;\n    server_tokens off;\n'
     printf '    location ~ /\\. { return 404; }\n'
     if [[ -n "${CFG[FILES_DIR]}" && "${CFG[FILES_HTTP]}" == yes ]]; then
@@ -4319,6 +4323,7 @@ self_test() {
     st "endpoint url: domain vs fallback"   '( allcfg; [[ "$(endpoint_url grafana http://x:3030/)" == https://grafana.example.net/ ]] && CFG[DOMAIN]="" && [[ "$(endpoint_url grafana http://x:3030/)" == http://x:3030/ ]] )'
     st "https port kept in links"           '( allcfg; CFG[HTTPS_PORT]=8444; [[ "$(dashboard_url)" == https://dashboard.example.net:8444/ ]] )'
     st "nginx: one server per endpoint"     '( allcfg; c=$(render_nginx); [[ $(grep -c "server_name .*\.example\.net;" <<<"$c") == 6 ]] )'
+    st "nginx: pihole card clicks pass"     '( allcfg; c=$(render_nginx); p=$(sed -n "/server_name pihole/,/^}/p" <<<"$c"); g=$(sed -n "/server_name grafana/,/^}/p" <<<"$c"); [[ "$c" == *"map \"\$request_method:\$http_sec_fetch_site\" \$dd_fetch_site"* && "$p" == *"Sec-Fetch-Site \$dd_fetch_site"* && "$g" != *Sec-Fetch-Site* ]] )'
     st "nginx: pihole / -> /admin/"         '( allcfg; c=$(render_nginx | sed -n "/server_name pihole/,/^}/p"); [[ "$c" == *"location = / { return 302 /admin/; }"* ]] )'
     st "nginx: tls upstream + websockets"   '( allcfg; c=$(render_nginx | sed -n "/server_name portainer/,/^}/p"); [[ "$c" == *"proxy_ssl_verify off"* && "$c" == *"Connection \$connection_upgrade"* && "$c" == *"client_max_body_size 0"* ]] )'
     st "nginx: guacamole legacy port"       '( allcfg; c=$(render_nginx); [[ "$c" == *"listen 8443 ssl;"* ]] && CFG[GUACAMOLE_TLS_PORT]=""; c=$(render_nginx); [[ "$c" != *"listen 8443"* ]] )'
