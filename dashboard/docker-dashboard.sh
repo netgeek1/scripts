@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.6.5"
+readonly SCRIPT_VERSION="2.6.6"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -3063,13 +3063,22 @@ running_containers() {
 # content gets a new ID, so comparing IDs alone reports updates that change nothing.
 image_content() { docker image inspect -f '{{json .RootFS.Layers}}{{json .Config}}' "$1" 2>/dev/null | sha256sum | cut -c1-32; }
 
-# image_differs CONTAINER_IMAGE_ID TAG -> true only when the tag's image really differs from the one running
+# image_differs CONTAINER_IMAGE_ID TAG [CONTAINER] -> true only when the tag's image really differs from the one running
 image_differs() {
-    local id=$1 tag=$2 newid a b
+    local id=$1 tag=$2 ctr=${3:-} newid a b empty tc ic
     newid=$(docker image inspect -f '{{.Id}}' "$tag" 2>/dev/null || true)
     [[ -n "$newid" && "$newid" != "$id" ]] || return 1
+    empty=$(printf '' | sha256sum | cut -c1-32)
     a=$(image_content "$id"); b=$(image_content "$tag")
-    [[ -z "$a" || "$a" == "$(printf '' | sha256sum | cut -c1-32)" || "$a" != "$b" ]]   # can't inspect the old one: assume it differs
+    if [[ -n "$a" && "$a" != "$empty" ]]; then [[ "$a" != "$b" ]]; return; fi
+    # The running image can't be looked up by the ID the container recorded. With the containerd store that is
+    # normal for local builds (the container keeps a digest the image list doesn't answer to), so fall back to time:
+    # a tag image built after the container was created is newer; one built before it is what the container runs.
+    [[ -n "$ctr" ]] || return 0
+    tc=$(date -d "$(docker inspect -f '{{.Created}}' "$ctr" 2>/dev/null)" +%s 2>/dev/null || echo 0)
+    ic=$(date -d "$(docker image inspect -f '{{.Created}}' "$tag" 2>/dev/null)" +%s 2>/dev/null || echo 0)
+    (( tc == 0 || ic == 0 )) && return 0
+    (( ic > tc ))
 }
 
 snapshot_images() { running_containers | awk -F"$US" '{print $1 "\t" $3}' | LC_ALL=C sort; }
@@ -3090,7 +3099,7 @@ check_updates() {
         if (( ! DRY_RUN )) && [[ -z "${pulled[$img]:-}" ]]; then
             if docker pull -q "$img" >/dev/null 2>&1; then pulled[$img]=ok; else pulled[$img]=fail; fi
         fi
-        if image_differs "$id" "$img"; then
+        if image_differs "$id" "$img" "$name"; then
             printf '  %-28s %-44s %s\n' "$name" "${img:0:44}" "${Y}UPDATE AVAILABLE${NC}$( [[ "${pulled[$img]:-}" == fail ]] && echo ' (newer local image)')"
             avail=$((avail + 1))
         elif [[ "${pulled[$img]:-}" == fail ]]; then
@@ -4340,6 +4349,8 @@ self_test() {
     st "updates: same content, new ID = current" '( docker() { case "$*" in *"{{.Id}} t") echo sha256:new ;; *"RootFS"*" sha256:old") echo L1 ;; *"RootFS"*" t") echo L1 ;; esac; }; ! image_differs sha256:old t )'
     st "updates: new content = update"      '( docker() { case "$*" in *"{{.Id}} t") echo sha256:new ;; *"RootFS"*" sha256:old") echo L1 ;; *"RootFS"*" t") echo L2 ;; esac; }; image_differs sha256:old t )'
     st "updates: old image gone = update"   '( docker() { case "$*" in *"{{.Id}} t") echo sha256:new ;; *"RootFS"*" t") echo L2 ;; *) return 1 ;; esac; }; image_differs sha256:old t )'
+    st "updates: old gone, tag older = current" '( docker() { case "$*" in *"{{.Id}} t") echo sha256:new ;; *"{{.Created}} c") echo 2026-10-30T03:18:06Z ;; *"{{.Created}} t") echo 2026-10-30T03:17:57Z ;; *) return 1 ;; esac; }; ! image_differs sha256:old t c )'
+    st "updates: old gone, tag newer = update"  '( docker() { case "$*" in *"{{.Id}} t") echo sha256:new ;; *"{{.Created}} c") echo 2026-10-30T03:18:06Z ;; *"{{.Created}} t") echo 2026-11-01T10:00:00Z ;; *) return 1 ;; esac; }; image_differs sha256:old t c )'
     st "updates: same ID = current"         '( docker() { case "$*" in *"{{.Id}} t") echo sha256:old ;; esac; }; ! image_differs sha256:old t )'
     st "nginx: pihole card clicks pass"     '( allcfg; c=$(render_nginx); p=$(sed -n "/server_name pihole/,/^}/p" <<<"$c"); g=$(sed -n "/server_name grafana/,/^}/p" <<<"$c"); [[ "$c" == *"map \"\$request_method:\$http_sec_fetch_site\" \$dd_fetch_site"* && "$p" == *"Sec-Fetch-Site \$dd_fetch_site"* && "$g" != *Sec-Fetch-Site* ]] )'
     st "nginx: pihole / -> /admin/"         '( allcfg; c=$(render_nginx | sed -n "/server_name pihole/,/^}/p"); [[ "$c" == *"location = / { return 302 /admin/; }"* ]] )'
