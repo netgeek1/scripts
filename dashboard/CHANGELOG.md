@@ -3,6 +3,14 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.6.3 — 2026-11-01 — Change IP from the menu
+
+### Added
+- Main menu **P**: change the host IP address. This is the same as `--change-ip`. The menu shows where the names
+  point now and the machine's current address.
+- Settings → Page points to **P** when you're moving the host, since editing `HOST_ADDR` there doesn't rewrite saved
+  links.
+
 ## v2.6.2 — 2026-10-31 — Pi-hole card click without a password
 
 ### Fixed
