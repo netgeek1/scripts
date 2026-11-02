@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.6.2"
+readonly SCRIPT_VERSION="2.6.3"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -3896,6 +3896,7 @@ cfg_page() {
     ask_valid DOMAIN "Domain for app names, e.g. example.net -> grafana.example.net (- for none: links use ports)" v_domain_opt
     [[ -n "${CFG[DOMAIN]}" ]] && ask_valid DASH_SUBDOMAIN "Dashboard name (-> $(fqdn "${CFG[DASH_SUBDOMAIN]}"))" v_sub
     detect_network
+    log_info "Moving this host to a new IP? Use P in the main menu instead: it also rewrites saved links."
     ask_valid HOST_ADDR "Address the names point at (auto = $DET_IP; set the FINAL IP if this host will move)" v_host
     ask_valid TIMEZONE "Time zone for the apps" v_tz
 }
@@ -4459,6 +4460,7 @@ main_menu() {
         show_banner
         printf '\n  %sSetup%s\n' "$B" "$NC"
         printf '   1) Full install / reconfigure   2) Settings   3) Apps   4) Links (custom)   K) Secrets   C) Certificate\n'
+        printf '   P) Change the host IP address  (names, links, Pi-hole records; then apply)\n'
         printf '  %sOperate%s\n' "$B" "$NC"
         printf '   5) Apply everything             (render, validate, start)\n'
         printf '   6) Update ALL containers        (apps, compose projects, docker-run containers)\n'
@@ -4476,6 +4478,12 @@ main_menu() {
             4) menu_services; continue ;;
             k) menu_secrets; continue ;;
             c) menu_cert ;;
+            p) local ip; detect_network; ensure_config
+               log_info "Names currently point at $(eff_host); this machine has ${DET_IP:-?} on ${DET_IFACE:-?}."
+               read -rp "  New IP address (empty = cancel): " ip || continue
+               [[ -n "$ip" ]] || continue
+               menu_action change_host_ip "$ip"
+               load_config ;;   # it ran in a subshell: pick up the saved HOST_ADDR
             5) menu_action stack_apply ;;
             6) menu_action update_all ;;
             7) menu_action check_updates ;;
