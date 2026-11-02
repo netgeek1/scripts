@@ -210,6 +210,8 @@ self-signed certificate. The pushed pair is kept in `/etc/docker-dashboard/certs
 sudo docker-dashboard --change-ip 192.168.0.200     # add --dry-run first to see what it would change
 ```
 
+Or in the menu: **P**. It shows the current address and asks for the new one.
+
 This changes everything docker-dashboard controls, then runs apply:
 
 - `HOST_ADDR`, which every name points at
@@ -244,7 +246,7 @@ Wildcard certificates (`custom`, `fetch`, `push`) don't contain the IP, so they 
 | 2 / 3 | `--settings` / `--apps` | Settings menu / turn apps on or off and edit their images, names and ports |
 | 4 | `--services`, `--add-service`, `--remove-service`, `--detect` | Custom links on the page |
 | K | `--secrets`, `--show-secret NAME`, `--set-secret NAME` | View or change stored passwords (see **Secrets**) |
-| — | `--change-ip NEW_IP` | Point names, links and Pi-hole records at a new host address, then apply |
+| P | `--change-ip NEW_IP` | Point names, links and Pi-hole records at a new host address, then apply |
 | C | `--cert-refresh`, `--cert-fetch-key`, `--cert-push-setup`, `--cert-receive` | Certificate actions |
 | 5 | `--apply` | Converge everything: compose files, proxy config, page, DNS file, timers |
 | 6 | `--update-all` | Update every running container on the host |
