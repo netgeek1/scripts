@@ -3,6 +3,17 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.6.6 — 2026-11-01 — Locally built images in the update check
+
+### Fixed
+- A custom app built on this host (e.g. `switch-dashboard:3.0.0`) showed `UPDATE AVAILABLE (newer local image)`
+  while it was running that very build.
+  - **Cause:** with the containerd store, the container records a digest of a local build that `docker image
+    inspect` doesn't answer to, so there was nothing to compare and the check assumed a change.
+  - **Fix:** in that case the check compares times. If the tag's image was built after the container was created,
+    it reports an update; if it was built before, the container is running it.
+- Self-test: 90 checks.
+
 ## v2.6.5 — 2026-11-01 — False "UPDATE AVAILABLE" with the containerd image store
 
 ### Fixed
