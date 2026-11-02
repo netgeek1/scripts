@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.6.3"
+readonly SCRIPT_VERSION="2.6.5"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -3058,13 +3058,27 @@ running_containers() {
     docker ps -q | xargs -r docker inspect -f "$fmt" | sed 's#^/##; s#<no value>##g'
 }
 
+# image_content IMAGE -> fingerprint of what actually runs: layers + config. With the containerd image store the same
+# image can be known by several IDs (index digest, platform manifest digest), and a re-pushed index with identical
+# content gets a new ID, so comparing IDs alone reports updates that change nothing.
+image_content() { docker image inspect -f '{{json .RootFS.Layers}}{{json .Config}}' "$1" 2>/dev/null | sha256sum | cut -c1-32; }
+
+# image_differs CONTAINER_IMAGE_ID TAG -> true only when the tag's image really differs from the one running
+image_differs() {
+    local id=$1 tag=$2 newid a b
+    newid=$(docker image inspect -f '{{.Id}}' "$tag" 2>/dev/null || true)
+    [[ -n "$newid" && "$newid" != "$id" ]] || return 1
+    a=$(image_content "$id"); b=$(image_content "$tag")
+    [[ -z "$a" || "$a" == "$(printf '' | sha256sum | cut -c1-32)" || "$a" != "$b" ]]   # can't inspect the old one: assume it differs
+}
+
 snapshot_images() { running_containers | awk -F"$US" '{print $1 "\t" $3}' | LC_ALL=C sort; }
 
 check_updates() {
     require_config
     docker_up || die "Docker is not running."
     log_step "Check for image updates$( ((DRY_RUN)) && echo ' (dry-run: local images only, no pull)')"
-    local name img id proj autorm newid n=0 avail=0
+    local name img id proj autorm n=0 avail=0
     local -A pulled=()
     printf '  %-28s %-44s %s\n' CONTAINER IMAGE STATUS
     while IFS=$US read -r name img id proj autorm _ _; do
@@ -3076,8 +3090,7 @@ check_updates() {
         if (( ! DRY_RUN )) && [[ -z "${pulled[$img]:-}" ]]; then
             if docker pull -q "$img" >/dev/null 2>&1; then pulled[$img]=ok; else pulled[$img]=fail; fi
         fi
-        newid=$(docker image inspect -f '{{.Id}}' "$img" 2>/dev/null || true)
-        if [[ -n "$newid" && "$newid" != "$id" ]]; then
+        if image_differs "$id" "$img"; then
             printf '  %-28s %-44s %s\n' "$name" "${img:0:44}" "${Y}UPDATE AVAILABLE${NC}$( [[ "${pulled[$img]:-}" == fail ]] && echo ' (newer local image)')"
             avail=$((avail + 1))
         elif [[ "${pulled[$img]:-}" == fail ]]; then
@@ -3088,7 +3101,7 @@ check_updates() {
     done < <(running_containers | sort)
     echo
     log_info "$n running container(s), $avail with a newer image$( ((DRY_RUN)) && echo ' already pulled')."
-    (( avail )) && log_info "Apply with menu 5 / --update-all (images are already downloaded)."
+    (( avail )) && log_info "Install them with menu 6 (Update ALL containers) or --update-all; the images are already downloaded."
     return 0
 }
 
@@ -4324,6 +4337,10 @@ self_test() {
     st "endpoint url: domain vs fallback"   '( allcfg; [[ "$(endpoint_url grafana http://x:3030/)" == https://grafana.example.net/ ]] && CFG[DOMAIN]="" && [[ "$(endpoint_url grafana http://x:3030/)" == http://x:3030/ ]] )'
     st "https port kept in links"           '( allcfg; CFG[HTTPS_PORT]=8444; [[ "$(dashboard_url)" == https://dashboard.example.net:8444/ ]] )'
     st "nginx: one server per endpoint"     '( allcfg; c=$(render_nginx); [[ $(grep -c "server_name .*\.example\.net;" <<<"$c") == 6 ]] )'
+    st "updates: same content, new ID = current" '( docker() { case "$*" in *"{{.Id}} t") echo sha256:new ;; *"RootFS"*" sha256:old") echo L1 ;; *"RootFS"*" t") echo L1 ;; esac; }; ! image_differs sha256:old t )'
+    st "updates: new content = update"      '( docker() { case "$*" in *"{{.Id}} t") echo sha256:new ;; *"RootFS"*" sha256:old") echo L1 ;; *"RootFS"*" t") echo L2 ;; esac; }; image_differs sha256:old t )'
+    st "updates: old image gone = update"   '( docker() { case "$*" in *"{{.Id}} t") echo sha256:new ;; *"RootFS"*" t") echo L2 ;; *) return 1 ;; esac; }; image_differs sha256:old t )'
+    st "updates: same ID = current"         '( docker() { case "$*" in *"{{.Id}} t") echo sha256:old ;; esac; }; ! image_differs sha256:old t )'
     st "nginx: pihole card clicks pass"     '( allcfg; c=$(render_nginx); p=$(sed -n "/server_name pihole/,/^}/p" <<<"$c"); g=$(sed -n "/server_name grafana/,/^}/p" <<<"$c"); [[ "$c" == *"map \"\$request_method:\$http_sec_fetch_site\" \$dd_fetch_site"* && "$p" == *"Sec-Fetch-Site \$dd_fetch_site"* && "$g" != *Sec-Fetch-Site* ]] )'
     st "nginx: pihole / -> /admin/"         '( allcfg; c=$(render_nginx | sed -n "/server_name pihole/,/^}/p"); [[ "$c" == *"location = / { return 302 /admin/; }"* ]] )'
     st "nginx: tls upstream + websockets"   '( allcfg; c=$(render_nginx | sed -n "/server_name portainer/,/^}/p"); [[ "$c" == *"proxy_ssl_verify off"* && "$c" == *"Connection \$connection_upgrade"* && "$c" == *"client_max_body_size 0"* ]] )'
