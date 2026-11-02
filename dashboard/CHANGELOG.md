@@ -3,6 +3,24 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.6.5 — 2026-11-01 — False "UPDATE AVAILABLE" with the containerd image store
+
+### Fixed
+- "Check for updates" kept reporting `UPDATE AVAILABLE` for some containers, such as `nginx:stable-alpine` and
+  `postgres:17`, even right after update-all. Docker Compose correctly left them running.
+  - **Cause:** with the containerd image store (the Docker 29 default), an image can be known by several IDs. A tag
+    whose index was re-pushed upstream gets a new ID, even when the image for your platform is byte-for-byte the
+    same. Seen on Engine 29.9.2 / Compose v5.6.1: the IDs differed, but the layers were identical.
+  - **Fix:** when the IDs differ, the check now compares what actually runs (layers + image config). It reports an
+    update only when those differ, or when the old image can no longer be inspected.
+- Self-test: 88 checks.
+
+## v2.6.4 — 2026-11-01 — Update hint
+
+### Fixed
+- After it finds newer images, "Check for updates" now points to menu 6 (Update ALL containers). It used to say
+  menu 5, which is Apply.
+
 ## v2.6.3 — 2026-11-01 — Change IP from the menu
 
 ### Added
