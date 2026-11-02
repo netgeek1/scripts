@@ -1,341 +1,528 @@
-# Changelog
+# docker-dashboard
 
-All notable changes to **docker-dashboard.sh**. Newest first.
-`SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
+An all-in-one, menu-driven installer for a self-hosted Docker host. It runs your apps behind one HTTPS reverse proxy
+with a landing page, keeps them updated, and moves them from an old host to a new one.
 
-## v2.6.5 — 2026-11-01 — False "UPDATE AVAILABLE" with the containerd image store
+| App | What you get |
+|---|---|
+| **Pi-hole** | DNS filtering. It also answers the proxy's own names locally |
+| **Portainer CE** | Container management |
+| **Internet monitoring** | Grafana, Prometheus, speedtest, ping (blackbox) and node exporters — the [geerlingguy/internet-pi](https://github.com/geerlingguy/internet-pi) stack |
+| **Guacamole** | Clientless remote desktop with PostgreSQL. Schema upgrades are applied for you |
+| **MeshCentral** | Remote device management |
+| **Greenbone / OpenVAS** *(optional, off)* | Vulnerability scanning, using Greenbone's own compose file |
 
-### Fixed
-- "Check for updates" kept reporting `UPDATE AVAILABLE` for some containers, such as `nginx:stable-alpine` and
-  `postgres:17`, even right after update-all. Docker Compose correctly left them running.
-  - **Cause:** with the containerd image store (the Docker 29 default), an image can be known by several IDs. A tag
-    whose index was re-pushed upstream gets a new ID, even when the image for your platform is byte-for-byte the
-    same. Seen on Engine 29.9.2 / Compose v5.6.1: the IDs differed, but the layers were identical.
-  - **Fix:** when the IDs differ, the check now compares what actually runs (layers + image config). It reports an
-    update only when those differ, or when the old image can no longer be inspected.
-- Self-test: 88 checks.
+Every app gets its own name, such as `https://grafana.example.net`, with one certificate (a wildcard or
+self-signed). Its original port can stay published as a fallback.
 
-## v2.6.4 — 2026-11-01 — Update hint
+The landing page shows a live up/down dot for each app, your own extra links, and an optional `/files/` share for
+scripts you `curl` onto other machines.
 
-### Fixed
-- After it finds newer images, "Check for updates" now points to menu 6 (Update ALL containers). It used to say
-  menu 5, which is Apply.
+> Version: see `SCRIPT_VERSION` in the script. History: [CHANGELOG.md](CHANGELOG.md).
 
-## v2.6.3 — 2026-11-01 — Change IP from the menu
+---
 
-### Added
-- Main menu **P**: change the host IP address. This is the same as `--change-ip`. The menu shows where the names
-  point now and the machine's current address.
-- Settings → Page points to **P** when you're moving the host, since editing `HOST_ADDR` there doesn't rewrite saved
-  links.
+## Contents
 
-## v2.6.2 — 2026-10-31 — Pi-hole card click without a password
+- [Requirements](#requirements)
+- [Quick start (new host)](#quick-start-new-host)
+- [Migrating from an existing host](#migrating-from-an-existing-host)
+- [Names, DNS and certificates](#names-dns-and-certificates)
+- [Changing the host's IP address](#changing-the-hosts-ip-address)
+- [Menu and CLI](#menu-and-cli)
+- [Apps](#apps)
+- [Custom apps](#custom-apps)
+- [Host health](#host-health)
+- [Updating containers](#updating-containers)
+- [Secrets](#secrets)
+- [Settings reference](#settings-reference)
+- [Files and paths](#files-and-paths)
+- [Uninstall](#uninstall)
+- [Testing](#testing)
 
-### Fixed
-- With no password, clicking the Pi-hole card gave 403 "Oops! Access denied", while typing the address worked.
-  - **Cause:** a click from `dashboard.<domain>` arrives marked `Sec-Fetch-Site: same-site`, and a passwordless
-    Pi-hole (FTL v6.8+) refuses that.
-  - **Fix:** the Pi-hole proxy now passes `GET`/`HEAD` page loads marked `same-site` as `same-origin`. `POST`s,
-    cross-site requests and everything else reach Pi-hole unchanged. Verified with a header-echo upstream.
-- Self-test: 84 checks.
+---
 
-## v2.6.1 — 2026-10-30 — Pi-hole without a password behind the proxy
+## Requirements
 
-### Fixed
-- With no password, Pi-hole answered `https://pihole.<domain>/` with 403 "Oops! Access denied". Since FTL v6.8, a
-  passwordless Pi-hole refuses Host names it doesn't recognise, and the proxy's name isn't one of them.
-  No-password mode now also sets `FTLCONF_webserver_domain` to the proxy name, unless `PIHOLE_EXTRA_ENV` sets it.
-- README: what that check is for, and that a password remains the safer choice.
-- Self-test: 83 checks.
+| | |
+|---|---|
+| OS | Debian 12/13 or Ubuntu 22.04/24.04 (amd64 / arm64) with systemd |
+| Access | root. The script re-runs itself through `sudo` |
+| Docker | Installed for you if missing (Docker CE + compose plugin from download.docker.com) |
+| Network | The image registries (docker.io, ghcr.io, and registry.community.greenbone.net for GVM), plus github.com for first-run defaults |
+| Ports | 80/443 for the proxy, 53 for Pi-hole, and each app's fallback port if you keep it |
 
-## v2.6.0 — 2026-10-30 — Change the IP, view passwords, Pi-hole without a password
+The install prepares the host before writing anything:
 
-### Added
-- **`--change-ip NEW_IP`**: points every name, the page's links, the Pi-hole records and the self-signed certificate
-  at a new host address, then applies.
-  - It also rewrites the old address in custom links and in custom apps' `FALLBACK_URL`/`UPSTREAM_URL`, matching
-    whole addresses only.
-  - It ends with a checklist of what it can't change: the machine's network settings, DHCP DNS option, other DNS
-    servers, firewall rules, and the OPNsense deployer.
-  - It lists app files that still mention the old address, without editing them.
-- **`--show-secret NAME`** prints one stored password. **`--set-secret NAME`** changes one: prompted, or the first
-  line of stdin; empty generates a new one.
-- **Pi-hole with no web password**:
-  - Enter `-` for `PIHOLE_PASSWORD` (menu K → C, or `--set-secret`), or set `PIHOLE_NO_PASSWORD=yes` in Apps →
-    Pi-hole.
-  - The container gets `FTLCONF_webserver_api_password: ''`, Pi-hole's documented "no password" value, so it
-    survives restarts.
-- The Secrets screen shows `none` and `not managed` (Pi-hole's own `pihole.toml` password) states, and offers to
-  apply after a Pi-hole or Guacamole change.
-- README: how to view and change passwords, and how to change the host's IP address.
-- Self-test: 82 checks.
+- **Base packages:** installs any that are missing.
+- **Checks:** disk, RAM, NTP, a DHCP-leased address on the DNS server, host DNS, and Docker Hub reachability.
+- **Port 53:** if `systemd-resolved` holds it and Pi-hole is enabled, it turns off only resolved's stub listener,
+  after asking first. The host keeps resolving through the upstream servers resolved already uses. The change is
+  rolled back if host DNS stops working, and undone on uninstall.
 
-## v2.5.1 — 2026-10-28 — Guacamole import restore
+## Quick start (new host)
 
-### Fixed
-- An import could fail with `pg_restore: type "guacamole_connection_group_type" already exists`, or worse, skip the
-  imported database without failing and start Guacamole with the stock schema. There were two causes:
-  - An `init/initdb.sql`, left by an earlier fresh install or attempt, was still in the folder. PostgreSQL runs it
-    on first start, so the stock schema was created alongside the restore.
-  - The readiness check asked over the socket. While the postgres entrypoint runs the init scripts, its temporary
-    server answers only there, so the restore started in the middle of that run.
-- With a dump pending and no database yet, `init/initdb.sql` is now set aside (to `.restore/initdb.sql.not-used`).
-- Readiness is now checked over TCP, which only the real server answers.
-- If the database holds only a stock or half-restored schema (no connections, no connection groups, no users other
-  than `guacadmin`), it is cleared before the restore. A database with real data is still never overwritten.
-- `pg_restore` runs in a single transaction, so a failure leaves an empty database and the next run can simply retry.
+```bash
+chmod +x docker-dashboard.sh
+sudo ./docker-dashboard.sh          # menu -> 1) Full install
+```
 
-## v2.5.0 — 2026-10-28 — Certificate push mode
+The install runs in this order:
 
-### Added
-- **`CERT_MODE=push`**: another machine pushes the certificate over SSH when it renews, such as the OPNsense
-  `install_wildcard_cert_api.sh` deployer. Unlike `fetch`, the new certificate is live within seconds, and the
-  pushing side gets a pass/fail answer.
-  - `--cert-receive` reads the chain and key (PEM) on stdin, validates them like every other mode, stores them in
-    `/etc/docker-dashboard/certs-pushed/`, reloads nginx and waits until the proxy serves the new certificate.
-    The last line is machine-readable: `DD-CERT-RECEIVE OK changed|unchanged sha256=… notafter=… live=yes|no`, or
-    `DD-CERT-RECEIVE FAIL <reason>`.
-  - The read is capped (64 KB, 30 s), so a stalled or wrong client can't hold the lock. A push waits up to 5 minutes
-    for a running menu or apply instead of failing.
-  - `--cert-push-setup [PUBKEY_FILE|-]` (Certificate menu → 4) creates the push user (`CERT_PUSH_USER`, default
-    `ddcertpush`), an `authorized_keys` line restricted to that one command (`restrict`, optional `from=` from
-    `CERT_PUSH_FROM`), and a sudoers rule for that exact command, checked with `visudo`.
-  - Until the first push, the proxy serves a temporary self-signed certificate.
-- Self-test: 79 checks.
+1. It installs Docker.
+2. It walks through the settings: domain, apps, certificate, file share, updates and paths. Each prompt shows the
+   current value, so Enter accepts it.
+3. It prepares the host: base packages, the checks above, and freeing port 53 for Pi-hole. Then it checks every
+   port the apps need.
+4. It brings everything up.
+5. It prints the DNS records to create.
 
-### Fixed
-- A new certificate could stay unserved after `--apply`. Apply skipped the nginx reload whenever it rewrote the
-  compose file, on the assumption that compose would recreate the container. A rewrite that compose sees as no
-  change leaves the old container running with the old certificate. Apply now compares the container ID before and
-  after, and reloads whenever it's the same container.
-- `--cert-refresh` trusted its own record of the last reload. It now asks the proxy which certificate it is serving,
-  so a missed reload is repaired by the next refresh.
+Afterwards the tool is installed as `sudo docker-dashboard`.
 
-### Notes
-- The push user's password field is `*`, not `!`. With `UsePAM no`, sshd refuses key logins to `!` (locked) accounts.
+First-run defaults for a fresh install:
 
-## v2.4.1 — 2026-10-26 — Speedtest health check
+| App | Default |
+|---|---|
+| Pi-hole, Grafana, Guacamole DB | Passwords are generated and stored in the vault (see **Secrets**) |
+| Guacamole | Starts with `guacadmin` / `guacadmin`. Change it at first login |
+| Internet monitoring | Upstream's dashboards and blackbox config. Ping targets are in `/opt/stacks/monitoring/prometheus/pinghosts.yaml` |
+| MeshCentral | A `config.json` is written so agents connect to `meshcentral.<domain>:<MeshCentral port>`. Create your admin account first, then set `NewAccounts` to `false` |
 
-### Fixed
-- The speedtest exporter showed `unhealthy` while working. Its image checks `http://localhost:9798/`, but the
-  exporter listens on IPv4 only, so the check fails wherever `localhost` resolves to `::1` first. The monitoring app
-  now probes `http://127.0.0.1:9798/`; a stopped or broken exporter still fails the check.
-- Self-test: 73 checks.
+## Migrating from an existing host
 
-## v2.4.0 — 2026-10-26 — Add any running container
+Export runs on the **old** host and needs only `bash`, `docker`, `tar` and `openssl`. It works on old Docker 20.10
+hosts with `docker-compose` v1. Import runs on the **new** host as part of the install.
 
-### Added
-- **Add a container that's already running** (Apps → C → D): lists every running container that docker-dashboard
-  doesn't run or proxy yet, from any folder, compose or `docker run`. The menu shows them as "running, not added".
-  - The chosen one is set up as started by its own script. Its folder under `custom/` holds only an `app.conf`, and
-    its files stay where they are.
-  - The container port and HTTPS are pre-filled from the container.
-- `CONTAINER` in `app.conf` lets you proxy a single `docker run` container instead of a compose project.
-- Self-test: 72 checks.
+```bash
+# old host -- stops each app briefly for a consistent copy, then starts it again
+sudo ./docker-dashboard.sh --export                 # asks for a passphrase; writes ~/docker-dashboard-export-<host>-<date>.tar.gz.enc
 
-### Fixed
-- Update-all warned about a custom app started by its own script a second time, in the compose-project pass.
-  `producer | grep -q` reports failure under `pipefail` when grep exits early, so the membership checks now
-  capture the list first.
-- Update-all no longer passes a registered `docker run` custom app to Watchtower; its own script updates it.
-- Records with empty fields (docker-run containers have no compose labels) use the 0x1f separator, so `read`
-  doesn't shift fields.
+# new host
+sudo ./docker-dashboard.sh --install --import docker-dashboard-export-<host>-<date>.tar.gz.enc
+```
 
-## v2.3.0 — 2026-10-26 — Apps started by their own script
+The export recognises apps by image, not by name or path. It reads each app's settings from the running container.
 
-### Added
-- **Custom apps started by their own script** (`MANAGED='no'`): docker-dashboard adds the proxy name, card, DNS
-  entry and health checks, and attaches to the running container.
-  - It never starts, stops, pulls or rebuilds the app; its own installer keeps doing that.
-  - Update-all reports it once and skips it. A delegate can run its installer instead.
-  - Remove only takes it off the proxy.
-- **Set up a folder** (F) detects an app already running from that folder under its own compose project and offers
-  this mode (recommended), or handing it over to docker-dashboard under the same project, so no second copy starts.
-- `PROJECT` in `app.conf` uses an existing compose project name instead of `dd-c-<name>`.
-- Self-test: 70 checks.
+| App | What is carried over |
+|---|---|
+| Pi-hole | `/etc/pihole` (gravity, settings, local DNS records, query log), web password, `FTLCONF_*` settings, ports |
+| Portainer | `/data` (users, endpoints, stacks), ports |
+| Internet monitoring | Prometheus config and **history**, Grafana database and provisioning, blackbox config, the exact image tags you run, retention, plugins, admin password, ports |
+| Guacamole | The database via `pg_dump`, which restores into a current PostgreSQL in one transaction. The 1.6 schema upgrade is applied automatically. A stock schema already on the new host, with no connections or extra users, is replaced; real data is never overwritten. Also drive/recording folders and the old HTTPS port |
+| MeshCentral | `meshcentral-data` (config, **server certificates** — your agents keep connecting), `-files`, `-backups`, `-web`. This works even when the data was never in a volume and lived inside the container |
+| File share | `~/web-site-content` of the user running the export |
 
-### Fixed
-- Setting up a folder whose compose file needs variables or secrets supplied by its installer exited the script.
-  The setup now finds the services from the running containers, and `docker compose config` errors are shown with
-  a hint instead.
-- Errors inside the Custom apps menu return to the menu instead of ending the script.
+The bundle is AES-256 encrypted with your passphrase, because it contains the apps' passwords.
 
-## v2.2.2 — 2026-10-26 — Remove options for custom apps
+**Export options:**
 
-### Changed
-- **Remove** (Apps → C → R) now offers three levels:
-  - *unregister only*: off the proxy, page and DNS list; containers keep running and the folder is untouched
-  - *stop + unregister*: containers removed, folder and data kept
-  - *delete everything*: still needs `DELETE-APP`
-- An unregistered folder shows as "not set up yet" and can be set up again with F.
+- `--no-metrics` leaves out Prometheus history, which can be gigabytes.
+- `--leave-stopped` keeps the old apps down after the export. Use it for the final cutover, so nothing changes after
+  the snapshot.
+- `--passphrase-file FILE` lets the export run without prompting.
 
-## v2.2.1 — 2026-10-26 — Custom app fixes
+**Not migrated:** containers the export doesn't recognise are listed in the bundle's notes, and the import shows them.
 
-### Fixed
-- A custom app whose `docker compose up` failed was reported as `[ OK ] ... is up`. Errors weren't being caught in
-  that step. Each step is now checked, the proxied service must actually be running, and failures are reported
-  while the other apps still start.
-- Custom apps accept `docker-compose.yml`, `docker-compose.yaml` and `compose.yml`, as well as `compose.yaml`.
+**Import behaviour:**
 
-### Added
-- **Set up a folder already in custom/** (Apps → C → F): for project folders another installer put there, built
-  from source or not. The menu lists such folders as "not set up yet".
-- Custom apps with a `build:` section are built on first apply. Update-all rebuilds them against a fresh base image,
-  and falls back to the local base if it can't be pulled.
-- "Make one from an image" warns when the image isn't on the host and points source-built apps to the folder setup.
-- Self-test: 67 checks.
+- Import refuses to write over existing app data unless you type `OVERWRITE` (or pass `--confirm OVERWRITE`). It
+  then stops those apps first.
+- The port check runs before any data is written.
 
-## v2.2.0 — 2026-10-26 — Custom apps and host health
+### Cutover keeping the same IP
 
-### Added
-- **Custom apps** live in `/opt/stacks/custom/<name>/` (`compose.yaml` + `app.conf`). Each one gets:
-  - its own proxy name and the certificate
-  - a card with a status dot, a place in the DNS list and the port check
-  - update-all and export/import
-- Custom apps are added from **Apps → C** (from an existing compose file or from an image) or by hand. Your compose
-  file is never modified: the container is attached to the proxy network after each start, and re-attached by the
-  health run if it was recreated elsewhere.
-- `UPSTREAM_URL` covers host-networking apps. Names must be unique, and one broken custom app is skipped without
-  blocking the rest.
-- **Host panel** on the page: CPU (busy %, load per core), memory, swap, each filesystem, uptime, and containers
-  (listing unhealthy, restarting and failed ones).
-  - Values show OK / HIGH / CRITICAL against thresholds you set.
-  - The data is collected by the existing health timer and needs no agent.
-- `--host` (menu H) prints the same in the terminal. `--custom-apps` opens the custom apps menu.
-- Self-test: 65 checks.
+1. Build the new host on a temporary IP. In **Settings → Page** set the host address to the **final** IP, so links,
+   DNS records and the certificate point there.
+2. On the old host, run `sudo ./docker-dashboard.sh --export --leave-stopped`.
+3. Copy the bundle to the new host, then run `--install --import`.
+4. Shut the old host down, move the new one to the final IP, and run `sudo docker-dashboard --apply`.
 
-## v2.1.1 — 2026-10-26 — Progress output
+Pi-hole is down from step 2 until step 4. Give clients a secondary DNS server for that window.
 
-### Fixed
-- Image pulls and apt output scrolled line by line instead of updating in place. Commands now write straight to the
-  terminal when there is one. The run log records each command and its exit code, and timer runs, which have no
-  terminal, still log the full output.
+## Names, DNS and certificates
 
-## v2.1.0 — 2026-10-26 — Host preparation
+With a domain set, each app endpoint gets `https://<name>.<domain>`, and the landing page lives at
+`https://dashboard.<domain>`. The names are configurable per app. Without a domain, links use `IP:port`.
 
-### Added
-- **Host preparation** runs during install, after the settings and before anything is written:
-  - It installs the base packages (`ca-certificates curl gnupg openssl iproute2 ...`) as `docker-base-install.sh`
-    does.
-  - It checks disk space (30 GiB with Greenbone), RAM for Greenbone, NTP sync, a DHCP-leased address on a DNS
-    server, host DNS, and Docker Hub reachability.
-- **Port 53 freed automatically** when Pi-hole is on and systemd-resolved's stub listener holds it.
-  - Only the stub listener is turned off. `/etc/resolv.conf` is pointed at resolved's upstream list, so the host
-    keeps resolving.
-  - If host DNS breaks, the change is rolled back.
-  - The original is recorded and restored on uninstall.
-  - This also runs on `--apply`.
-- Self-test: 52 checks (stub freed/restored, rollback on DNS failure).
+**DNS:**
 
-### Changed
-- The install checks ports before any import data is written, and checks them once per run.
+- `sudo docker-dashboard --dns-records` (menu D) lists every name with ready-to-paste `Add-DnsServerResourceRecordA`
+  lines for Windows DNS.
+- If Pi-hole is enabled, it answers these names itself. The script writes `etc-pihole/hosts/docker-dashboard.list`
+  and leaves your own local DNS records alone.
+- If clients resolve the domain through another server, such as Active Directory, add the records there as well.
 
-## v2.0.0 — 2026-10-26 — All-in-one installer, reverse proxy, migration
+**Certificates** (Settings → Certificate):
 
-### Added
-- **App catalog**, each app as its own compose project (`dd-<app>`) under `/opt/stacks/<app>`, with data alongside:
-  - Pi-hole
-  - Portainer CE
-  - internet monitoring (Grafana, Prometheus, node, blackbox and speedtest exporters)
-  - Guacamole on PostgreSQL 17
-  - MeshCentral
-  - Greenbone/OpenVAS (optional, off by default; uses Greenbone's own compose file plus an override)
-- **Reverse proxy:** each app endpoint gets `https://<name>.<domain>`.
-  - Upstreams resolve per request through Docker DNS, so a stopped app returns 502 without breaking nginx.
-  - Websockets, TLS upstreams, unbuffered streaming and large uploads are handled per app.
-  - Pi-hole `/` redirects to `/admin/`.
-  - Guacamole's legacy `:8443` keeps working.
-  - Direct ports stay published as fallbacks and can be blanked per app.
-- **Certificates:**
-  - Modes: `selfsigned` (adds `*.<domain>`), `custom` (watched by a systemd path unit), and `fetch` (daily `scp`
-    from another host, e.g. OPNsense acme.sh, with its own SSH key).
-  - Key match, expiry and name coverage are checked before deploying, and a bad certificate is refused.
-- **DNS:**
-  - `--dns-records` lists every name, with Windows DNS PowerShell lines.
-  - Pi-hole answers the names itself through `etc-pihole/hosts/docker-dashboard.list`, without touching your
-    records.
-- **Migration:**
-  - `--export` runs on the old host using only `docker`/`tar`/`openssl`, so it works with Docker 20.10 and
-    `docker-compose` v1. It recognises apps by image and reads their real settings.
-  - Data is captured consistently: apps are stopped briefly and restarted, Guacamole is captured with `pg_dump`, and
-    MeshCentral data is copied out even from inside a container. The result is one AES-256 bundle.
-  - `--import` (with `--install`) restores data with numeric ownership, restores the Guacamole database, and applies
-    the Guacamole 1.6 schema upgrade.
-  - Options: `--no-metrics`, `--leave-stopped`, `--passphrase-file`. Import has an `OVERWRITE` gate that stops the
-    apps first.
-- **Encrypted vault** for app passwords (systemd-creds/TPM2 or openssl, same scheme as mediastack-installer).
-  Passwords are passed to compose at run time and never written to compose files. The Secrets menu changes the
-  Guacamole DB password in PostgreSQL as well.
-- Update-all updates managed apps and the dashboard first, with secrets. Other projects and `docker run` containers
-  are handled as before.
-- Apps menu (on/off, images, names, ports), Secrets menu, Certificate menu, `--gvm-password`, `--cert-refresh`,
-  `--cert-fetch-key`.
-- The page shows each app's direct-port fallback under its link.
-- Port check covers every app port (TCP and UDP 53) and explains systemd-resolved on Ubuntu.
-- Self-test: 50 checks.
+| Mode | Behaviour |
+|---|---|
+| `selfsigned` | Generated for the host IP, `*.<domain>` and `<domain>`. Browsers warn once |
+| `custom` | Your full-chain PEM + key on this host. A systemd path unit redeploys them whenever the files change |
+| `fetch` | Copied over `scp` every day from another machine, such as **OPNsense running acme.sh**, then deployed if changed |
+| `push` | Another machine pushes it over SSH when it renews, such as the OPNsense `install_wildcard_cert_api.sh` deployer. Deployed at once, and the push gets a pass/fail answer |
 
-### Changed
-- The page groups app links under **Apps**. Custom links keep their own groups (default group: `Links`).
-- Uninstall also removes managed app containers and the proxy network. App data is kept unless `DELETE-DATA` is
-  typed.
-- Health checks reach the app names through the local proxy, so they work before DNS records exist.
+Every mode is checked before it is used. The key must match, the certificate must not be expired, and every name the
+proxy serves is checked against it (a warning names any that aren't covered). A bad certificate is refused and the
+running one stays in place. nginx reloads without dropping connections.
 
-### Fixed
-- Endpoint records use `|`, not tabs. `read` collapses repeated tabs, which shifted empty fields.
+**Fetch mode setup:**
 
-### Companion: docker-inventory.sh v1.0.1
-- Compose v1 records config files relative to the project folder. Those files are now found and included.
+1. Choose `fetch` and enter `user@host:/folder` plus the two file names, for example `fullchain.pem` and
+   `privkey.pem`.
+2. Let it create a key, or run `sudo docker-dashboard --cert-fetch-key`. Add the printed public key to that user on
+   the source machine. On OPNsense, that is **System → Access → Users → Authorized keys**; the user needs a login
+   shell and read access to the files.
+3. If the source needs a non-standard SSH port, add a `Host` entry for it to root's `~/.ssh/config`.
 
-## v1.0.0 — 2026-10-25 — Initial release
+If a fetch fails, the last good certificate keeps being served, and the timer run exits non-zero so the failure shows
+in the journal.
 
-### Added
-- **Landing page** on the host's ports 80/443, served by an nginx container (`docker-dashboard`):
-  - HTTP redirects to HTTPS, keeping the path; a non-443 HTTPS port is kept in the redirect.
-  - Links are grouped and filterable, in light and dark themes, and work at phone width.
-  - The page loads nothing from the internet. Its content comes from `services.json`, so editing the services list
-    never touches the page or nginx.
-- **Services list** in `/etc/docker-dashboard/services.conf` (`group | name | url | description`), managed from the
-  Services menu (add, edit, remove, move, detect) or the CLI (`--add-service`, `--remove-service`,
-  `--list-services`). Changes publish to the running page immediately.
-- **Detection** of web endpoints published by running containers:
-  - Each published TCP port is probed for HTTPS, then HTTP.
-  - Common images get friendly names, and Pi-hole gets its `/admin/` path.
-  - `--rm` containers and the dashboard's own ports are skipped.
-  - Host-network containers are listed for manual entry.
-- **Health checks** run host-side from a systemd timer every N minutes and write `status.json`, so the page's status
-  dots work for `http://` services too. A browser on an HTTPS page cannot probe those (mixed content).
-- **TLS**: a self-signed certificate (IP + hostname SANs, plus extra names) that is regenerated when names change or
-  expiry is under 30 days. Alternatively, a custom certificate (e.g. an acme.sh wildcard), checked for key match and
-  expiry.
-- **File share** (optional): a read-only folder at `/files/`.
-  - The page lists the files with copy-ready `curl` commands.
-  - Downloads also work over plain HTTP for targets without TLS.
-  - Dotfiles are never served.
-- **Update all containers** (`--update-all`, menu 5):
-  - Compose projects are pulled and brought up from their own folder and compose files. One unpullable (local or
-    private) image does not block the rest of its project.
-  - A project whose `docker compose config` fails is skipped with guidance. This is usually because an installer
-    supplies its variables or secrets.
-  - **Delegates** (`project=command`) hand a project to its own installer. `mediastack-installer` is detected
-    automatically.
-  - Standalone `docker run` containers are recreated with their original settings by a one-shot run of the
-    maintained Watchtower fork (`nickfedor/watchtower`). If the pull fails, a local copy is used.
-  - `--rm` containers (such as the temporary `web` file server) are never touched. An exclusion list applies too.
-  - Dangling images are pruned, and the run ends with a summary of which containers actually changed.
-  - The exit status is non-zero when anything failed, for the timer.
-- `--check-updates` (menu 6): pulls newer images and reports which containers are behind, without restarting
-  anything.
-- **Scheduled updates** (off, daily or weekly at a set time) as a systemd timer, with `Persistent=true` so a missed
-  run happens at next boot.
-- **Port check** before every apply: names the container or process holding 80/443, with the exact fix (the
-  compose file to edit, or `docker run -p`, or Pi-hole's `FTLCONF_webserver_port` for host networking).
-- Safety:
-  - `nginx -t` validates in a throwaway container before the running dashboard is touched.
-  - Writes are atomic and only happen when content changed. nginx is reloaded and systemd `daemon-reload` runs only
-    when needed.
-  - Dry-run mode is available everywhere.
-  - Uninstall requires typing `UNINSTALL`, and the shared files folder is never deleted.
-- Docker Engine install based on `docker-base-install.sh` (Ubuntu/Debian, conflicting distro packages handled),
-  with an optional add of the invoking user to the `docker` group.
-- Menu and CLI equivalents, per-run logs in `/var/log/docker-dashboard` (newest 30 kept), and a self-test with
-  38 checks.
+**Push mode setup:**
+
+1. On the pushing machine, create a key pair. On OPNsense:
+   `ssh-keygen -t ed25519 -N '' -f /root/ssl_certs/docker_push_ed25519`
+2. Here, choose `push` (Settings → Certificate) and let it set up the receiver, or run
+   `sudo docker-dashboard --cert-push-setup /path/to/docker_push_ed25519.pub` (or paste the key when asked).
+   This creates:
+   - a system user, `ddcertpush` by default (`CERT_PUSH_USER`), with no password and no shell access
+   - its `authorized_keys` line, which pins the key to one command:
+     `restrict,from="<CERT_PUSH_FROM>",command="sudo -n /usr/local/sbin/docker-dashboard --cert-receive"`
+   - `/etc/sudoers.d/docker-dashboard-certpush`, which allows that user that one command and nothing else
+3. Set `CERT_PUSH_FROM` to the pushing machine's IP so the key works only from there.
+4. Push: `cat fullchain.pem privkey.pem | ssh -i docker_push_ed25519 ddcertpush@<this host>`
+
+The receiver reads at most 64 KB within 30 seconds. It expects the certificate chain followed by exactly one private
+key, and runs the same checks as the other modes before anything is replaced. It waits up to 5 minutes for a menu or
+apply run to finish, reloads nginx, and waits until the proxy really serves the new certificate. Its last output line
+is meant for scripts:
+
+```
+DD-CERT-RECEIVE OK changed|unchanged sha256=<fingerprint> notafter=<date> live=yes|no
+DD-CERT-RECEIVE FAIL <reason>
+```
+
+The exit code is 0 for OK and non-zero otherwise. Until the first push arrives, the proxy serves a temporary
+self-signed certificate. The pushed pair is kept in `/etc/docker-dashboard/certs-pushed/`.
+
+## Changing the host's IP address
+
+```bash
+sudo docker-dashboard --change-ip 192.168.0.200     # add --dry-run first to see what it would change
+```
+
+Or in the menu: **P**. It shows the current address and asks for the new one.
+
+This changes everything docker-dashboard controls, then runs apply:
+
+- `HOST_ADDR`, which every name points at
+- the Pi-hole records for the dashboard's names
+- the page's links
+- the self-signed certificate, if you use one
+- any custom links and custom app direct links (`FALLBACK_URL`, `UPSTREAM_URL`) that contain the old address,
+  matched as whole addresses only, so `.19` never matches inside `.190`
+
+It does **not** change the machine's own network settings. It ends with a checklist:
+
+1. **Change the machine's address.** On Debian, edit `/etc/network/interfaces` (or set a DHCP reservation for its
+   MAC address), then reboot from the console or Hyper-V, not over SSH. You can do this before or after
+   `--change-ip`.
+2. **Point DNS clients at the new address.** If clients use Pi-hole, change the DNS server your DHCP hands out, and
+   any static clients.
+3. **Update other DNS servers.** If another server, such as Active Directory, also holds the names, update its
+   records. `--dns-records` prints the commands.
+4. **Update anything that connects by IP:** firewall rules or aliases, and the OPNsense cert deployer
+   (`DOCKER_IP`, plus `ssh-keyscan` the new address into its `known_hosts`).
+
+It also lists app files under `/opt/stacks` that still mention the old address, such as a Prometheus target. It
+doesn't edit those.
+
+Wildcard certificates (`custom`, `fetch`, `push`) don't contain the IP, so they need nothing.
+
+## Menu and CLI
+
+| Menu | CLI | What it does |
+|---|---|---|
+| 1 | `--install [--import FILE]` | Docker, settings, ports, (import), apps, proxy, page |
+| 2 / 3 | `--settings` / `--apps` | Settings menu / turn apps on or off and edit their images, names and ports |
+| 4 | `--services`, `--add-service`, `--remove-service`, `--detect` | Custom links on the page |
+| K | `--secrets`, `--show-secret NAME`, `--set-secret NAME` | View or change stored passwords (see **Secrets**) |
+| P | `--change-ip NEW_IP` | Point names, links and Pi-hole records at a new host address, then apply |
+| C | `--cert-refresh`, `--cert-fetch-key`, `--cert-push-setup`, `--cert-receive` | Certificate actions |
+| 5 | `--apply` | Converge everything: compose files, proxy config, page, DNS file, timers |
+| 6 | `--update-all` | Update every running container on the host |
+| 7 | `--check-updates` | Pull newer images and report which containers are behind; changes nothing |
+| 8 / 9 | `--status` / `--health` | Overview / check every link now |
+| D | `--dns-records` | DNS names to create |
+| E / I | `--export` / `--import FILE` | Migration |
+| X / U | `--stop` / `--uninstall` | Stop all (data kept) / remove (typed `UNINSTALL`) |
+| T / S | `--dry-run` / `--self-test` | Show what would change / built-in tests |
+
+More actions:
+
+- `--host` (menu H) shows host health and refreshes the page's Host panel.
+- `--custom-apps` (or Apps → C) manages your own apps.
+- `--gvm-password` sets the Greenbone admin password from the vault once its first start has finished.
+
+## Apps
+
+Each app is its own compose project, `dd-<app>`, in `/opt/stacks/<app>/`. Its data sits next to its compose file in
+plain folders, so one copy of `/opt/stacks` backs up everything.
+
+- **Compose files are generated:** on every apply, from your settings. Change settings, not the files.
+- **Passwords:** they never touch disk in plain text. They are passed to `docker compose` from the vault at run time.
+- **Turning an app off:** it stops and its containers are removed, but its data stays. Turn it on again and it comes
+  back as it was.
+- **Ports:** every app's direct port is a setting. Blank means proxy only.
+
+## Custom apps
+
+Any app with a compose file can join the proxy: its own name, the wildcard certificate, a card with a status dot,
+the DNS list, the port check, update-all and export/import. Your compose file is never changed. After each start,
+the script attaches the app's container to the proxy network under the alias `dd-c-<name>`.
+
+**Adding one from the menu:** **Apps → C → N**. Give it a short name, then either point at an existing compose file
+(its `.env` is copied too) or let the script write a basic one from an image and port. Answer a few questions, then
+apply.
+
+**A project folder that's already there:** if a folder in `/opt/stacks/custom/` already has its own
+`docker-compose.yml`, for example one another installer put there, it shows as "not set up yet". Choose
+**Apps → C → F** to give it an `app.conf`. Apps with a `build:` section are built on the first apply, and
+update-all rebuilds them.
+
+**Any container that's already running:** **Apps → C → D** lists every running container docker-dashboard doesn't
+run or proxy yet, wherever its files are (compose or `docker run`). The menu shows them as "running, not added".
+Pick one and it is set up as *started by its own script*. Its `custom/<name>/` folder holds only the `app.conf`,
+and the app's own files stay where they are.
+
+**An app another script already runs:** if setup finds the app running from that folder under its own compose
+project, for example one started by its own installer, choose *its own script keeps starting and updating it*
+(`MANAGED='no'`). docker-dashboard then only adds the name, card, DNS entry and health checks, attaching to the
+running container. It never starts, stops, pulls or rebuilds it. Update-all leaves it to its installer; add a
+delegate if you want update-all to run that installer.
+
+**Adding one by hand:** create `/opt/stacks/custom/<name>/compose.yaml` (or `docker-compose.yml`) and an `app.conf`, then run
+`sudo docker-dashboard --apply`:
+
+```
+TITLE='HP Switches'
+SUBDOMAIN='switches'                       # -> https://switches.<domain>
+SERVICE='web'                              # compose service the proxy talks to
+PORT='8443'                                # its container port
+TLS='yes'                                  # that port speaks HTTPS itself
+FLAGS='ws'                                 # ws (websockets), stream (no buffering), big (large uploads)
+FALLBACK_URL='https://192.168.0.190:8444/' # shown under the card (optional)
+MANAGED='yes'                              # 'no' = started/updated by its own script; only proxied and checked
+PROJECT=''                                 # its compose project (empty = dd-c-<folder>)
+CONTAINER=''                               # or: a single docker-run container by name
+DESCRIPTION='Port status and admin up/down'
+ENABLED='yes'
+```
+
+**How it behaves:**
+
+- **Host networking:** apps using `network_mode: host` can't join a network. Set
+  `UPSTREAM_URL='http://<host-ip>:<port>'` instead of `SERVICE`/`PORT`.
+- **Checks at apply:** names must be unique, and the service must exist in the compose file.
+- **One broken app doesn't block the rest:** a custom app with a problem is reported and skipped.
+- **Recreated outside the script:** if the container is recreated another way (for example with
+  `docker compose up` by hand), the next health run re-attaches it, within the health interval.
+- **Disable or remove:** `ENABLED='no'` stops the app and keeps its folder. **Remove** in the menu offers three
+  levels: *unregister only* (containers and folder untouched), *stop + unregister* (folder and data kept), or
+  *delete everything* (after you type `DELETE-APP`).
+
+## Host health
+
+The health check (every 2 minutes) also collects host health for the **Host** panel at the top of the page. Each
+value shows OK, HIGH or CRITICAL against thresholds you set in **Settings → Health**.
+
+| Tile | Shows |
+|---|---|
+| CPU | Busy % and 5-min load per core (default: high at 1.0, critical at 2.0) |
+| Memory / Swap | Use % and amounts (memory default: high at 85%, critical at 95%) |
+| Disk (each filesystem) | Use % and amounts (default: high at 80%, critical at 90%). Includes NFS/SMB mounts |
+| Containers | Running / total. Lists unhealthy, restarting, and exited-with-error containers |
+| Uptime | Uptime and OS |
+
+`sudo docker-dashboard --host` (menu H) prints the same in the terminal. For history and graphs, Grafana's
+*Node Exporter Full* dashboard (ID 1860) uses the node-exporter that the monitoring app already runs.
+
+## Updating containers
+
+`sudo docker-dashboard --update-all` (menu 6) runs in three passes:
+
+1. **Managed apps and the dashboard:** `pull` + `up` with secrets from the vault. Guacamole's schema is checked
+   before it starts.
+2. **Other compose projects:** `pull` + `up` from their own folder. Projects that need an installer's secrets are
+   skipped with a hint, or handed to that installer as a **delegate**, e.g.
+   `mediastack=/usr/local/sbin/mediastack-installer --apply --yes`. MediaStack is detected automatically.
+3. **`docker run` containers:** recreated with their original settings by one run of the maintained Watchtower fork
+   (`nickfedor/watchtower`). `--rm` containers are never touched.
+
+Pinned tags stay pinned: an update moves within the tag you chose. You can exclude apps, containers or projects. A
+daily or weekly timer is optional.
+
+**Check for updates** (`--check-updates`, menu 7) pulls each running container's image and compares it with what the
+container runs. It compares contents (layers and image config), not just image IDs. With the containerd image store,
+an image re-published upstream can get a new ID while the image for your platform is identical. That is not an
+update, and Docker Compose rightly leaves the container alone.
+
+A custom app started by its own script that shows **newer local image** was rebuilt on this host after its container
+was started. Restart it with its own script. (For local builds the running image often can't be looked up by its
+recorded ID, so the check compares the build time with the container's start instead.)
+
+## Secrets
+
+Secrets are stored in `/etc/docker-dashboard/secrets.enc`, encrypted with **systemd-creds** (bound to the TPM2 when
+present) or with openssl and a root-only key file. This is the same scheme as `mediastack-installer`.
+
+| Secret | Used for | Changing it later |
+|---|---|---|
+| `PIHOLE_PASSWORD` | Pi-hole web login | Applies on the next apply. If an imported Pi-hole had no password in its environment, none is set, and the one in its `pihole.toml` stays. Use `-` for no password at all |
+| `GRAFANA_ADMIN_PASSWORD` | Grafana's first start only | Change it in the Grafana UI |
+| `GUAC_DB_PASSWORD` | Guacamole's PostgreSQL user | The Secrets menu changes it in PostgreSQL too |
+| `GVM_ADMIN_PASSWORD` | Greenbone admin, via `--gvm-password` | Run `--gvm-password` again |
+
+**Viewing a password:**
+
+```bash
+sudo docker-dashboard --show-secret PIHOLE_PASSWORD     # or GRAFANA_ADMIN_PASSWORD, GUAC_DB_PASSWORD, GVM_ADMIN_PASSWORD
+```
+
+Or use the menu: **K → R** and type the name. The Secrets screen shows each one's state:
+
+- `set`: the vault holds it, and the app uses it.
+- `none (login without a password)`: Pi-hole only; its web login asks for no password.
+- `not managed`: Pi-hole only. After a migration where the old container had no password in its environment,
+  Pi-hole keeps the one in its own `pihole.toml`. Set one here to take it over, or reset it with
+  `docker exec -it pihole pihole setpassword`.
+
+**Changing a password:**
+
+```bash
+sudo docker-dashboard --set-secret PIHOLE_PASSWORD      # prompts; empty = generate a new one
+echo 'new-value' | sudo docker-dashboard --set-secret PIHOLE_PASSWORD
+sudo docker-dashboard --apply                           # Pi-hole and Guacamole pick it up on apply
+```
+
+Or use the menu: **K → C**. It offers to apply right away.
+
+**Pi-hole with no password:** enter `-` as the new value (menu or `--set-secret`), then apply. This sets
+`PIHOLE_NO_PASSWORD=yes`, and the container gets `FTLCONF_webserver_api_password: ''`, which is Pi-hole's documented
+way to turn the login off. To turn it back on, set any value. An empty password set inside the container with
+`pihole setpassword` does not survive a container restart; this setting does.
+
+Since FTL v6.8, a Pi-hole without a password refuses cross-site browser requests and any `Host` name it doesn't
+recognise. It answers with a 403 "Oops! Access denied" page. Through the proxy the Host is `pihole.<domain>`, so
+no-password mode also sets `FTLCONF_webserver_domain` to that name, unless `PIHOLE_EXTRA_ENV` already sets it. The
+direct port, by IP, may still be refused; use the proxy name.
+
+The same check refuses page loads marked `Sec-Fetch-Site: same-site`. Browsers send that when you click the Pi-hole
+card on the dashboard, because both names are under the same domain. The proxy passes plain page loads (`GET`/`HEAD`)
+from sibling names to Pi-hole as `same-origin`. Every other request, including all `POST`s and anything from another
+site, reaches Pi-hole unchanged, so its protection still applies.
+
+Pi-hole added that check because, with no password, any web page opened on your network can reach Pi-hole's API
+through your browser. A password is the safer choice.
+
+The admin login of Grafana, and later Guacamole and MeshCentral accounts, are stored in each app's own database. You
+change those in the app itself.
+
+## Settings reference
+
+All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menus, or edit the file and then run
+`--apply`. In menus, `-` clears an optional value.
+
+**General:**
+
+| Key | Default | Meaning |
+|---|---|---|
+| `DOMAIN` | detected | Names become `<sub>.<domain>`; empty = port links |
+| `DASH_SUBDOMAIN` | `dashboard` | Landing page name |
+| `HOST_ADDR` | `auto` | IP the names point at. Set the final IP before a cutover |
+| `HTTP_PORT` / `HTTPS_PORT` | `80` / `443` | Proxy ports |
+| `TIMEZONE` | host's | `TZ` for the apps |
+| `STACKS_DIR` / `DEPLOY_DIR` | `/opt/stacks` / `/opt/docker-dashboard` | App folders / proxy + page |
+| `CERT_MODE` | `selfsigned` | `selfsigned`, `custom`, `fetch` or `push` |
+| `CERT_FILE`, `CERT_KEY_FILE` | — | `custom` mode |
+| `CERT_FETCH_SOURCE`, `CERT_FETCH_CERT`, `CERT_FETCH_KEY` | — | `fetch` mode |
+| `CERT_PUSH_USER` | `ddcertpush` | `push` mode: the local user the pushing machine logs in as |
+| `CERT_PUSH_FROM` | — | `push` mode: IPs/CIDRs the push key is accepted from (sshd `from=`); empty = any |
+| `FILES_DIR`, `FILES_HTTP` | —, `yes` | `/files/` share, plus plain-HTTP downloads |
+| `HEALTH_CHECK`, `HEALTH_INTERVAL` | `yes`, `2` | Status dots |
+| `HOST_PANEL` | `yes` | Host panel on the page |
+| `HOST_DISK_WARN`, `HOST_DISK_CRIT` | `80`, `90` | Disk thresholds (%) |
+| `HOST_MEM_WARN`, `HOST_MEM_CRIT` | `85`, `95` | Memory thresholds (%) |
+| `HOST_LOAD_WARN`, `HOST_LOAD_CRIT` | `1.0`, `2.0` | Load-per-core thresholds |
+| `UPDATE_SCHEDULE`, `UPDATE_DAY`, `UPDATE_TIME` | `off`, `Sun`, `04:00` | Scheduled updates |
+| `UPDATE_PRUNE` | `yes` | Prune dangling images after updates |
+| `UPDATE_EXCLUDE` | — | Apps, containers or projects never updated |
+| `UPDATE_DELEGATE` | — | `project=command;...` |
+
+**Per app:**
+
+| Keys | Meaning |
+|---|---|
+| `APP_<NAME>` | `yes` / `no` |
+| `<APP>_IMAGE` | Image and tag |
+| `<APP>_SUBDOMAIN` | Name on the proxy |
+| `<APP>_*_PORT` | Direct ports. Blank = not published |
+| `PIHOLE_EXTRA_ENV`, `GRAFANA_EXTRA_ENV` | Extra settings as `K=V;K=V` |
+| `PIHOLE_NO_PASSWORD` | `yes` = Pi-hole web login without a password. Default `no` |
+| `PROMETHEUS_RETENTION`, `GRAFANA_PLUGINS` | Monitoring options |
+| `GUAC_POSTGRES_IMAGE` | Default `postgres:17`. Keep the major version once data exists |
+
+## Files and paths
+
+| Path | What |
+|---|---|
+| `/etc/docker-dashboard/dashboard.conf` | Settings (0600) |
+| `/etc/docker-dashboard/secrets.enc` | Encrypted secrets |
+| `/etc/docker-dashboard/services.conf` | Custom links |
+| `/etc/docker-dashboard/certfetch_ed25519` | Fetch-mode SSH key |
+| `/etc/docker-dashboard/certs-pushed/` | Push mode: the last pushed certificate and key |
+| `/etc/sudoers.d/docker-dashboard-certpush` | Push mode: allows only `docker-dashboard --cert-receive` |
+| `/opt/stacks/<app>/` | `compose.yaml` + the app's data |
+| `/opt/stacks/guacamole/.restore/` | Imported database dump (kept after restore) |
+| `/opt/docker-dashboard/` | Proxy compose, `nginx/`, `html/` (page, `services.json`, `status.json`), `certs/` |
+| `/var/log/docker-dashboard/run-*.log` | One log per run (newest 30 kept) |
+| `/etc/systemd/system/docker-dashboard-*` | Health, update and certificate timers/watchers |
+| `/usr/local/sbin/docker-dashboard` | Installed copy |
+
+## Uninstall
+
+`sudo docker-dashboard --uninstall` (menu U) requires you to type `UNINSTALL`. It removes:
+
+- the dashboard and every managed app container
+- the proxy network
+- the timers
+- `/opt/docker-dashboard`
+
+It then asks two questions. Deleting app data needs a second typed `DELETE-DATA`; removing settings and the vault is
+a yes/no. Both default to keeping, so `--apply` brings everything back. Other containers and Docker itself are
+never touched.
+
+## Testing
+
+```bash
+./docker-dashboard.sh --self-test      # 90 checks, no root or Docker needed
+```
+
+The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
+parsing, port-conflict parsing, certificate SANs, the vault round-trip, manifest safety, delegates and exclusions.
+
+v2.0.0 was also run end to end on a real Docker daemon. The test environment used PostgreSQL holding a real
+Guacamole 1.5 schema, and stand-in containers for the other apps at their real ports, mounts and image names. It
+covered:
+
+- export from a replica of an old Debian 11 layout, including MeshCentral data inside a container
+- wipe, then import
+- every name served through the proxy with the wildcard certificate, including websocket upgrade
+- the Guacamole data restored onto the new PostgreSQL, with the 1.6 schema upgrade applied, including over a stale
+  `init/initdb.sql` or a stock schema left by an earlier attempt
+- ownership kept for Grafana (472) and Prometheus (65534)
+- the Pi-hole local DNS file written, with existing records untouched
+- idempotent re-apply, with no containers recreated
+- update-all recreating only the changed image
+- app off/on, certificate renewal, a mismatched key refused, a fetch over scp, a fetch failure fallback, a push over a forced-command SSH key (renewal, unchanged, garbage, wrong key, shell and scp attempts refused, wrong source IP refused, lock wait)
+- port-conflict and overwrite guards, the menus, uninstall, and a fresh install without a bundle
+- the Greenbone override validated against Greenbone's real `compose.yaml`
