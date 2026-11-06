@@ -6,6 +6,19 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.49.0] - 2026-11-05
+
+### Changed
+- **`build` now recreates a missing build script instead of only falling back
+  to PyInstaller.** Both build scripts are embedded in the single `.py` (base64,
+  verified byte-identical to the standalone files), so a lone copy of the script
+  can write out `build.sh` / `build.ps1` for the current OS and run it - the one
+  file is fully self-sufficient for building its own executable. Direct
+  PyInstaller invocation remains only as a last resort if the script cannot be
+  written (e.g. a read-only directory).
+
+---
+
 ## [1.48.0] - 2026-11-05
 
 ### Added
