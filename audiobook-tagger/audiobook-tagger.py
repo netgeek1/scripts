@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.46.0
+audiobook-tagger 1.47.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.46.0"
+__version__ = "1.47.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -91,6 +91,17 @@ except ImportError:
     HAVE_CERTIFI = False
 
 import ssl
+
+
+def app_dir() -> Path:
+    """Directory the app lives in, correct for a PyInstaller onefile exe.
+
+    When frozen, __file__ points into a temp extraction dir that is deleted on
+    exit, so the config and sidecar lookups must key off the EXE's own folder.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 log = logging.getLogger(PROGRAM)
 
@@ -246,7 +257,7 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
     global CONFIG_SOURCE
     cfg = dict(DEFAULT_CONFIG)
     if not path:
-        here = Path(__file__).resolve().parent
+        here = app_dir()
         for candidate in ("audiobook-tagger.yaml", "audiobook-tagger.yml",
                           "audiobook-tagger.json"):
             if Path(candidate).is_file():          # working directory first
@@ -452,7 +463,7 @@ def render_config(cfg: Dict[str, Any]) -> str:
 
 def default_config_path() -> Path:
     """Next to the script, so it is found regardless of working directory."""
-    return Path(__file__).resolve().parent / "audiobook-tagger.yaml"
+    return app_dir() / "audiobook-tagger.yaml"
 
 
 def save_config(cfg: Dict[str, Any], path: Optional[Path] = None) -> Optional[Path]:
@@ -4468,7 +4479,7 @@ def find_json_libraries(roots: Sequence[Path], max_depth: int = 5,
 
 def do_find_json(cfg: Dict[str, Any], library: Optional[Path],
                  extra: Optional[Sequence[str]] = None) -> int:
-    roots: List[Path] = [Path.cwd(), Path(__file__).resolve().parent]
+    roots: List[Path] = [Path.cwd(), app_dir()]
     for e in extra or []:
         roots.append(Path(e).expanduser())
     if cfg["openaudible_dir"]:
