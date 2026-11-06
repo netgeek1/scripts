@@ -6,6 +6,20 @@ All notable changes to audiobook-tagger. Format loosely follows
 
 ---
 
+## [1.48.0] - 2026-11-05
+
+### Added
+- **Build from the menu / CLI.** A new `build` command and menu entry
+  (**B. Build .exe/binary**) produce the self-contained executable without
+  leaving the tool. It runs the platform build script (`build.ps1` on Windows,
+  `build.sh` elsewhere) when present, and falls back to invoking PyInstaller
+  directly with the current interpreter otherwise. When already running as a
+  frozen binary it says so instead of trying to rebuild. Verified end-to-end:
+  the menu build produced a working binary, and the no-script fallback prints
+  the exact `pip install pyinstaller` hint.
+
+---
+
 ## [1.47.0] - 2026-11-05
 
 ### Added
