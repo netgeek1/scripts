@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.47.0
+audiobook-tagger 1.48.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.47.0"
+__version__ = "1.48.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -91,6 +91,9 @@ except ImportError:
     HAVE_CERTIFI = False
 
 import ssl
+
+
+import subprocess as _subprocess
 
 
 def app_dir() -> Path:
@@ -4663,6 +4666,83 @@ def do_search(cfg: Dict[str, Any], title: str, author: Optional[str],
     return 0 if any_hit else 1
 
 
+def _build_with_pyinstaller(source: Path, workdir: Path, name: str) -> int:
+    """Fallback build when no build.sh/build.ps1 is present: run PyInstaller
+    directly with the current interpreter."""
+    try:
+        import PyInstaller  # noqa: F401
+    except ImportError:
+        exe = Path(sys.executable).name
+        print("  PyInstaller is not installed in this Python. Either:")
+        print(f"    {exe} -m pip install pyinstaller")
+        print("  then try again, or run the bundled build.ps1 / build.sh")
+        print("  (they create an isolated venv and install everything for you).")
+        return 1
+    cmd = [sys.executable, "-m", "PyInstaller", "--onefile", "--console",
+           "--name", name, "--collect-submodules", "mutagen",
+           "--collect-data", "certifi", "--noconfirm", str(source)]
+    print(f"  $ {' '.join(cmd)}")
+    return _subprocess.call(cmd, cwd=str(workdir))
+
+
+def do_build(name: str = "audiobook-tagger") -> int:
+    """Build a single self-contained executable of this tool."""
+    if getattr(sys, "frozen", False):
+        print("")
+        print("  This is already a built, self-contained executable - nothing to build.")
+        print(f"    {sys.executable}")
+        return 0
+
+    source = Path(__file__).resolve()
+    here = app_dir()
+    is_windows = os.name == "nt"
+    script = here / ("build.ps1" if is_windows else "build.sh")
+
+    print("")
+    print("=" * 72)
+    print(f"  {PROGRAM} {__version__} - build self-contained executable")
+    print("=" * 72)
+    print(f"  source : {source}")
+    print(f"  output : {here / 'dist' / (name + ('.exe' if is_windows else ''))}")
+    print("  Python is needed to BUILD; the result needs no Python to RUN.")
+    print("  This can take a minute or two.")
+    print("")
+
+    try:
+        if script.is_file():
+            if is_windows:
+                cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
+            else:
+                cmd = ["bash", str(script)]
+            print(f"  using build script: {script.name}")
+            rc = _subprocess.call(cmd, cwd=str(here))
+        else:
+            print("  no build.ps1 / build.sh found next to the script - "
+                  "building with PyInstaller directly.")
+            rc = _build_with_pyinstaller(source, here, name)
+    except FileNotFoundError as exc:
+        tool = "PowerShell" if is_windows else "bash"
+        print(f"  could not start the build ({exc}).")
+        print(f"  make sure {tool} and Python are installed, or run the build "
+              "script manually.")
+        return 1
+
+    out = here / "dist" / (name + (".exe" if is_windows else ""))
+    print("")
+    if rc == 0 and out.exists():
+        size = out.stat().st_size / (1024 * 1024)
+        print(f"  Built: {out}  ({size:.1f} MB)")
+        print(f"  Test:  {out} --version")
+        print("  Copy that one file to any same-OS/arch machine - no Python needed.")
+    elif rc == 0:
+        print("  Build reported success but the output file was not found under dist/.")
+        rc = 1
+    else:
+        print(f"  Build failed (exit {rc}). See the output above.")
+    print("")
+    return rc
+
+
 def do_inspect(target: Path, limit: int = 0, raw: bool = True) -> int:
     """Dump every tag frame of every audio file under a path. Writes nothing."""
     if target.is_file():
@@ -5035,6 +5115,9 @@ def build_parser() -> argparse.ArgumentParser:
                                 "with no arguments)")
 
     sub.add_parser("fields", help="list field names and the tags they write")
+
+    sub.add_parser("build", help="bundle this tool into one self-contained "
+                                 "executable (needs Python + PyInstaller to build)")
 
     sp = sub.add_parser("search", help="query Audible directly and show what each "
                                        "search strategy returns; writes nothing")
@@ -5653,7 +5736,7 @@ def run_menu() -> int:
         print("  SETTINGS")
         print("   L. Library path        T. Tag options        M. Matching and prompts")
         print("   P. Providers           N. Network and output C. Config file")
-        print("   Q. Quit")
+        print("   B. Build .exe/binary   Q. Quit")
         print("")
         raw = _ask_choice("  > ")
         if raw is None:                      # EOF or Ctrl-C
@@ -5762,6 +5845,9 @@ def run_menu() -> int:
             if extra:
                 args += ["--scan"] + [x.strip() for x in extra.split(",") if x.strip()]
             _run(args)
+        elif choice == "b":
+            do_build()
+            _ask("  Press Enter to return to the menu. ")
         else:
             print("  Unrecognised choice.")
 
@@ -5798,6 +5884,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.command == "fields":
         return do_fields()
+
+    if args.command == "build":
+        return do_build()
 
     if args.command == "search":
         return do_search(cfg, args.title, args.author, args.raw)
