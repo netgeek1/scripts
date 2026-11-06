@@ -9,10 +9,12 @@ All notable changes to audiobook-tagger. Format loosely follows
 ## [1.47.0] - 2026-11-05
 
 ### Added
-- **Self-contained build support.** `build.ps1` bundles the script plus mutagen
-  and the optional libraries into a single `audiobook-tagger.exe` via
-  PyInstaller - no Python install needed to run the result. Build once on
-  Windows, then copy the one file anywhere.
+- **Self-contained build support.** `build.ps1` (Windows) and `build.sh`
+  (Linux/macOS) bundle the script plus mutagen and the optional libraries into a
+  single `audiobook-tagger` executable via PyInstaller - no Python install
+  needed to run the result. Build once, then copy the one file to any machine of
+  the same OS/arch. (The Linux build was verified end-to-end: the frozen binary
+  runs with no Python or mutagen on PATH and writes its config next to itself.)
 - A frozen-aware `app_dir()` so a PyInstaller onefile exe writes its config and
   resolves sidecar paths next to the EXE (which persists) rather than the temp
   extraction dir (which is deleted on exit). No change to the plain-script
