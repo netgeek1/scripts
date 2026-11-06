@@ -15,13 +15,19 @@ on a machine with no Python, bundle it into a single executable with the
 included `build.ps1` (uses PyInstaller):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
+powershell -ExecutionPolicy Bypass -File .\build.ps1      # Windows
 ```
 
-This creates `dist\audiobook-tagger.exe` - copy that one file anywhere and run
-it exactly like the script (`audiobook-tagger.exe menu`, `... tag D:\Audiobooks`,
-etc.). Python is needed only to *build* the exe, not to run it. The build must
-run on the OS you want the exe for (a Windows exe has to be built on Windows).
+```bash
+./build.sh                                                # Linux / macOS
+```
+
+The Windows script creates `dist\audiobook-tagger.exe`; the Linux/macOS script
+creates `dist/audiobook-tagger`. Either way it is one - copy that one file anywhere and run
+it exactly like the script (`audiobook-tagger menu`, `... tag /audiobooks`,
+etc.). Python is needed only to *build* the binary, not to run it. The build
+must run on the OS/arch you want the binary for (a Windows exe is built on
+Windows, a Linux binary on Linux).
 
 When frozen this way, the config `audiobook-tagger.yaml` is written next to the
 exe. Note that mutagen is GPL-2.0-or-later, so a bundled binary is, as a whole,
