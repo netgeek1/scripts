@@ -8,6 +8,25 @@ key. Every write is snapshotted first, so any run can be undone.
 
 ---
 
+## Running without a Python install (single .exe)
+
+The tool is one Python file whose only hard dependency is **mutagen**. To run it
+on a machine with no Python, bundle it into a single executable with the
+included `build.ps1` (uses PyInstaller):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+This creates `dist\audiobook-tagger.exe` - copy that one file anywhere and run
+it exactly like the script (`audiobook-tagger.exe menu`, `... tag D:\Audiobooks`,
+etc.). Python is needed only to *build* the exe, not to run it. The build must
+run on the OS you want the exe for (a Windows exe has to be built on Windows).
+
+When frozen this way, the config `audiobook-tagger.yaml` is written next to the
+exe. Note that mutagen is GPL-2.0-or-later, so a bundled binary is, as a whole,
+GPL - fine for personal use; see LICENSE if you redistribute it.
+
 ## Install
 
 ```
