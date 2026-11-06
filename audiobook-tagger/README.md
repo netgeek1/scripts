@@ -23,8 +23,10 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1      # Windows
 ```
 
 You can also build straight from the tool - run `audiobook-tagger build`, or
-pick **B. Build .exe/binary** in the menu; it runs the right script for your OS
-(or PyInstaller directly if the scripts are not present).
+pick **B. Build .exe/binary** in the menu; it runs the right script for your OS.
+Both build scripts are embedded in the single `.py`, so even a lone copy of the
+script can recreate `build.sh` / `build.ps1` and build itself with no other
+files present.
 
 The Windows script creates `dist\audiobook-tagger.exe`; the Linux/macOS script
 creates `dist/audiobook-tagger`. Either way it is one - copy that one file anywhere and run
