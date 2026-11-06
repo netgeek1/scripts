@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-audiobook-tagger 1.48.0
+audiobook-tagger 1.49.0
 
 Scan, identify, tag, verify and report on an audiobook library, writing
 Plex- / Audiobookshelf-friendly tags across MP3, M4B/M4A, FLAC and OGG.
@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "1.48.0"
+__version__ = "1.49.0"
 PROGRAM = "audiobook-tagger"
 
 # --------------------------------------------------------------------------
@@ -4666,6 +4666,160 @@ def do_search(cfg: Dict[str, Any], title: str, author: Optional[str],
     return 0 if any_hit else 1
 
 
+# ----------------------------------------------------------------------------
+# Embedded build scripts (base64 of build.sh / build.ps1). Lets the single .py
+# recreate them when distributed on its own, so `build` works with no extra
+# files. Kept in sync with the standalone build.sh / build.ps1.
+# ----------------------------------------------------------------------------
+_BUILD_SH_B64 = (
+    "IyEvdXNyL2Jpbi9lbnYgYmFzaAojCiMgQnVpbGQgYSBzaW5nbGUgc2VsZi1jb250YWluZWQgYXVk"
+    "aW9ib29rLXRhZ2dlciBiaW5hcnkgKG5vIFB5dGhvbiBpbnN0YWxsCiMgbmVlZGVkIHRvIFJVTiB0"
+    "aGUgcmVzdWx0KS4KIwojIENyZWF0ZXMgYSB0aHJvd2F3YXkgdmlydHVhbCBlbnZpcm9ubWVudCwg"
+    "aW5zdGFsbHMgbXV0YWdlbiBwbHVzIHRoZSBvcHRpb25hbAojIGxpYnJhcmllcywgYW5kIHJ1bnMg"
+    "UHlJbnN0YWxsZXIgdG8gcHJvZHVjZSBvbmUgcG9ydGFibGUgZXhlY3V0YWJsZS4gUHl0aG9uIElT"
+    "CiMgcmVxdWlyZWQgdG8gQlVJTEQgKHJ1biB0aGlzIG9uY2UpOyBpdCBpcyBOT1QgcmVxdWlyZWQg"
+    "dG8gcnVuIHRoZSByZXN1bHQgb24KIyBhbm90aGVyIG1hY2hpbmUgb2YgdGhlIHNhbWUgT1MvYXJj"
+    "aC4KIwojIE91dHB1dDogIC4vZGlzdC9hdWRpb2Jvb2stdGFnZ2VyCiMKIyBVc2FnZToKIyAgIC4v"
+    "YnVpbGQuc2ggICAgICAgICAgICAgICAgICMgbm9ybWFsIGJ1aWxkCiMgICAuL2J1aWxkLnNoIC0t"
+    "Y2xlYW4gICAgICAgICAjIHdpcGUgYnVpbGQvIGRpc3QvICouc3BlYyBmaXJzdAojICAgU0NSSVBU"
+    "PWZvby5weSAuL2J1aWxkLnNoICAgIyBidW5kbGUgYSBkaWZmZXJlbnQgc291cmNlIGZpbGUKIwoj"
+    "IE5vdGVzOgojICAgLSBCdWlsZCBvbiB0aGUgc2FtZSBPUy9hcmNoIHlvdSB3YW50IHRoZSBiaW5h"
+    "cnkgZm9yIChhIExpbnV4IGJ1aWxkIG1ha2VzIGEKIyAgICAgTGludXggYmluYXJ5OyBpdCB3aWxs"
+    "IG5vdCBydW4gb24gV2luZG93cyBvciBtYWNPUykuCiMgICAtIG11dGFnZW4gaXMgR1BMLTIuMC1v"
+    "ci1sYXRlci4gQSBidW5kbGVkIGJpbmFyeSB0aGF0IGVtYmVkcyBpdCBpcywgYXMgYQojICAgICB3"
+    "aG9sZSwgY292ZXJlZCBieSB0aGUgR1BMLiBTaGlwcGluZyB0aGUgLnB5IHdpdGggZGVwcyBpbnN0"
+    "YWxsZWQgc2VwYXJhdGVseQojICAgICBrZWVwcyB0aGVtIGluZGVwZW5kZW50IHdvcmtzLiBGaW5l"
+    "IGZvciBwZXJzb25hbCB1c2UgZWl0aGVyIHdheS4KCnNldCAtZXVvIHBpcGVmYWlsCmNkICIkKGRp"
+    "cm5hbWUgIiQwIikiCgpTQ1JJUFQ9IiR7U0NSSVBUOi1hdWRpb2Jvb2tfdGFnZ2VyLnB5fSIKTkFN"
+    "RT0iJHtOQU1FOi1hdWRpb2Jvb2stdGFnZ2VyfSIKVkVOVj0iJHtWRU5WOi0uYnVpbGQtdmVudn0i"
+    "CgojIC0tLS0gb3B0aW9ucyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
+    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tCkNMRUFOPTAKZm9yIGFyZyBpbiAiJEAiOyBkbwogICAgY2Fz"
+    "ZSAiJGFyZyIgaW4KICAgICAgICAtLWNsZWFuKSBDTEVBTj0xIDs7CiAgICAgICAgKikgZWNobyAi"
+    "dW5rbm93biBvcHRpb246ICRhcmciID4mMjsgZXhpdCAyIDs7CiAgICBlc2FjCmRvbmUKCmlmIFtb"
+    "ICEgLWYgIiRTQ1JJUFQiIF1dOyB0aGVuCiAgICBlY2hvICJlcnJvcjogc291cmNlIHNjcmlwdCAn"
+    "JFNDUklQVCcgbm90IGZvdW5kIG5leHQgdG8gdGhpcyBidWlsZCBzY3JpcHQuIiA+JjIKICAgIGV4"
+    "aXQgMQpmaQoKIyAtLS0tIGZpbmQgcHl0aG9uIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
+    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpQWT0iIgpmb3IgYyBpbiBweXRob24zIHB5dGhv"
+    "bjsgZG8KICAgIGlmIGNvbW1hbmQgLXYgIiRjIiA+L2Rldi9udWxsIDI+JjE7IHRoZW4gUFk9IiRj"
+    "IjsgYnJlYWs7IGZpCmRvbmUKaWYgW1sgLXogIiRQWSIgXV07IHRoZW4KICAgIGVjaG8gImVycm9y"
+    "OiBubyBweXRob24zIGZvdW5kLiBJbnN0YWxsIFB5dGhvbiAzLjkrIGFuZCByZS1ydW4uIiA+JjIK"
+    "ICAgIGV4aXQgMQpmaQplY2hvICJVc2luZyBQeXRob246ICQoIiRQWSIgLS12ZXJzaW9uIDI+JjEp"
+    "IgoKaWYgW1sgIiRDTEVBTiIgPT0gIjEiIF1dOyB0aGVuCiAgICBlY2hvICJDbGVhbmluZyBidWls"
+    "ZC8gZGlzdC8gKi5zcGVjIC4uLiIKICAgIHJtIC1yZiBidWlsZCBkaXN0IC4vKi5zcGVjCmZpCgoj"
+    "IC0tLS0gaXNvbGF0ZWQgYnVpbGQgdmVudiAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
+    "LS0tLS0tLS0tLS0tLS0tLS0tCmlmIFtbICEgLWQgIiRWRU5WIiBdXTsgdGhlbgogICAgZWNobyAi"
+    "Q3JlYXRpbmcgYnVpbGQgdmVudiBpbiAkVkVOViAuLi4iCiAgICAiJFBZIiAtbSB2ZW52ICIkVkVO"
+    "ViIKZmkKVkVOVl9QWT0iJFZFTlYvYmluL3B5dGhvbiIKCmVjaG8gIkluc3RhbGxpbmcgYnVpbGQg"
+    "ZGVwZW5kZW5jaWVzIC4uLiIKIiRWRU5WX1BZIiAtbSBwaXAgaW5zdGFsbCAtLXVwZ3JhZGUgcGlw"
+    "ID4vZGV2L251bGwKIyBtdXRhZ2VuIGlzIHRoZSBvbmx5IGhhcmQgZGVwZW5kZW5jeTsgdGhlIHJl"
+    "c3QgbGlnaHQgdXAgb3B0aW9uYWwgZmVhdHVyZXMuCiIkVkVOVl9QWSIgLW0gcGlwIGluc3RhbGwg"
+    "bXV0YWdlbiByYXBpZGZ1enogUGlsbG93IFB5WUFNTCBjZXJ0aWZpIHB5aW5zdGFsbGVyCgojIC0t"
+    "LS0gYnVpbGQgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
+    "LS0tLS0tLS0tLS0tLS0tCklDT05fQVJHUz0oKQojIFB5SW5zdGFsbGVyIG9uIExpbnV4IGlnbm9y"
+    "ZXMgLS1pY29uIGZvciBFTEYgYmluYXJpZXM7IGxlZnQgb3V0IGJ5IGRlc2lnbi4KCmVjaG8gIlJ1"
+    "bm5pbmcgUHlJbnN0YWxsZXIgLi4uIgoiJFZFTlZfUFkiIC1tIFB5SW5zdGFsbGVyIFwKICAgIC0t"
+    "b25lZmlsZSBcCiAgICAtLWNvbnNvbGUgXAogICAgLS1uYW1lICIkTkFNRSIgXAogICAgLS1jb2xs"
+    "ZWN0LXN1Ym1vZHVsZXMgbXV0YWdlbiBcCiAgICAtLWNvbGxlY3QtZGF0YSBjZXJ0aWZpIFwKICAg"
+    "IC0tbm9jb25maXJtIFwKICAgICIke0lDT05fQVJHU1tAXX0iIFwKICAgICIkU0NSSVBUIgoKT1VU"
+    "PSJkaXN0LyROQU1FIgppZiBbWyAtZiAiJE9VVCIgXV07IHRoZW4KICAgIFNJWkU9IiQoZHUgLWgg"
+    "IiRPVVQiIHwgY3V0IC1mMSkiCiAgICBlY2hvICIiCiAgICBlY2hvICJCdWlsdDogJE9VVCAgKCRT"
+    "SVpFKSIKICAgIGVjaG8gIlRlc3QgaXQ6ICAkT1VUIC0tdmVyc2lvbiIKICAgIGVjaG8gIiIKICAg"
+    "IGVjaG8gIkNvcHkgdGhhdCBzaW5nbGUgZmlsZSB0byBhbnkgc2FtZS1PUy9hcmNoIG1hY2hpbmUg"
+    "LSBubyBQeXRob24gbmVlZGVkLiIKZWxzZQogICAgZWNobyAiZXJyb3I6IGJ1aWxkIGZpbmlzaGVk"
+    "IGJ1dCAnJE9VVCcgd2FzIG5vdCBmb3VuZC4iID4mMgogICAgZXhpdCAxCmZpCg=="
+)
+
+_BUILD_PS1_B64 = (
+    "PCMKLlNZTk9QU0lTCiAgICBCdWlsZHMgYSBzaW5nbGUgc2VsZi1jb250YWluZWQgYXVkaW9ib29r"
+    "LXRhZ2dlci5leGUgKG5vIFB5dGhvbiBpbnN0YWxsCiAgICBuZWVkZWQgdG8gUlVOIHRoZSByZXN1"
+    "bHQpLgoKLkRFU0NSSVBUSU9OCiAgICBDcmVhdGVzIGEgdGhyb3dhd2F5IHZpcnR1YWwgZW52aXJv"
+    "bm1lbnQsIGluc3RhbGxzIG11dGFnZW4gcGx1cyB0aGUgb3B0aW9uYWwKICAgIGxpYnJhcmllcywg"
+    "YW5kIHJ1bnMgUHlJbnN0YWxsZXIgdG8gcHJvZHVjZSBvbmUgcG9ydGFibGUgLmV4ZS4gUHl0aG9u"
+    "IElTCiAgICByZXF1aXJlZCB0byBCVUlMRCAocnVuIHRoaXMgb25jZSk7IGl0IGlzIE5PVCByZXF1"
+    "aXJlZCB0byBydW4gdGhlIHJlc3VsdGluZwogICAgZXhlIG9uIGFueSBvdGhlciBtYWNoaW5lLgoK"
+    "ICAgIE91dHB1dDogIC5cZGlzdFxhdWRpb2Jvb2stdGFnZ2VyLmV4ZQoKLk5PVEVTCiAgICAtIFJ1"
+    "biBvbiB0aGUgU0FNRSBPUy9hcmNoIHlvdSB3YW50IHRoZSBleGUgZm9yIChXaW5kb3dzIGV4ZSBu"
+    "ZWVkcyBXaW5kb3dzKS4KICAgIC0gbXV0YWdlbiBpcyBHUEwtMi4wLW9yLWxhdGVyLiBBIGJ1bmRs"
+    "ZWQgYmluYXJ5IHRoYXQgZW1iZWRzIGl0IGlzLCBhcyBhCiAgICAgIHdob2xlLCBjb3ZlcmVkIGJ5"
+    "IHRoZSBHUEwuIERpc3RyaWJ1dGluZyB0aGUgLnB5IHNjcmlwdCB3aXRoIGRlcHMgaW5zdGFsbGVk"
+    "CiAgICAgIHNlcGFyYXRlbHkga2VlcHMgdGhlbSBpbmRlcGVuZGVudCB3b3Jrcy4gRmluZSBmb3Ig"
+    "cGVyc29uYWwgdXNlIGVpdGhlciB3YXkuCgouRVhBTVBMRQogICAgcG93ZXJzaGVsbCAtRXhlY3V0"
+    "aW9uUG9saWN5IEJ5cGFzcyAtRmlsZSAuXGJ1aWxkLnBzMQojPgoKW0NtZGxldEJpbmRpbmcoKV0K"
+    "cGFyYW0oCiAgICBbc3RyaW5nXSRTY3JpcHQgID0gImF1ZGlvYm9va190YWdnZXIucHkiLCAgICMg"
+    "c291cmNlIHRvIGJ1bmRsZQogICAgW3N0cmluZ10kTmFtZSAgICA9ICJhdWRpb2Jvb2stdGFnZ2Vy"
+    "IiwgICAgICAjIG91dHB1dCBleGUgbmFtZSAobm8gZXh0ZW5zaW9uKQogICAgW3N3aXRjaF0kQ29u"
+    "c29sZSA9ICR0cnVlLCAgICAgICAgICAgICAgICAgICAjIGtlZXAgdGhlIGNvbnNvbGUgd2luZG93"
+    "IChDTEkgdG9vbCkKICAgIFtzd2l0Y2hdJENsZWFuICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+    "ICAgIyByZW1vdmUgYnVpbGQvIGRpc3QvICouc3BlYyBmaXJzdAopCgokRXJyb3JBY3Rpb25QcmVm"
+    "ZXJlbmNlID0gIlN0b3AiClNldC1Mb2NhdGlvbiAtUGF0aCAkUFNTY3JpcHRSb290CgpmdW5jdGlv"
+    "biBGaW5kLVB5dGhvbiB7CiAgICBmb3JlYWNoICgkYyBpbiBAKAogICAgICAgIEB7IGV4ZSA9ICJw"
+    "eSI7ICAgICBhcmdzID0gQCgiLTMiKSB9LAogICAgICAgIEB7IGV4ZSA9ICJweXRob24iOyBhcmdz"
+    "ID0gQCgpIH0sCiAgICAgICAgQHsgZXhlID0gInB5dGhvbjMiOyBhcmdzID0gQCgpIH0KICAgICkp"
+    "IHsKICAgICAgICAkY21kID0gR2V0LUNvbW1hbmQgJGMuZXhlIC1FcnJvckFjdGlvbiBTaWxlbnRs"
+    "eUNvbnRpbnVlCiAgICAgICAgaWYgKCRjbWQpIHsKICAgICAgICAgICAgdHJ5IHsgJiAkYy5leGUg"
+    "QCgkYy5hcmdzICsgIi0tdmVyc2lvbiIpICo+ICRudWxsOyByZXR1cm4gJGMgfSBjYXRjaCB7fQog"
+    "ICAgICAgIH0KICAgIH0KICAgIHRocm93ICJObyBQeXRob24gZm91bmQuIEluc3RhbGwgUHl0aG9u"
+    "IDMuOSsgZnJvbSBodHRwczovL3B5dGhvbi5vcmcgYW5kIHJlLXJ1bi4iCn0KCmlmICgtbm90IChU"
+    "ZXN0LVBhdGggJFNjcmlwdCkpIHsKICAgIHRocm93ICJTb3VyY2Ugc2NyaXB0ICckU2NyaXB0JyBu"
+    "b3QgZm91bmQgbmV4dCB0byB0aGlzIGJ1aWxkIHNjcmlwdC4iCn0KCmlmICgkQ2xlYW4pIHsKICAg"
+    "IFdyaXRlLUhvc3QgIkNsZWFuaW5nIGJ1aWxkLyBkaXN0LyAqLnNwZWMgLi4uIiAtRm9yZWdyb3Vu"
+    "ZENvbG9yIFllbGxvdwogICAgUmVtb3ZlLUl0ZW0gLVJlY3Vyc2UgLUZvcmNlIGJ1aWxkLCBkaXN0"
+    "IC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlCiAgICBSZW1vdmUtSXRlbSAtRm9yY2UgKi5z"
+    "cGVjIC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlCn0KCiRweSA9IEZpbmQtUHl0aG9uCiRw"
+    "eUV4ZSA9ICRweS5leGUKJHB5QXJncyA9ICRweS5hcmdzCldyaXRlLUhvc3QgIlVzaW5nIFB5dGhv"
+    "bjogJHB5RXhlICQoJHB5QXJncyAtam9pbiAnICcpIiAtRm9yZWdyb3VuZENvbG9yIEN5YW4KCiMg"
+    "LS0tIGlzb2xhdGVkIGJ1aWxkIHZlbnYgKGtlZXBzIHlvdXIgc3lzdGVtIFB5dGhvbiBjbGVhbikg"
+    "LS0tLS0tLS0tLS0tLS0tLS0tCiR2ZW52ID0gSm9pbi1QYXRoICRQU1NjcmlwdFJvb3QgIi5idWls"
+    "ZC12ZW52IgppZiAoLW5vdCAoVGVzdC1QYXRoICR2ZW52KSkgewogICAgV3JpdGUtSG9zdCAiQ3Jl"
+    "YXRpbmcgYnVpbGQgdmVudiBpbiAkdmVudiAuLi4iIC1Gb3JlZ3JvdW5kQ29sb3IgQ3lhbgogICAg"
+    "JiAkcHlFeGUgQCgkcHlBcmdzICsgQCgiLW0iLCAidmVudiIsICR2ZW52KSkKfQokdmVudlB5ID0g"
+    "Sm9pbi1QYXRoICR2ZW52ICJTY3JpcHRzXHB5dGhvbi5leGUiCmlmICgtbm90IChUZXN0LVBhdGgg"
+    "JHZlbnZQeSkpIHsKICAgICMgbm9uLVdpbmRvd3MgdmVudiBsYXlvdXQgKGxldHMgdGhpcyBzY3Jp"
+    "cHQgYWxzbyBidWlsZCBvbiBMaW51eC9tYWNPUykKICAgICR2ZW52UHkgPSBKb2luLVBhdGggJHZl"
+    "bnYgImJpbi9weXRob24iCn0KCldyaXRlLUhvc3QgIkluc3RhbGxpbmcgYnVpbGQgZGVwZW5kZW5j"
+    "aWVzIC4uLiIgLUZvcmVncm91bmRDb2xvciBDeWFuCiYgJHZlbnZQeSAtbSBwaXAgaW5zdGFsbCAt"
+    "LXVwZ3JhZGUgcGlwICo+ICRudWxsCiMgbXV0YWdlbiBpcyB0aGUgb25seSBoYXJkIGRlcDsgdGhl"
+    "IHJlc3QgbGlnaHQgdXAgb3B0aW9uYWwgZmVhdHVyZXMKJiAkdmVudlB5IC1tIHBpcCBpbnN0YWxs"
+    "IG11dGFnZW4gcmFwaWRmdXp6IFBpbGxvdyBQeVlBTUwgY2VydGlmaSBweWluc3RhbGxlcgoKIyAt"
+    "LS0gYnVpbGQgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t"
+    "LS0tLS0tLS0tLS0tLS0tLS0KJGljb25BcmcgPSBAKCkKaWYgKFRlc3QtUGF0aCAiaWNvbi5pY28i"
+    "KSB7ICRpY29uQXJnID0gQCgiLS1pY29uIiwgImljb24uaWNvIikgfQoKJG1vZGUgPSBpZiAoJENv"
+    "bnNvbGUpIHsgIi0tY29uc29sZSIgfSBlbHNlIHsgIi0td2luZG93ZWQiIH0KCldyaXRlLUhvc3Qg"
+    "IlJ1bm5pbmcgUHlJbnN0YWxsZXIgLi4uIiAtRm9yZWdyb3VuZENvbG9yIEN5YW4KJiAkdmVudlB5"
+    "IC1tIFB5SW5zdGFsbGVyIGAKICAgIC0tb25lZmlsZSBgCiAgICAkbW9kZSBgCiAgICAtLW5hbWUg"
+    "JE5hbWUgYAogICAgLS1jb2xsZWN0LXN1Ym1vZHVsZXMgbXV0YWdlbiBgCiAgICAtLWNvbGxlY3Qt"
+    "ZGF0YSBjZXJ0aWZpIGAKICAgIC0tbm9jb25maXJtIGAKICAgIEBpY29uQXJnIGAKICAgICRTY3Jp"
+    "cHQKCiRvdXQgPSBKb2luLVBhdGggJFBTU2NyaXB0Um9vdCAiZGlzdFwkTmFtZS5leGUiCmlmICgt"
+    "bm90IChUZXN0LVBhdGggJG91dCkpIHsgJG91dCA9IEpvaW4tUGF0aCAkUFNTY3JpcHRSb290ICJk"
+    "aXN0LyROYW1lIiB9ICAjIG5vbi1XaW5kb3dzCgppZiAoVGVzdC1QYXRoICRvdXQpIHsKICAgICRz"
+    "aXplID0gInswOk4xfSBNQiIgLWYgKChHZXQtSXRlbSAkb3V0KS5MZW5ndGggLyAxTUIpCiAgICBX"
+    "cml0ZS1Ib3N0ICIiCiAgICBXcml0ZS1Ib3N0ICJCdWlsdDogJG91dCAgKCRzaXplKSIgLUZvcmVn"
+    "cm91bmRDb2xvciBHcmVlbgogICAgV3JpdGUtSG9zdCAiVGVzdCBpdDogICYgJyRvdXQnIC0tdmVy"
+    "c2lvbiIgLUZvcmVncm91bmRDb2xvciBHcmVlbgogICAgV3JpdGUtSG9zdCAiIgogICAgV3JpdGUt"
+    "SG9zdCAiQ29weSB0aGF0IHNpbmdsZSBmaWxlIGFueXdoZXJlIC0gbm8gUHl0aG9uIG5lZWRlZCB0"
+    "byBydW4gaXQuIiAtRm9yZWdyb3VuZENvbG9yIEdyZWVuCn0gZWxzZSB7CiAgICB0aHJvdyAiQnVp"
+    "bGQgZmluaXNoZWQgYnV0IHRoZSBleHBlY3RlZCBvdXRwdXQgd2FzIG5vdCBmb3VuZCB1bmRlciBk"
+    "aXN0XC4iCn0K"
+)
+
+
+def _write_build_script(path: Path, is_windows: bool) -> bool:
+    """Write build.sh / build.ps1 from the embedded copy. Returns success."""
+    import base64
+    data = base64.b64decode(_BUILD_PS1_B64 if is_windows else _BUILD_SH_B64)
+    try:
+        path.write_bytes(data)
+        if not is_windows:
+            try:
+                path.chmod(path.stat().st_mode | 0o755)
+            except OSError:
+                pass
+        return True
+    except OSError as exc:
+        log.warning("could not write %s: %s", path, exc)
+        return False
+
+
 def _build_with_pyinstaller(source: Path, workdir: Path, name: str) -> int:
     """Fallback build when no build.sh/build.ps1 is present: run PyInstaller
     directly with the current interpreter."""
@@ -4717,9 +4871,19 @@ def do_build(name: str = "audiobook-tagger") -> int:
             print(f"  using build script: {script.name}")
             rc = _subprocess.call(cmd, cwd=str(here))
         else:
-            print("  no build.ps1 / build.sh found next to the script - "
-                  "building with PyInstaller directly.")
-            rc = _build_with_pyinstaller(source, here, name)
+            print(f"  {script.name} not found - creating it from the built-in copy ...")
+            if _write_build_script(script, is_windows):
+                print(f"  wrote {script}")
+                if is_windows:
+                    cmd = ["powershell", "-ExecutionPolicy", "Bypass",
+                           "-File", str(script)]
+                else:
+                    cmd = ["bash", str(script)]
+                rc = _subprocess.call(cmd, cwd=str(here))
+            else:
+                print("  could not create the build script - "
+                      "building with PyInstaller directly instead.")
+                rc = _build_with_pyinstaller(source, here, name)
     except FileNotFoundError as exc:
         tool = "PowerShell" if is_windows else "bash"
         print(f"  could not start the build ({exc}).")
