@@ -32,6 +32,7 @@ scripts you `curl` onto other machines.
 - [Menu and CLI](#menu-and-cli)
 - [Apps](#apps)
 - [Custom apps](#custom-apps)
+- [Status dots](#status-dots)
 - [Host health](#host-health)
 - [Updating containers](#updating-containers)
 - [Secrets](#secrets)
@@ -392,6 +393,21 @@ reports a "DNS rebind attack", and some NAS or switch UIs say "invalid host". Yo
 A plain link (**Links**) only adds a card that opens the device directly. A site goes through the proxy: you get
 the certificate and name, and the status dot reflects what the proxy can reach.
 
+## Status dots
+
+Every 2 minutes (`HEALTH_INTERVAL`), a timer requests each link from this host and writes the result to the page.
+
+- **Any HTTP answer counts as up**, including 401, 403 and 500. No answer within 3 s to connect, or 6 s in total,
+  counts as down. Certificate errors are ignored.
+- **The proxy's own names** are requested through the local proxy. A 502/503/504 from it means the app behind it is
+  down.
+- **Custom links and external sites by name** are looked up in **Pi-hole first**, then this host's DNS if Pi-hole
+  has no answer (`HEALTH_DNS='pihole'`, the default). Records you add to Pi-hole's local DNS for your clients
+  therefore count here too, even when the host itself uses another DNS server. Set `HEALTH_DNS='host'` (Settings →
+  Health) to use only the host's DNS. Lookups use `dig` (package `bind9-dnsutils`, installed with the base
+  packages); without it, or with Pi-hole stopped, the host's DNS is used.
+- `sudo docker-dashboard --health` (menu 9) checks everything now and shows the result for each link.
+
 ## Host health
 
 The health check (every 2 minutes) also collects host health for the **Host** panel at the top of the page. Each
@@ -511,6 +527,7 @@ All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menu
 | `CERT_PUSH_FROM` | — | `push` mode: IPs/CIDRs the push key is accepted from (sshd `from=`); empty = any |
 | `FILES_DIR`, `FILES_HTTP` | —, `yes` | `/files/` share, plus plain-HTTP downloads |
 | `HEALTH_CHECK`, `HEALTH_INTERVAL` | `yes`, `2` | Status dots |
+| `HEALTH_DNS` | `pihole` | Name lookups for status dots: `pihole` (Pi-hole first, then the host's DNS) or `host` |
 | `HOST_PANEL` | `yes` | Host panel on the page |
 | `HOST_DISK_WARN`, `HOST_DISK_CRIT` | `80`, `90` | Disk thresholds (%) |
 | `HOST_MEM_WARN`, `HOST_MEM_CRIT` | `85`, `95` | Memory thresholds (%) |
@@ -567,7 +584,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 98 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 102 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
