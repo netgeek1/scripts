@@ -3,6 +3,16 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.9.0 — 2026-11-07 — Status dots look names up in Pi-hole
+
+### Changed
+- Status checks for custom links and external sites now resolve names via **Pi-hole first**, then the host's DNS.
+  Names that exist only in Pi-hole's local DNS, which the clients use but the host doesn't, used to show red.
+  `HEALTH_DNS='host'` (Settings → Health) restores host-only lookups.
+- `bind9-dnsutils` (`dig`) joins the base packages. Without it, or with Pi-hole stopped, the host's DNS is used.
+- README: a new **Status dots** section explains how links are checked.
+- Self-test: 102 checks.
+
 ## v2.8.0 — 2026-11-07 — Pi-hole hostname and dnsmasq options
 
 ### Added
