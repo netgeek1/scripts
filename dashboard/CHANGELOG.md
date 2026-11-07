@@ -3,6 +3,35 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.8.0 — 2026-11-07 — Pi-hole hostname and dnsmasq options
+
+### Added
+- **Pi-hole's hostname is its proxy name** (`pihole.<domain>`, or `pihole` without a domain), instead of the
+  container ID.
+- **Pi-hole answers its own name and `pi.hole` with the host address**, via `FTLCONF_dns_reply_host_force4`/`_IPv4`.
+  Pi-hole answers those names with the interface a query arrived on. Inside Docker that is the container's internal
+  IP, so making the hostname the proxy name would otherwise send clients to an address they can't reach.
+  `--change-ip` keeps it current.
+- **`PIHOLE_DNSMASQ_LINES`** (Apps → Pi-hole), passed as `FTLCONF_misc_dnsmasq_lines`. It defaults to
+  `dns-forward-max=5096;min-cache-ttl=300`, which avoids "Maximum number of concurrent DNS queries reached
+  (max: 150)". Existing installs get it on the next apply.
+- Any of these can be overridden by setting the same `FTLCONF_*` key in `PIHOLE_EXTRA_ENV`.
+- Self-test: 98 checks.
+
+## v2.7.0 — 2026-11-01 — Sites on other machines
+
+### Added
+- **External sites** (`KIND='site'` in `app.conf`). A web UI on another machine, such as a firewall, NAS, switch or
+  printer, gets its own name under the domain, the wildcard certificate, a card with a status dot, and an entry in
+  the Pi-hole/DNS list.
+  - Add one from the menu (**Apps → C → W**) or with `--add-site 'name|https://host[:port]/|Title|Description'`,
+    which applies straight away. Both first check that this host can reach the address.
+  - Absolute redirects from the device to its own address are rewritten back to the proxy name.
+  - `HOST_HEADER='upstream'` sends the device its own host/IP for UIs that reject unknown names. The README covers
+    the device-side alternative, e.g. OPNsense Alternate Hostnames.
+  - Nothing runs here. Update-all and the update check skip sites, and Remove deletes only the `app.conf`.
+- Self-test: 94 checks.
+
 ## v2.6.6 — 2026-11-01 — Locally built images in the update check
 
 ### Fixed
