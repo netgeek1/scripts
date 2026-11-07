@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.8.0"
+readonly SCRIPT_VERSION="2.9.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -87,7 +87,7 @@ CONF_KEYS=( DASH_TITLE DOMAIN DASH_SUBDOMAIN HOST_ADDR EXTRA_NAMES HTTP_PORT HTT
             DEPLOY_DIR STACKS_DIR NGINX_IMAGE
             CERT_MODE CERT_FILE CERT_KEY_FILE CERT_DAYS CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY
             CERT_PUSH_USER CERT_PUSH_FROM
-            FILES_DIR FILES_HTTP HEALTH_CHECK HEALTH_INTERVAL
+            FILES_DIR FILES_HTTP HEALTH_CHECK HEALTH_INTERVAL HEALTH_DNS
             HOST_PANEL HOST_DISK_WARN HOST_DISK_CRIT HOST_MEM_WARN HOST_MEM_CRIT HOST_LOAD_WARN HOST_LOAD_CRIT
             UPDATE_SCHEDULE UPDATE_DAY UPDATE_TIME UPDATE_PRUNE UPDATE_EXCLUDE UPDATE_DELEGATE WATCHTOWER_IMAGE
             SECRETS_BACKEND
@@ -354,6 +354,7 @@ set_default_config() {
         [FILES_HTTP]="yes"
         [HEALTH_CHECK]="yes"
         [HEALTH_INTERVAL]="2"
+        [HEALTH_DNS]="pihole"
         [HOST_PANEL]="yes"
         [HOST_DISK_WARN]="80"
         [HOST_DISK_CRIT]="90"
@@ -2410,7 +2411,7 @@ render_oncalendar() {   # render_oncalendar SCHEDULE DAY HH:MM
 # -----------------------------------------------------------------------------
 # HOST PREPARATION (after the settings are known, before anything is deployed)
 # -----------------------------------------------------------------------------
-readonly BASE_PACKAGES="ca-certificates curl gnupg openssl iproute2 gawk sed util-linux diffutils tar gzip openssh-client"
+readonly BASE_PACKAGES="ca-certificates curl gnupg openssl iproute2 gawk sed util-linux diffutils tar gzip openssh-client bind9-dnsutils"
 
 ensure_base_packages() {
     local -a missing=() p
@@ -2988,11 +2989,15 @@ stack_stop() {   # stop_all: dashboard + apps (data kept)
 # -----------------------------------------------------------------------------
 # probe_url URL [VIA_PROXY_HOST] -> "code<TAB>seconds"; own names are sent to the local proxy
 probe_url() {
-    local out port
+    local out port h ip
     local -a extra=()
     if [[ -n "${2:-}" ]]; then
         port=${CFG[HTTPS_PORT]:-443}
         extra=( --resolve "$2:$port:127.0.0.1" )
+    elif [[ -n "$HC_DNS" ]] && read -r h port < <(url_host_port "$1") && ! valid_ipv4 "$h"; then
+        # Pi-hole first (it knows the local records the clients use), this host's DNS if it has no answer
+        ip=$(pihole_lookup "$h")
+        [[ -n "$ip" ]] && extra=( --resolve "$h:$port:$ip" )
     fi
     out=$(curl -sk --noproxy '*' "${extra[@]}" -o /dev/null -m 6 --connect-timeout 3 -w '%{http_code}\t%{time_total}' "$1" 2>/dev/null || true)
     [[ "$out" =~ ^[0-9]{3}$'\t'[0-9.]+$ ]] || out=$'000\t0'
@@ -3001,12 +3006,39 @@ probe_url() {
     printf '%s' "$out"
 }
 
+# url_host_port URL -> "host port" (default port from the scheme; IPv6 literals are left to curl)
+url_host_port() {
+    local u=$1 scheme hp h p
+    [[ "$u" =~ ^(https?)://([^/?#]+) ]] || return 1
+    scheme=${BASH_REMATCH[1]}; hp=${BASH_REMATCH[2]}; hp=${hp##*@}
+    [[ "$hp" == \[* ]] && return 1
+    h=${hp%%:*}; p=${hp#"$h"}; p=${p#:}
+    [[ -n "$p" ]] || { [[ "$scheme" == https ]] && p=443 || p=80; }
+    printf '%s %s\n' "$h" "$p"
+}
+
+# pihole_lookup NAME -> first IPv4 Pi-hole returns (follows CNAMEs), or nothing
+pihole_lookup() {
+    dig +short +time=2 +tries=1 -p "${HC_DNS#*:}" "@${HC_DNS%%:*}" A "$1" 2>/dev/null \
+        | grep -Em1 '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true
+}
+
+HC_DNS=""   # "addr:port" of the Pi-hole used for lookups during a health run
+health_dns_setup() {
+    HC_DNS=""
+    [[ "${CFG[HEALTH_DNS]:-pihole}" == pihole ]] && app_on pihole || return 0
+    command -v dig >/dev/null 2>&1 || { _log_file WARN "health: dig not found (package bind9-dnsutils); using this host's DNS"; return 0; }
+    docker ps -q --filter name='^pihole$' --filter status=running 2>/dev/null | grep -q . || return 0
+    HC_DNS="127.0.0.1:${CFG[PIHOLE_DNS_PORT]:-53}"
+}
+
 health_check() {   # health_check [quiet]
     ensure_config
     detect_network
     load_services
     local quiet=${1:-} t i url via n
     local -a urls=() vias=()
+    health_dns_setup
     # custom apps recreated outside this script lose their proxy network: re-attach before probing
     if (( ! DRY_RUN )) && docker_up; then for n in $(enabled_customs); do custom_attach "$n"; done; fi
     while IFS=$'\t' read -r url via; do
@@ -4022,6 +4054,7 @@ v_fetchsrc()  { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.:_-]+:/[^[:spa
 v_fname()     { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 v_url()       { valid_url "$1"; }
 v_dnsmasq()   { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9][A-Za-z0-9=,./:#_-]*(\;[A-Za-z0-9][A-Za-z0-9=,./:#_-]*)*$ ]]; }
+v_healthdns() { [[ "$1" =~ ^(pihole|host)$ ]]; }
 v_pct()       { [[ "$1" =~ ^[0-9]{1,3}$ ]] && (( $1 >= 1 && $1 <= 100 )); }
 v_load()      { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 section() { printf '\n  %s%s%s\n' "$B" "$1" "$NC"; }
@@ -4079,6 +4112,7 @@ cfg_health() {
     section "Health checks (status dots on the page)"
     ask_valid HEALTH_CHECK "Check links from this host (yes/no)" v_yesno
     [[ "${CFG[HEALTH_CHECK]}" == yes ]] && ask_valid HEALTH_INTERVAL "Interval in minutes (1-60)" v_minutes
+    [[ "${CFG[HEALTH_CHECK]}" == yes ]] && ask_valid HEALTH_DNS "Look names up via Pi-hole first, then this host's DNS (pihole), or this host's DNS only (host)" v_healthdns
     ask_valid HOST_PANEL "Show host health (CPU, memory, disks, containers) on the page (yes/no)" v_yesno
     if [[ "${CFG[HOST_PANEL]}" == yes ]]; then
         ask_valid HOST_DISK_WARN "Disk use warning at %" v_pct
@@ -4472,6 +4506,10 @@ self_test() {
     st "site: nginx block"                  '( allcfg; STACKS_DIR="$t/stacks1"; site_defaults fw https://192.168.0.253/ Firewall; mkdir -p "$(custom_dir fw)"; custom_save fw; c=$(render_nginx | sed -n "/server_name fw.example.net/,/^}/p"); [[ "$c" == *"set \$upstream https://192.168.0.253;"* && "$c" == *"proxy_redirect https://192.168.0.253/ /;"* && "$c" == *"proxy_ssl_verify off"* && "$c" == *"proxy_set_header Host \$host;"* ]] )'
     st "site: upstream host header"         '( allcfg; STACKS_DIR="$t/stacks2"; site_defaults nas http://nas.lan:5000/; CA[HOST_HEADER]=upstream; mkdir -p "$(custom_dir nas)"; custom_save nas; c=$(render_nginx | sed -n "/server_name nas.example.net/,/^}/p"); [[ "$c" == *"proxy_set_header Host nas.lan:5000;"* && "$c" != *"proxy_set_header Host \$host;"* ]] )'
     st "site: validates without docker"     '( allcfg; STACKS_DIR="$t/stacks3"; docker_up() { false; }; site_defaults fw2 https://10.0.0.1/; mkdir -p "$(custom_dir fw2)"; custom_save fw2; custom_validate fw2 && custom_on fw2 && CA[UPSTREAM_URL]=https://10.0.0.1/x && custom_save fw2 && ! custom_validate fw2 )'
+    st "health: url host/port parsing"      '[[ "$(url_host_port https://nas.lan/x)" == "nas.lan 443" && "$(url_host_port http://h:8080/)" == "h 8080" && "$(url_host_port http://u:p@h/)" == "h 80" && "$(url_host_port http://10.0.0.1:81)" == "10.0.0.1 81" ]] && ! url_host_port ftp://h/'
+    st "health: names via Pi-hole first"    '( HC_DNS=127.0.0.1:53; dig() { printf "alias.lan.\n10.9.8.7\n"; }; curl() { printf "%s\n" "$@" >"$t/curlargs"; printf "200\t0.01"; }; probe_url http://nas.lan:5000/ >/dev/null; grep -qx "nas.lan:5000:10.9.8.7" "$t/curlargs" )'
+    st "health: host DNS when Pi-hole has none" '( HC_DNS=127.0.0.1:53; dig() { :; }; curl() { printf "%s\n" "$@" >"$t/curlargs2"; printf "200\t0.01"; }; probe_url http://nas.lan/ >/dev/null; ! grep -q -- --resolve "$t/curlargs2" )'
+    st "health: IPs not looked up"          '( HC_DNS=127.0.0.1:53; dig() { echo 1.2.3.4; }; curl() { printf "%s\n" "$@" >"$t/curlargs3"; printf "200\t0.01"; }; probe_url http://10.0.0.5/ >/dev/null; ! grep -q -- --resolve "$t/curlargs3" )'
     st "nginx: pihole card clicks pass"     '( allcfg; c=$(render_nginx); p=$(sed -n "/server_name pihole/,/^}/p" <<<"$c"); g=$(sed -n "/server_name grafana/,/^}/p" <<<"$c"); [[ "$c" == *"map \"\$request_method:\$http_sec_fetch_site\" \$dd_fetch_site"* && "$p" == *"Sec-Fetch-Site \$dd_fetch_site"* && "$g" != *Sec-Fetch-Site* ]] )'
     st "nginx: pihole / -> /admin/"         '( allcfg; c=$(render_nginx | sed -n "/server_name pihole/,/^}/p"); [[ "$c" == *"location = / { return 302 /admin/; }"* ]] )'
     st "nginx: tls upstream + websockets"   '( allcfg; c=$(render_nginx | sed -n "/server_name portainer/,/^}/p"); [[ "$c" == *"proxy_ssl_verify off"* && "$c" == *"Connection \$connection_upgrade"* && "$c" == *"client_max_body_size 0"* ]] )'
