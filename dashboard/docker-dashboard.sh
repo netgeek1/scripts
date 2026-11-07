@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.6.6"
+readonly SCRIPT_VERSION="2.8.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -91,7 +91,7 @@ CONF_KEYS=( DASH_TITLE DOMAIN DASH_SUBDOMAIN HOST_ADDR EXTRA_NAMES HTTP_PORT HTT
             HOST_PANEL HOST_DISK_WARN HOST_DISK_CRIT HOST_MEM_WARN HOST_MEM_CRIT HOST_LOAD_WARN HOST_LOAD_CRIT
             UPDATE_SCHEDULE UPDATE_DAY UPDATE_TIME UPDATE_PRUNE UPDATE_EXCLUDE UPDATE_DELEGATE WATCHTOWER_IMAGE
             SECRETS_BACKEND
-            APP_PIHOLE PIHOLE_IMAGE PIHOLE_SUBDOMAIN PIHOLE_WEB_PORT PIHOLE_DNS_PORT PIHOLE_LOCAL_DNS PIHOLE_EXTRA_ENV PIHOLE_NO_PASSWORD
+            APP_PIHOLE PIHOLE_IMAGE PIHOLE_SUBDOMAIN PIHOLE_WEB_PORT PIHOLE_DNS_PORT PIHOLE_LOCAL_DNS PIHOLE_EXTRA_ENV PIHOLE_NO_PASSWORD PIHOLE_DNSMASQ_LINES
             APP_PORTAINER PORTAINER_IMAGE PORTAINER_SUBDOMAIN PORTAINER_HTTPS_PORT PORTAINER_EDGE_PORT
             APP_MONITORING GRAFANA_IMAGE PROMETHEUS_IMAGE NODEEXP_IMAGE BLACKBOX_IMAGE SPEEDTEST_IMAGE
             GRAFANA_SUBDOMAIN PROMETHEUS_SUBDOMAIN GRAFANA_PORT PROMETHEUS_PORT NODEEXP_PORT BLACKBOX_PORT SPEEDTEST_PORT
@@ -376,6 +376,7 @@ set_default_config() {
         [PIHOLE_DNS_PORT]="53"
         [PIHOLE_LOCAL_DNS]="yes"
         [PIHOLE_NO_PASSWORD]="no"
+        [PIHOLE_DNSMASQ_LINES]="dns-forward-max=5096;min-cache-ttl=300"
         [PIHOLE_EXTRA_ENV]="FTLCONF_dns_listeningMode=all"
         [APP_PORTAINER]="no"
         [PORTAINER_IMAGE]="portainer/portainer-ce:lts"
@@ -874,9 +875,14 @@ render_port() { [[ -n "$1" ]] && printf '      - "%s:%s"\n' "$1" "$2"; return 0;
 render_labels() { printf '    labels:\n      dev.docker-dashboard.app: "%s"\n' "$1"; }
 render_header() { printf '# Managed by %s v%s -- regenerated on every apply; change settings instead.\nname: %s\nservices:\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" "$(app_project "$1")"; }
 
+pihole_extra_has() { kv_pairs "${CFG[PIHOLE_EXTRA_ENV]}" | cut -f1 | grep -qx "$1"; }   # set by hand in PIHOLE_EXTRA_ENV
+
 render_app_pihole() {
     render_header pihole
     printf '  pihole:\n    image: %s\n    container_name: pihole\n    restart: unless-stopped\n' "$(yaml_str "${CFG[PIHOLE_IMAGE]}")"
+    # its own name instead of the container ID (shown in the web UI and logs)
+    local hn; hn=$(fqdn "${CFG[PIHOLE_SUBDOMAIN]}"); hn=${hn:-pihole}
+    printf '    hostname: %s\n' "$(yaml_str "$hn")"
     printf '    ports:\n'
     printf '      - "%s:53/tcp"\n      - "%s:53/udp"\n' "${CFG[PIHOLE_DNS_PORT]}" "${CFG[PIHOLE_DNS_PORT]}"
     [[ -n "${CFG[PIHOLE_WEB_PORT]}" ]] && printf '      - "%s:80/tcp"\n' "${CFG[PIHOLE_WEB_PORT]}"
@@ -887,11 +893,19 @@ render_app_pihole() {
         # Without a password, FTL (v6.8+) refuses requests whose Host it doesn't recognise (403 "Access denied").
         # Through the proxy the Host is our name for it, so tell Pi-hole that is its web domain.
         local wd; wd=$(fqdn "${CFG[PIHOLE_SUBDOMAIN]}")
-        if [[ -n "$wd" ]] && ! kv_pairs "${CFG[PIHOLE_EXTRA_ENV]}" | cut -f1 | grep -qx FTLCONF_webserver_domain; then
+        if [[ -n "$wd" ]] && ! pihole_extra_has FTLCONF_webserver_domain; then
             printf '      FTLCONF_webserver_domain: %s\n' "$(yaml_str "$wd")"
         fi
     elif secret_is_set PIHOLE_PASSWORD; then
         printf '      FTLCONF_webserver_api_password: "${PIHOLE_PASSWORD:?err}"\n'
+    fi
+    # Pi-hole answers its own hostname (and pi.hole) with the address of the interface the query came in on --
+    # inside Docker that is the container's bridge IP, useless to clients. Pin it to this host, where the proxy is.
+    pihole_extra_has FTLCONF_dns_reply_host_force4 || printf '      FTLCONF_dns_reply_host_force4: "true"\n'
+    pihole_extra_has FTLCONF_dns_reply_host_IPv4   || printf '      FTLCONF_dns_reply_host_IPv4: %s\n' "$(yaml_str "$(eff_host)")"
+    # extra dnsmasq options, e.g. dns-forward-max (default 150: "Maximum number of concurrent DNS queries reached")
+    if [[ -n "${CFG[PIHOLE_DNSMASQ_LINES]}" ]] && ! pihole_extra_has FTLCONF_misc_dnsmasq_lines; then
+        printf '      FTLCONF_misc_dnsmasq_lines: %s\n' "$(yaml_str "${CFG[PIHOLE_DNSMASQ_LINES]}")"
     fi
     local k v
     while IFS=$'\t' read -r k v; do
@@ -1362,7 +1376,7 @@ change_host_ip() {   # --change-ip NEW_IP
 # Your compose file is never modified: after each start the script attaches the app's
 # container to the proxy network under the alias dd-c-<name>.
 # -----------------------------------------------------------------------------
-CUSTOM_KEYS=( TITLE ENABLED MANAGED PROJECT CONTAINER SUBDOMAIN SERVICE PORT TLS FLAGS UPSTREAM_URL FALLBACK_URL DESCRIPTION )
+CUSTOM_KEYS=( TITLE ENABLED KIND MANAGED PROJECT CONTAINER SUBDOMAIN SERVICE PORT TLS FLAGS UPSTREAM_URL HOST_HEADER FALLBACK_URL DESCRIPTION )
 declare -A CA=()
 
 custom_root()     { printf '%s/custom' "$STACKS_DIR"; }
@@ -1375,6 +1389,8 @@ custom_conf_get() {
 }
 custom_project()  { local p; p=$(custom_conf_get "$1" PROJECT); printf '%s' "${p:-${APP_PREFIX}c-$1}"; }
 custom_managed()  { [[ "$(custom_conf_get "$1" MANAGED)" != no ]]; }
+custom_is_site()  { [[ "$(custom_conf_get "$1" KIND)" == site ]]; }   # another machine, proxied by URL; no container here
+ca_is_site()      { [[ "${CA[KIND]:-app}" == site ]]; }
 ca_project()      { printf '%s' "${CA[PROJECT]:-${APP_PREFIX}c-$1}"; }   # same, from CA[] (also before app.conf is saved)
 # compose projects of managed custom apps (handled by the custom-app pass of update-all)
 custom_managed_projects()  { local n; for n in $(custom_names); do custom_managed "$n" && custom_project "$n" && echo; done; return 0; }
@@ -1394,8 +1410,8 @@ custom_names() {   # every folder with an app.conf
 }
 
 custom_defaults() {
-    CA=( [TITLE]="$1" [ENABLED]="yes" [MANAGED]="yes" [PROJECT]="" [CONTAINER]="" [SUBDOMAIN]="$1" [SERVICE]="" [PORT]="" [TLS]="no" [FLAGS]="ws"
-         [UPSTREAM_URL]="" [FALLBACK_URL]="" [DESCRIPTION]="" )
+    CA=( [TITLE]="$1" [ENABLED]="yes" [KIND]="app" [MANAGED]="yes" [PROJECT]="" [CONTAINER]="" [SUBDOMAIN]="$1" [SERVICE]="" [PORT]="" [TLS]="no" [FLAGS]="ws"
+         [UPSTREAM_URL]="" [HOST_HEADER]="proxy" [FALLBACK_URL]="" [DESCRIPTION]="" )
 }
 
 custom_load() {   # custom_load NAME -> CA[]
@@ -1420,6 +1436,7 @@ custom_save() {   # custom_save NAME  (from CA[])
         printf '# UPSTREAM_URL: instead of SERVICE/PORT, e.g. for network_mode: host apps (http://192.168.0.190:8080)\n'
         printf '# FLAGS: any of ws (websockets), stream (no buffering), big (large uploads)\n'
         printf '# MANAGED=no: started/updated by its own script; docker-dashboard only proxies and checks it\n'
+        printf '# KIND=site: a web UI on another machine (UPSTREAM_URL); HOST_HEADER=upstream sends its own name/IP as Host\n'
         printf '# PROJECT: its compose project name (empty = %sc-<folder>); CONTAINER: a plain docker-run container instead\n' "$APP_PREFIX"
         for k in "${CUSTOM_KEYS[@]}"; do printf '%s=%s\n' "$k" "$(conf_quote "${CA[$k]:-}")"; done
     } | write_file "$d/app.conf" 644 root:root
@@ -1460,6 +1477,10 @@ custom_endpoint() {   # custom_endpoint NAME -> endpoint record (same shape as a
     custom_load "$1" || return 0
     local flags=${CA[FLAGS]//[[:space:]]/}
     [[ "${CA[TLS]}" == yes || "${CA[UPSTREAM_URL]}" == https://* ]] && flags+="${flags:+,}tls"
+    if ca_is_site; then
+        flags+="${flags:+,}site"
+        [[ "${CA[HOST_HEADER]}" == upstream ]] && flags+=",uphost"
+    fi
     printf 'c-%s|%s|%s|%s|%s|%s|%s\n' "$1" "${CA[TITLE]}" "${CA[SUBDOMAIN]}" "$(custom_upstream "$1")" \
         "$flags" "${CA[FALLBACK_URL]}" "${CA[DESCRIPTION]}"
 }
@@ -1508,7 +1529,10 @@ custom_validate() {   # custom_validate NAME -> 0 ok, messages on failure
     local n=$1 d sub bad=0 svcs
     d=$(custom_dir "$n")
     custom_load "$n"
-    if [[ "${CA[MANAGED]}" != no ]]; then
+    if ca_is_site; then
+        site_url_ok "${CA[UPSTREAM_URL]}" || { log_error "$n: UPSTREAM_URL must be http(s)://host[:port]/ (no path), e.g. https://192.168.0.253/"; bad=1; }
+        [[ "${CA[HOST_HEADER]:-proxy}" =~ ^(proxy|upstream)$ ]] || { log_error "$n: HOST_HEADER must be proxy or upstream."; bad=1; }
+    elif [[ "${CA[MANAGED]}" != no ]]; then
         custom_compose_file "$n" >/dev/null || { log_error "$n: no compose file (compose.yaml or docker-compose.yml) in $d."; return 1; }
     fi
     v_sub "${CA[SUBDOMAIN]}" || { log_error "$n: SUBDOMAIN '${CA[SUBDOMAIN]}' is not a valid name."; bad=1; }
@@ -1557,6 +1581,12 @@ custom_attach() {   # put the service's container(s) on the proxy network (idemp
 custom_up() {   # custom_up NAME [pull]
     local n=$1 mode=${2:-nopull}
     custom_load "$n"
+    if ca_is_site; then
+        log_step "${CA[TITLE]} (external site: ${CA[UPSTREAM_URL]})"
+        custom_validate "$n" || { log_error "Fix $(custom_dir "$n")/app.conf, then apply again."; return 1; }
+        log_ok "${CA[TITLE]} is proxied as $(fqdn "${CA[SUBDOMAIN]}")"
+        return 0
+    fi
     log_step "${CA[TITLE]} (custom$( [[ "${CA[MANAGED]}" == no ]] && echo ", started by its own script"): $(custom_dir "$n"))"
     custom_validate "$n" || { log_error "Fix $(custom_dir "$n")/app.conf, then apply again."; return 1; }
     if [[ "${CA[MANAGED]}" == no ]]; then   # never start, stop or pull someone else's app
@@ -1708,6 +1738,12 @@ custom_detach() {   # take the app's containers off the proxy network
 custom_remove() {   # three levels: unregister / stop + unregister / delete everything
     local n=$1 d ch
     d=$(custom_dir "$n"); custom_load "$n"
+    if ca_is_site; then
+        confirm "Remove the external site '${CA[TITLE]}' (${CA[UPSTREAM_URL]}) from the proxy and page?" n || { log_info "Cancelled"; return 0; }
+        safe_path "$d" && run rm -rf -- "$d"
+        log_ok "Removed $n (the machine itself is untouched). Apply (A) to update the proxy, page and DNS list."
+        return 0
+    fi
     printf '\n  Remove %s (%s):\n' "${CA[TITLE]}" "$d"
     printf '   1) Unregister only    -- off the proxy, page and DNS list; containers keep running, folder untouched\n'
     if [[ "${CA[MANAGED]}" == no ]]; then printf '   2) (same as 1 -- this app is started by its own script, so it is never stopped from here)\n'
@@ -1794,7 +1830,70 @@ custom_add_running() {   # register a running container (any folder, compose or 
         || log_warn "Saved, but fix the problems above before applying."
 }
 
-custom_edit() { custom_load "$1"; custom_prompt "$1"; custom_save "$1"; custom_validate "$1" || true; }
+custom_edit() {
+    custom_load "$1"
+    if ca_is_site; then site_prompt "$1"; else custom_prompt "$1"; fi
+    custom_save "$1"; custom_validate "$1" || true
+}
+
+# ---- External sites: a web UI on another machine behind the proxy (name, wildcard cert, card, status dot) ----
+site_prompt() {   # site_prompt NAME -- edit CA[] for an external site
+    local v
+    ask v "Title on the page" "${CA[TITLE]}"; CA[TITLE]=$v
+    ask v "Name (-> $(fqdn "${CA[SUBDOMAIN]}"))" "${CA[SUBDOMAIN]}"; CA[SUBDOMAIN]=$v
+    ask v "Its address, e.g. https://192.168.0.253/ or http://nas.lan:5000/" "${CA[UPSTREAM_URL]}"; CA[UPSTREAM_URL]=${v%/}/
+    log_info "Host header: 'proxy' sends $(fqdn "${CA[SUBDOMAIN]}"); 'upstream' sends $(url_hostport "${CA[UPSTREAM_URL]}")."
+    log_info "Use 'upstream' if the device rejects unknown names (e.g. 'DNS rebind' or 'invalid host' errors)."
+    ask v "Host header (proxy/upstream)" "${CA[HOST_HEADER]:-proxy}"; CA[HOST_HEADER]=$v
+    ask v "Flags: ws,stream,big (- for none)" "${CA[FLAGS]}"; [[ "$v" == - ]] && v=""; CA[FLAGS]=$v
+    ask v "Direct link shown under the card (- for none)" "${CA[FALLBACK_URL]:-${CA[UPSTREAM_URL]}}"; [[ "$v" == - ]] && v=""; CA[FALLBACK_URL]=$v
+    ask v "Description (- for none)" "${CA[DESCRIPTION]}"; [[ "$v" == - ]] && v=""; CA[DESCRIPTION]=$v
+}
+
+site_defaults() {   # site_defaults NAME URL [TITLE]
+    custom_defaults "$1"
+    CA[KIND]=site; CA[MANAGED]=no; CA[UPSTREAM_URL]=${2%/}/; CA[TITLE]=${3:-$1}; CA[FALLBACK_URL]=${2%/}/
+}
+
+custom_add_site() {   # menu: add an external site
+    local n url
+    read -rp "  Short name (a-z, 0-9, -; also the default subdomain): " n || return 0
+    valid_app_name "$n" || { log_warn "Invalid name"; return 0; }
+    [[ -e "$(custom_dir "$n")" ]] && { log_warn "$(custom_dir "$n") already exists; use Edit."; return 0; }
+    read -rp "  Its address (e.g. https://192.168.0.253/): " url || return 0
+    site_url_ok "$url" || { log_warn "Use http(s)://host[:port]/ without a path."; return 0; }
+    site_defaults "$n" "$url"
+    site_check_reach "$url"
+    site_prompt "$n"
+    run mkdir -p "$(custom_dir "$n")"
+    custom_save "$n"
+    custom_validate "$n" && log_ok "Site '$n' saved. Apply (A) to put it behind the proxy as $(fqdn "${CA[SUBDOMAIN]}")." \
+        || log_warn "Saved, but fix the problems above before applying."
+}
+
+site_check_reach() {   # warn early if this host can't reach it (the proxy reaches it from here too)
+    local code
+    code=$(curl -sk --noproxy '*' -o /dev/null -m 6 --connect-timeout 3 -w '%{http_code}' "$1" 2>/dev/null || true)
+    if [[ "$code" =~ ^[1-5][0-9][0-9]$ && "$code" != 000 ]]; then log_ok "Reachable from this host (HTTP $code)"
+    else log_warn "This host gets no answer from $1 -- the proxy won't either (firewall, VLAN or wrong port?)."; fi
+}
+
+site_add_cli() {   # --add-site 'name|url|title|description'
+    require_config
+    local n u t d
+    IFS='|' read -r n u t d <<<"$1"
+    n=$(trim "$n"); u=$(trim "$u"); t=$(trim "$t"); d=$(trim "$d")
+    valid_app_name "$n" && site_url_ok "$u" || die "Usage: --add-site 'name|https://host[:port]/|Title|Description'"
+    [[ -e "$(custom_dir "$n")" ]] && die "$(custom_dir "$n") already exists."
+    [[ -n "$(fqdn "$n")" ]] || die "Set a domain first (Settings -> Page): sites are served as <name>.<domain>."
+    site_defaults "$n" "$u" "${t:-$n}"; CA[DESCRIPTION]=$d
+    site_check_reach "$u"
+    run mkdir -p "$(custom_dir "$n")"
+    custom_save "$n"
+    custom_validate "$n" || { safe_path "$(custom_dir "$n")" && run rm -rf -- "$(custom_dir "$n")"; die "Not added."; }
+    log_ok "Added site '$n' -> $u"
+    stack_apply
+}
 
 custom_adopt() {   # give a folder that already has a compose file (and maybe a build) its app.conf
     local -a cand; local i n
@@ -1841,14 +1940,16 @@ menu_custom() {
             n=${names[$i]}; custom_load "$n"
             printf '   %d) %-22s %-34s %b%s\n' "$((i + 1))" "${CA[TITLE]}" "$(fqdn "${CA[SUBDOMAIN]}")" \
                 "$( [[ "${CA[ENABLED]}" == yes ]] && echo "${G}on${NC}" || echo "${D}off${NC}")" \
-                "$( [[ "${CA[MANAGED]}" == no ]] && echo "  (started by its own script)")"
+                "$(if ca_is_site; then echo "  (site: ${CA[UPSTREAM_URL]})"; elif [[ "${CA[MANAGED]}" == no ]]; then echo "  (started by its own script)"; fi)"
         done
         printf '\n   N) New   F) Set up a folder already in custom/   D) Add a container that is already running (any folder)\n'
+        printf '   W) Add a web site on another machine (e.g. a router, NAS or switch UI)\n'
         printf '   E) Edit   T) Toggle on/off   R) Remove   A) Apply   0) Back\n'
         read -rp "  Choice: " ch || return 0
         case "${ch,,}" in
             n) menu_action custom_add ;;
             d) menu_action custom_add_running ;;
+            w) menu_action custom_add_site ;;
             f) menu_action custom_adopt ;;
             e|t|r)
                 read -rp "  Number: " i || continue
@@ -1914,7 +2015,11 @@ render_proxy_location() {
     printf '        set $upstream %s;\n' "$up"
     printf '        proxy_pass $upstream;\n'
     printf '        proxy_http_version 1.1;\n'
-    printf '        proxy_set_header Host $host;\n'
+    if [[ "$flags" == *,uphost,* ]]; then
+        printf '        proxy_set_header Host %s;\n' "$(url_hostport "$up")"   # the device checks its own name/IP
+    else
+        printf '        proxy_set_header Host $host;\n'
+    fi
     printf '        proxy_set_header X-Real-IP $remote_addr;\n'
     printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
     printf '        proxy_set_header X-Forwarded-Proto https;\n'
@@ -1928,8 +2033,16 @@ render_proxy_location() {
     [[ "$flags" == *,tls,* ]]    && printf '        proxy_ssl_verify off;\n        proxy_ssl_server_name on;\n'
     [[ "$flags" == *,stream,* ]] && printf '        proxy_buffering off;\n        proxy_request_buffering off;\n'
     [[ "$flags" == *,big,* ]]    && printf '        client_max_body_size 0;\n'
+    if [[ "$flags" == *,site,* ]]; then
+        # a variable proxy_pass disables "proxy_redirect default": map the device's own absolute redirects back here
+        local hp; hp=$(url_hostport "$up")
+        printf '        proxy_redirect http://%s/ /;\n        proxy_redirect https://%s/ /;\n' "$hp" "$hp"
+    fi
     printf '    }\n'
 }
+
+url_hostport() { local u=${1#*://}; printf '%s' "${u%%/*}"; }   # https://h:8443/x -> h:8443
+site_url_ok()  { [[ "$1" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]{1,5})?/?$ ]]; }
 
 render_nginx() {
     local redirect="https://\$host" key title sub up flags fb desc host
@@ -3138,6 +3251,7 @@ update_all() {
     done
     for a in $(enabled_customs); do
         if is_excluded "$a" "$(custom_project "$a")"; then log_info "Custom app '$a': excluded"; continue; fi
+        custom_is_site "$a" && continue   # another machine: nothing to update here
         if ! custom_managed "$a"; then log_info "Custom app '$a': updated by its own script (add a delegate to run it from here)"; continue; fi
         log_info "Custom app '$a' ($(custom_dir "$a"))"
         if custom_buildable "$a"; then
@@ -3907,6 +4021,7 @@ v_kv()        { local e IFS=';'; for e in $1; do e=$(trim "$e"); [[ -z "$e" || "
 v_fetchsrc()  { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.:_-]+:/[^[:space:]\']*$ ]]; }
 v_fname()     { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 v_url()       { valid_url "$1"; }
+v_dnsmasq()   { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9][A-Za-z0-9=,./:#_-]*(\;[A-Za-z0-9][A-Za-z0-9=,./:#_-]*)*$ ]]; }
 v_pct()       { [[ "$1" =~ ^[0-9]{1,3}$ ]] && (( $1 >= 1 && $1 <= 100 )); }
 v_load()      { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 section() { printf '\n  %s%s%s\n' "$B" "$1" "$NC"; }
@@ -4006,6 +4121,7 @@ cfg_app() {   # per-app settings
             ask_valid PIHOLE_WEB_PORT "Direct web port on the host (- for proxy only)" v_port_opt
             ask_valid PIHOLE_LOCAL_DNS "Answer the dashboard's names itself (yes/no)" v_yesno
             ask_valid PIHOLE_NO_PASSWORD "Web login WITHOUT a password (yes/no)" v_yesno
+            ask_valid PIHOLE_DNSMASQ_LINES "Extra dnsmasq lines, a;b (- for none)" v_dnsmasq
             ask_valid PIHOLE_EXTRA_ENV "Extra FTLCONF_* settings, K=V;K=V (- to clear)" v_kv ;;
         portainer)
             ask_valid PORTAINER_IMAGE "Image" v_image
@@ -4352,6 +4468,10 @@ self_test() {
     st "updates: old gone, tag older = current" '( docker() { case "$*" in *"{{.Id}} t") echo sha256:new ;; *"{{.Created}} c") echo 2026-10-30T03:18:06Z ;; *"{{.Created}} t") echo 2026-10-30T03:17:57Z ;; *) return 1 ;; esac; }; ! image_differs sha256:old t c )'
     st "updates: old gone, tag newer = update"  '( docker() { case "$*" in *"{{.Id}} t") echo sha256:new ;; *"{{.Created}} c") echo 2026-10-30T03:18:06Z ;; *"{{.Created}} t") echo 2026-11-01T10:00:00Z ;; *) return 1 ;; esac; }; image_differs sha256:old t c )'
     st "updates: same ID = current"         '( docker() { case "$*" in *"{{.Id}} t") echo sha256:old ;; esac; }; ! image_differs sha256:old t )'
+    st "site: url check"                    'site_url_ok https://192.168.0.253/ && site_url_ok http://nas.lan:5000 && ! site_url_ok https://h/admin && ! site_url_ok ftp://h/ && [[ $(url_hostport https://h.lan:8443/) == h.lan:8443 ]]'
+    st "site: nginx block"                  '( allcfg; STACKS_DIR="$t/stacks1"; site_defaults fw https://192.168.0.253/ Firewall; mkdir -p "$(custom_dir fw)"; custom_save fw; c=$(render_nginx | sed -n "/server_name fw.example.net/,/^}/p"); [[ "$c" == *"set \$upstream https://192.168.0.253;"* && "$c" == *"proxy_redirect https://192.168.0.253/ /;"* && "$c" == *"proxy_ssl_verify off"* && "$c" == *"proxy_set_header Host \$host;"* ]] )'
+    st "site: upstream host header"         '( allcfg; STACKS_DIR="$t/stacks2"; site_defaults nas http://nas.lan:5000/; CA[HOST_HEADER]=upstream; mkdir -p "$(custom_dir nas)"; custom_save nas; c=$(render_nginx | sed -n "/server_name nas.example.net/,/^}/p"); [[ "$c" == *"proxy_set_header Host nas.lan:5000;"* && "$c" != *"proxy_set_header Host \$host;"* ]] )'
+    st "site: validates without docker"     '( allcfg; STACKS_DIR="$t/stacks3"; docker_up() { false; }; site_defaults fw2 https://10.0.0.1/; mkdir -p "$(custom_dir fw2)"; custom_save fw2; custom_validate fw2 && custom_on fw2 && CA[UPSTREAM_URL]=https://10.0.0.1/x && custom_save fw2 && ! custom_validate fw2 )'
     st "nginx: pihole card clicks pass"     '( allcfg; c=$(render_nginx); p=$(sed -n "/server_name pihole/,/^}/p" <<<"$c"); g=$(sed -n "/server_name grafana/,/^}/p" <<<"$c"); [[ "$c" == *"map \"\$request_method:\$http_sec_fetch_site\" \$dd_fetch_site"* && "$p" == *"Sec-Fetch-Site \$dd_fetch_site"* && "$g" != *Sec-Fetch-Site* ]] )'
     st "nginx: pihole / -> /admin/"         '( allcfg; c=$(render_nginx | sed -n "/server_name pihole/,/^}/p"); [[ "$c" == *"location = / { return 302 /admin/; }"* ]] )'
     st "nginx: tls upstream + websockets"   '( allcfg; c=$(render_nginx | sed -n "/server_name portainer/,/^}/p"); [[ "$c" == *"proxy_ssl_verify off"* && "$c" == *"Connection \$connection_upgrade"* && "$c" == *"client_max_body_size 0"* ]] )'
@@ -4361,6 +4481,10 @@ self_test() {
     st "nginx: no domain -> no app servers" '( allcfg; CFG[DOMAIN]=""; [[ $(render_nginx | grep -c "server_name .*\.") == 0 ]] )'
     st "nginx: files on https + http"       '( allcfg; CFG[FILES_DIR]=/srv/web; c=$(render_nginx); [[ $(grep -c "location /files/ {" <<<"$c") == 2 ]] )'
     st "dashboard compose maps 8443"        '( allcfg; c=$(render_compose); [[ "$c" == *"\"8443:8443\""* && "$c" == *"external: true"* ]] && CFG[APP_GUACAMOLE]=no && [[ "$(render_compose)" != *8443* ]] )'
+    st "pihole: hostname + host IP reply"   '( allcfg; o=$(render_app_pihole); [[ "$o" == *"hostname: \"pihole.example.net\""* && "$o" == *"FTLCONF_dns_reply_host_force4: \"true\""* && "$o" == *"FTLCONF_dns_reply_host_IPv4: \"192.168.0.190\""* ]] && CFG[DOMAIN]="" && [[ "$(render_app_pihole)" == *"hostname: \"pihole\""* ]] )'
+    st "pihole: dnsmasq lines default"      '( allcfg; o=$(render_app_pihole); [[ "$o" == *"FTLCONF_misc_dnsmasq_lines: \"dns-forward-max=5096;min-cache-ttl=300\""* ]] && CFG[PIHOLE_DNSMASQ_LINES]="" && [[ "$(render_app_pihole)" != *dnsmasq_lines* ]] )'
+    st "pihole: hand-set env wins"          '( allcfg; CFG[PIHOLE_EXTRA_ENV]="FTLCONF_dns_reply_host_IPv4=10.1.1.1;FTLCONF_misc_dnsmasq_lines=x"; o=$(render_app_pihole); [[ $(grep -c dns_reply_host_IPv4 <<<"$o") == 1 && $(grep -c dnsmasq_lines <<<"$o") == 1 && "$o" == *10.1.1.1* ]] )'
+    st "pihole: dnsmasq lines validator"    'v_dnsmasq "dns-forward-max=5096;min-cache-ttl=300" && v_dnsmasq "" && ! v_dnsmasq "a;;b" && ! v_dnsmasq "x\"y"'
     st "pihole: explicit no password"       '( allcfg; CFG[PIHOLE_NO_PASSWORD]=yes; o=$(render_app_pihole); [[ "$o" == *"FTLCONF_webserver_api_password: '"''"'"* && "$o" != *PIHOLE_PASSWORD* ]] )'
     st "pihole: no password sets web domain" '( allcfg; CFG[PIHOLE_NO_PASSWORD]=yes; o=$(render_app_pihole); [[ "$o" == *"FTLCONF_webserver_domain: \"pihole.example.net\""* ]] && CFG[PIHOLE_EXTRA_ENV]="FTLCONF_webserver_domain=x.lan" && o=$(render_app_pihole) && [[ $(grep -c webserver_domain <<<"$o") == 1 && "$o" == *x.lan* ]] && CFG[PIHOLE_NO_PASSWORD]=no && [[ "$(CFG[PIHOLE_EXTRA_ENV]=; render_app_pihole)" != *webserver_domain* ]] )'
     st "change-ip: whole addresses only"    '[[ "$(printf "%s\n" "a|b|http://10.0.0.19:8080/|x 10.0.0.190 10.0.0.19" | ip_replace 10.0.0.19 10.0.0.5)" == "a|b|http://10.0.0.5:8080/|x 10.0.0.190 10.0.0.5" ]]'
@@ -4558,6 +4682,7 @@ Actions (default: interactive menu)
   --custom-apps              Custom apps menu (your own compose apps behind the proxy)
   --cert-refresh             Fetch / re-read the certificate and reload nginx if it changed
   --cert-fetch-key           Create (or show) the SSH key used by certificate fetch mode
+  --add-site 'N|URL|T|D'     Put a web UI on another machine behind the proxy: name | https://host[:port]/ | title | description
   --change-ip NEW_IP         Point every name, link and Pi-hole record at a new host address, then apply
   --show-secret NAME         Print one stored password (e.g. PIHOLE_PASSWORD)
   --set-secret NAME          Change one (prompted, or first line of stdin; empty = generate; - = no Pi-hole password)
@@ -4622,6 +4747,7 @@ main() {
             --cert-fetch-key)  action=certkey ;;
             --cert-receive)    action=certreceive ;;
             --change-ip)       action=changeip; arg=${2:-}; shift ;;
+            --add-site)        action=addsite; arg=${2:-}; shift ;;
             --show-secret)     action=showsecret; arg=${2:-}; shift ;;
             --set-secret)      action=setsecret; arg=${2:-}; shift ;;
             --cert-push-setup) action=certpush; [[ -n "${2:-}" && "${2:-}" != --* ]] && { arg=$2; shift; } ;;
@@ -4689,6 +4815,7 @@ main() {
         certkey)     ensure_config; cert_fetch_key ;;
         certreceive) cert_receive ;;
         changeip)    change_host_ip "$arg" ;;
+        addsite)     site_add_cli "$arg" ;;
         showsecret)  ensure_config; show_secret "$arg" ;;
         setsecret)
             ensure_config
