@@ -246,6 +246,7 @@ Wildcard certificates (`custom`, `fetch`, `push`) don't contain the IP, so they 
 | 2 / 3 | `--settings` / `--apps` | Settings menu / turn apps on or off and edit their images, names and ports |
 | 4 | `--services`, `--add-service`, `--remove-service`, `--detect` | Custom links on the page |
 | K | `--secrets`, `--show-secret NAME`, `--set-secret NAME` | View or change stored passwords (see **Secrets**) |
+| Apps → C → W | `--add-site 'N\|URL\|T\|D'` | Put a web UI on another machine behind the proxy (see **Sites on other machines**) |
 | P | `--change-ip NEW_IP` | Point names, links and Pi-hole records at a new host address, then apply |
 | C | `--cert-refresh`, `--cert-fetch-key`, `--cert-push-setup`, `--cert-receive` | Certificate actions |
 | 5 | `--apply` | Converge everything: compose files, proxy config, page, DNS file, timers |
@@ -273,6 +274,22 @@ plain folders, so one copy of `/opt/stacks` backs up everything.
 - **Turning an app off:** it stops and its containers are removed, but its data stays. Turn it on again and it comes
   back as it was.
 - **Ports:** every app's direct port is a setting. Blank means proxy only.
+
+**Pi-hole specifics** (each one can be overridden by setting the same `FTLCONF_*` key in `PIHOLE_EXTRA_ENV`):
+
+- **Hostname:** the container's hostname is its proxy name, e.g. `pihole.certifiedgeeks.net` (or `pihole` without a
+  domain), instead of a container ID.
+- **Its own name and `pi.hole` resolve to this host.** Pi-hole answers its hostname and `pi.hole` with the address of
+  the interface a query arrived on. Inside Docker that is the container's internal IP, which clients can't use. So
+  `FTLCONF_dns_reply_host_force4`/`_IPv4` pin those answers to the host address, where the proxy is.
+  `--change-ip` updates it.
+- **Extra dnsmasq options:** `PIHOLE_DNSMASQ_LINES` (Apps → Pi-hole) is passed as `FTLCONF_misc_dnsmasq_lines`. It
+  defaults to `dns-forward-max=5096;min-cache-ttl=300`, which avoids "Maximum number of concurrent DNS queries
+  reached (max: 150)". Pi-hole v6 doesn't read `/etc/dnsmasq.d` unless `misc.etc_dnsmasq_d` is on; this is its
+  native replacement.
+  - Because it comes from the environment, the setting is read-only in Pi-hole's web UI. Change it here.
+  - A flood of those warnings can also mean a DNS loop or an upstream that doesn't answer. Raising the limit hides
+    that, so check the upstreams if the warnings persist.
 
 ## Custom apps
 
@@ -329,6 +346,51 @@ ENABLED='yes'
 - **Disable or remove:** `ENABLED='no'` stops the app and keeps its folder. **Remove** in the menu offers three
   levels: *unregister only* (containers and folder untouched), *stop + unregister* (folder and data kept), or
   *delete everything* (after you type `DELETE-APP`).
+
+### Sites on other machines
+
+A web UI on another machine can sit behind the proxy too. Examples are a router or firewall, a NAS, switches, or a
+printer. It gets its own name such as `https://nas.<domain>`, the wildcard certificate, a card with a status dot,
+and an entry in the DNS list.
+
+```bash
+sudo docker-dashboard --add-site 'nas|https://192.168.0.20:443/|TrueNAS|Storage'   # name | address | title | description
+```
+
+Or use the menu: **Apps → C → W**. Either way, it first checks that this host can reach the address. The proxy runs
+here, so if this host can't reach it, neither can the proxy. The CLI applies straight away; in the menu, apply
+with **A**.
+
+Its `app.conf` looks like this:
+
+```
+KIND='site'
+UPSTREAM_URL='https://192.168.0.20/'   # scheme://host[:port]/, no path; a self-signed certificate is fine
+HOST_HEADER='proxy'                     # or 'upstream' (see below)
+SUBDOMAIN='nas'
+FALLBACK_URL='https://192.168.0.20/'    # direct link under the card
+```
+
+**How a site behaves:**
+
+- **Nothing runs here.** There's no container to start, stop or update; update-all and the update check skip it.
+  Remove deletes only the `app.conf`, and the machine itself is untouched.
+- **Redirects:** when the device redirects to its own address (`https://192.168.0.20/login`), the proxy rewrites
+  that back to the proxy name.
+- **Status dot:** the check goes through the proxy. A 502 from the proxy, meaning the device didn't answer, shows
+  as down.
+
+**When the device rejects the name.** Some devices refuse requests addressed to a name they don't know. OPNsense
+reports a "DNS rebind attack", and some NAS or switch UIs say "invalid host". You can fix this on either side:
+
+- **On the device (preferred):** add the proxy name to the device's allowed host names. In OPNsense that's
+  **System → Settings → Administration → Alternate Hostnames**.
+- **Here:** set `HOST_HEADER='upstream'`. The proxy then sends the device its own address as Host. Most UIs
+  accept that, but some also check the browser's `Referer`/`Origin` on logins and form saves, and those still
+  carry the proxy name. If saves fail, use the device-side setting.
+
+A plain link (**Links**) only adds a card that opens the device directly. A site goes through the proxy: you get
+the certificate and name, and the status dot reflects what the proxy can reach.
 
 ## Host health
 
@@ -468,6 +530,7 @@ All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menu
 | `<APP>_*_PORT` | Direct ports. Blank = not published |
 | `PIHOLE_EXTRA_ENV`, `GRAFANA_EXTRA_ENV` | Extra settings as `K=V;K=V` |
 | `PIHOLE_NO_PASSWORD` | `yes` = Pi-hole web login without a password. Default `no` |
+| `PIHOLE_DNSMASQ_LINES` | dnsmasq options, `;`-separated. Default `dns-forward-max=5096;min-cache-ttl=300`; `-` for none |
 | `PROMETHEUS_RETENTION`, `GRAFANA_PLUGINS` | Monitoring options |
 | `GUAC_POSTGRES_IMAGE` | Default `postgres:17`. Keep the major version once data exists |
 
@@ -504,7 +567,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 90 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 98 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
