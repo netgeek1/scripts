@@ -53,6 +53,7 @@ scripts you `curl` onto other machines.
 | Docker | Installed for you if missing (Docker CE + compose plugin from download.docker.com) |
 | Network | The image registries (docker.io, ghcr.io, and registry.community.greenbone.net for GVM), plus github.com for first-run defaults |
 | Ports | 80/443 for the proxy, 53 for Pi-hole, and each app's fallback port if you keep it |
+| Terminal | UTF-8, for Docker's in-place progress bars (PuTTY: **Window → Translation → Remote character set: UTF-8**). The script checks the terminal; if it isn't UTF-8, Docker progress is shown as plain lines instead of a mess of `â£¿` characters |
 
 The install prepares the host before writing anything:
 
@@ -643,7 +644,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 113 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 114 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
