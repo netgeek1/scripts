@@ -3,6 +3,19 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.11.1 — 2026-11-08 — Progress bars in non-UTF-8 terminals
+
+### Fixed
+- Image pulls scrolled again, showing `â £¿` instead of spinners and bars, for example on the 1.1 GB FileBot image.
+  - **Cause:** the terminal wasn't decoding UTF-8. Compose draws its progress with braille characters and pads each
+    line to the full terminal width. Shown as 2-3 characters each, every line wrapped, so the in-place redraw
+    landed one line lower each time.
+  - **Fix:** at the start of an interactive run, the script asks the terminal where the cursor ends up after one
+    3-byte character. If the terminal isn't UTF-8, Docker Compose runs with `--progress plain` and the script says
+    how to fix the terminal (PuTTY: Window → Translation → UTF-8). UTF-8 terminals keep the in-place progress.
+- All compose calls go through one wrapper (`dcompose`).
+- Self-test: 114 checks.
+
 ## v2.11.0 — 2026-11-08 — FileBot uses the official image
 
 ### Changed
