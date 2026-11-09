@@ -3,6 +3,25 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.11.0 — 2026-11-08 — FileBot uses the official image
+
+### Changed
+- FileBot now defaults to the **official `rednoah/filebot:xpra`** image: the FileBot desktop in the browser,
+  protected by an xpra password from the vault. `FILEBOT_VARIANT` picks the image:
+  - `xpra` (default)
+  - `node`: the official amc web UI. Basic auth; the root redirects to `/filebot/`.
+  - `jlesage`: the previous community image, unchanged.
+- The image follows the variant. `FILEBOT_IMAGE` now only pins a tag; an empty value or another variant's default
+  means "this variant's default".
+- **Official images:** data is in `/opt/stacks/filebot/data` (license: `data/filebot/license.txt`). Media goes to
+  `/volume1`, which `FILEBOT_MOUNTS` now accepts as `volume1=...`; the new default is `volume1=./media`. The images
+  run as `PUID`/`PGID`.
+- **v2.10.0 defaults migrate automatically** when the variant isn't `jlesage`: `storage=./storage` and the
+  jlesage-only extra env.
+- SMB shares, the pre-start checks, boot recovery, and one app not blocking the others all work the same for every
+  variant.
+- Self-test: 113 checks.
+
 ## v2.10.0 — 2026-11-08 — FileBot with SMB shares; one app can't block the rest
 
 ### Added
