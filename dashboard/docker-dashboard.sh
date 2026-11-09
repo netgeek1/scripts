@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.10.0"
+readonly SCRIPT_VERSION="2.11.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -100,7 +100,7 @@ CONF_KEYS=( DASH_TITLE DOMAIN DASH_SUBDOMAIN HOST_ADDR EXTRA_NAMES HTTP_PORT HTT
             GUAC_DB_NAME GUAC_DB_USER
             APP_MESHCENTRAL MESHCENTRAL_IMAGE MESHCENTRAL_SUBDOMAIN MESHCENTRAL_PORT
             APP_GVM GVM_SUBDOMAIN GVM_COMPOSE_URL
-            APP_FILEBOT FILEBOT_IMAGE FILEBOT_SUBDOMAIN FILEBOT_WEB_PORT FILEBOT_WEB_USER FILEBOT_UID FILEBOT_GID
+            APP_FILEBOT FILEBOT_VARIANT FILEBOT_IMAGE FILEBOT_SUBDOMAIN FILEBOT_WEB_PORT FILEBOT_WEB_USER FILEBOT_UID FILEBOT_GID
             FILEBOT_MOUNTS FILEBOT_SMB_USER FILEBOT_SMB_DOMAIN FILEBOT_SMB_VERS FILEBOT_SMB_OPTS FILEBOT_EXTRA_ENV )
 declare -A CFG=()
 declare -A SECRETS=()
@@ -418,18 +418,19 @@ set_default_config() {
         [GVM_SUBDOMAIN]="gvm"
         [GVM_COMPOSE_URL]="$GVM_COMPOSE_DEFAULT"
         [APP_FILEBOT]="no"
-        [FILEBOT_IMAGE]="jlesage/filebot:latest"
+        [FILEBOT_VARIANT]="xpra"
+        [FILEBOT_IMAGE]=""
         [FILEBOT_SUBDOMAIN]="filebot"
         [FILEBOT_WEB_PORT]=""
         [FILEBOT_WEB_USER]="admin"
         [FILEBOT_UID]="1000"
         [FILEBOT_GID]="1000"
-        [FILEBOT_MOUNTS]="storage=./storage"
+        [FILEBOT_MOUNTS]="volume1=./media"
         [FILEBOT_SMB_USER]=""
         [FILEBOT_SMB_DOMAIN]=""
         [FILEBOT_SMB_VERS]="3.0"
         [FILEBOT_SMB_OPTS]=""
-        [FILEBOT_EXTRA_ENV]="KEEP_APP_RUNNING=1;AMC_ENABLED=0"
+        [FILEBOT_EXTRA_ENV]=""
     )
 }
 
@@ -447,6 +448,11 @@ load_config() {
     fi
     DEPLOY_DIR=${CFG[DEPLOY_DIR]%/}
     STACKS_DIR=${CFG[STACKS_DIR]%/}
+    # v2.10.0 saved jlesage-only defaults; with an official variant they mean "default"
+    if [[ "$(filebot_variant)" != jlesage ]]; then
+        [[ "${CFG[FILEBOT_EXTRA_ENV]}" == "KEEP_APP_RUNNING=1;AMC_ENABLED=0" ]] && CFG[FILEBOT_EXTRA_ENV]=""
+        [[ "${CFG[FILEBOT_MOUNTS]}" == "storage=./storage" ]] && CFG[FILEBOT_MOUNTS]="volume1=./media"
+    fi
     CONFIG_LOADED=1
     return 0
 }
@@ -859,7 +865,11 @@ app_endpoints() {
             printf 'gvm|Greenbone|%s|https://gvm-web:443|tls,big||Vulnerability scanning\n' "${CFG[GVM_SUBDOMAIN]}" ;;
         filebot)
             p=${CFG[FILEBOT_WEB_PORT]}
-            printf 'filebot|FileBot|%s|https://filebot:5800|ws,tls,stream|%s|Rename and organize media\n' "${CFG[FILEBOT_SUBDOMAIN]}" "${p:+https://$ip:$p/}" ;;
+            case "$(filebot_variant)" in
+                node)    printf 'filebot|FileBot|%s|http://filebot:5452|ws,fbnode|%s|Rename and organize media (amc web UI)\n' "${CFG[FILEBOT_SUBDOMAIN]}" "${p:+http://$ip:$p/filebot/}" ;;
+                jlesage) printf 'filebot|FileBot|%s|https://filebot:5800|ws,tls,stream|%s|Rename and organize media\n' "${CFG[FILEBOT_SUBDOMAIN]}" "${p:+https://$ip:$p/}" ;;
+                *)       printf 'filebot|FileBot|%s|http://filebot:5454|ws,stream|%s|Rename and organize media\n' "${CFG[FILEBOT_SUBDOMAIN]}" "${p:+http://$ip:$p/}" ;;
+            esac ;;
     esac
 }
 
@@ -1035,7 +1045,18 @@ render_app_meshcentral() {
 }
 
 # ---- FileBot: jlesage/filebot (web GUI on 5800), media on SMB shares or local folders --------------------
-# FILEBOT_MOUNTS: "NAME=SOURCE;..."  NAME = storage | watch | output | /absolute/container/path
+# Variants: xpra = official rednoah/filebot:xpra (FileBot desktop in the browser) -- the default
+#           node = official rednoah/filebot:node (web UI for amc runs)   jlesage = jlesage/filebot (community)
+filebot_variant() { local v=${CFG[FILEBOT_VARIANT]:-xpra}; [[ "$v" =~ ^(xpra|node|jlesage)$ ]] || v=xpra; printf '%s' "$v"; }
+filebot_default_image() { case "$1" in node) echo "rednoah/filebot:node" ;; jlesage) echo "jlesage/filebot:latest" ;; *) echo "rednoah/filebot:xpra" ;; esac; }
+filebot_image() {   # FILEBOT_IMAGE overrides (e.g. a pinned tag); empty or another variant's default = this variant's default
+    local i=${CFG[FILEBOT_IMAGE]:-} v; v=$(filebot_variant)
+    case "$i" in ""|rednoah/filebot:xpra|rednoah/filebot:node|jlesage/filebot:latest) filebot_default_image "$v" ;; *) printf '%s\n' "$i" ;; esac
+}
+filebot_port() { case "$(filebot_variant)" in node) echo 5452 ;; jlesage) echo 5800 ;; *) echo 5454 ;; esac; }
+filebot_datadir() { [[ "$(filebot_variant)" == jlesage ]] && echo config || echo data; }
+
+# FILEBOT_MOUNTS: "NAME=SOURCE;..."  NAME = volume1 | storage | watch | output | /absolute/container/path
 #                 SOURCE = //server/share[/sub] (SMB, mounted by Docker's cifs volume driver) | /host/path | ./in-app-folder
 # filebot_mounts -> "container_path<TAB>kind(smb|bind)<TAB>source<TAB>volume_name" per entry
 filebot_mounts() {
@@ -1044,7 +1065,7 @@ filebot_mounts() {
         e=$(trim "$e"); [[ -n "$e" ]] || continue
         name=$(trim "${e%%=*}"); src=$(trim "${e#*=}")
         case "$name" in
-            storage|watch|output) cpath="/$name" ;;
+            storage|watch|output|volume1) cpath="/$name" ;;
             /*) cpath=$name ;;
             *) return 1 ;;
         esac
@@ -1093,21 +1114,34 @@ render_app_filebot() {
     render_header filebot
     local hn cpath kind src vol k v
     hn=$(fqdn "${CFG[FILEBOT_SUBDOMAIN]}"); hn=${hn:-filebot}
-    printf '  filebot:\n    image: %s\n    container_name: filebot\n    restart: unless-stopped\n' "$(yaml_str "${CFG[FILEBOT_IMAGE]}")"
+    local variant; variant=$(filebot_variant)
+    printf '  filebot:\n    image: %s\n    container_name: filebot\n    restart: unless-stopped\n' "$(yaml_str "$(filebot_image)")"
     printf '    hostname: %s\n' "$(yaml_str "$hn")"
-    [[ -n "${CFG[FILEBOT_WEB_PORT]}" ]] && { printf '    ports:\n'; render_port "${CFG[FILEBOT_WEB_PORT]}" 5800; }
+    [[ -n "${CFG[FILEBOT_WEB_PORT]}" ]] && { printf '    ports:\n'; render_port "${CFG[FILEBOT_WEB_PORT]}" "$(filebot_port)"; }
     printf '    environment:\n      TZ: %s\n' "$(yaml_str "${CFG[TIMEZONE]}")"
-    printf '      USER_ID: "%s"\n      GROUP_ID: "%s"\n' "${CFG[FILEBOT_UID]}" "${CFG[FILEBOT_GID]}"
-    # HTTPS inside the container lets the login page work without "allow insecure"; the proxy talks TLS to it
-    printf '      SECURE_CONNECTION: "1"\n      WEB_AUTHENTICATION: "1"\n'
-    printf '      WEB_AUTHENTICATION_USERNAME: %s\n' "$(yaml_str "${CFG[FILEBOT_WEB_USER]}")"
-    printf '      WEB_AUTHENTICATION_PASSWORD: "${FILEBOT_WEB_PASSWORD:?err}"\n'
-    printf '      VNC_LISTENING_PORT: "-1"\n'
+    case "$variant" in
+        jlesage)
+            printf '      USER_ID: "%s"\n      GROUP_ID: "%s"\n' "${CFG[FILEBOT_UID]}" "${CFG[FILEBOT_GID]}"
+            # HTTPS inside the container lets the login page work without "allow insecure"; the proxy talks TLS to it
+            printf '      SECURE_CONNECTION: "1"\n      WEB_AUTHENTICATION: "1"\n'
+            printf '      WEB_AUTHENTICATION_USERNAME: %s\n' "$(yaml_str "${CFG[FILEBOT_WEB_USER]}")"
+            printf '      WEB_AUTHENTICATION_PASSWORD: "${FILEBOT_WEB_PASSWORD:?err}"\n'
+            printf '      VNC_LISTENING_PORT: "-1"\n      KEEP_APP_RUNNING: "1"\n      AMC_ENABLED: "0"\n' ;;
+        node)
+            printf '      PUID: "%s"\n      PGID: "%s"\n' "${CFG[FILEBOT_UID]}" "${CFG[FILEBOT_GID]}"
+            printf '      FILEBOT_NODE_AUTH: "BASIC"\n'
+            printf '      FILEBOT_NODE_AUTH_USER: %s\n' "$(yaml_str "${CFG[FILEBOT_WEB_USER]}")"
+            printf '      FILEBOT_NODE_AUTH_PASS: "${FILEBOT_WEB_PASSWORD:?err}"\n' ;;
+        *)
+            printf '      PUID: "%s"\n      PGID: "%s"\n' "${CFG[FILEBOT_UID]}" "${CFG[FILEBOT_GID]}"
+            printf '      XPRA_AUTH: "password:value=${FILEBOT_WEB_PASSWORD:?err}"\n' ;;
+    esac
     while IFS=$'\t' read -r k v; do
-        [[ "$k" =~ ^(TZ|USER_ID|GROUP_ID|WEB_AUTHENTICATION_PASSWORD)$ ]] && continue
+        [[ "$k" =~ ^(TZ|USER_ID|GROUP_ID|PUID|PGID|WEB_AUTHENTICATION_PASSWORD|FILEBOT_NODE_AUTH_PASS|XPRA_AUTH)$ ]] && continue
         printf '      %s: %s\n' "$k" "$(yaml_str "$v")"
     done < <(kv_pairs "${CFG[FILEBOT_EXTRA_ENV]}")
-    printf '    volumes:\n      - "./config:/config"\n'
+    if [[ "$variant" == jlesage ]]; then printf '    volumes:\n      - "./config:/config"\n'
+    else printf '    volumes:\n      - "./data:/data"\n'; fi
     while IFS=$'\t' read -r cpath kind src vol; do
         [[ -n "$cpath" ]] || continue
         if [[ "$kind" == smb ]]; then printf '      - "%s:%s"\n' "$vol" "$cpath"
@@ -1350,16 +1384,21 @@ JSON
             fi ;;
         filebot)
             filebot_mounts >/dev/null || die "FILEBOT_MOUNTS is not valid: ${CFG[FILEBOT_MOUNTS]} (Apps -> FileBot)"
-            run mkdir -p "$d/config"
+            local dd; dd=$(filebot_datadir)
+            run mkdir -p "$d/$dd"
             local cpath kind src vol
             while IFS=$'\t' read -r cpath kind src vol; do
                 [[ "$kind" == bind && "$src" == ./* ]] || continue
                 run mkdir -p "$d/${src#./}"
                 (( DRY_RUN )) || chown "${CFG[FILEBOT_UID]}:${CFG[FILEBOT_GID]}" "$d/${src#./}" 2>/dev/null || true
             done < <(filebot_mounts)
-            (( DRY_RUN )) || chown "${CFG[FILEBOT_UID]}:${CFG[FILEBOT_GID]}" "$d/config" 2>/dev/null || true
+            (( DRY_RUN )) || chown -R "${CFG[FILEBOT_UID]}:${CFG[FILEBOT_GID]}" "$d/$dd" 2>/dev/null || true
             filebot_smb_check || return 1
-            ls "$d"/config/*.psm >/dev/null 2>&1 || log_info "FileBot license: put your .psm file in $d/config/, then restart FileBot." ;;
+            if [[ "$dd" == config ]]; then
+                ls "$d"/config/*.psm >/dev/null 2>&1 || log_info "FileBot license: put your .psm file in $d/config/, then restart FileBot."
+            elif [[ ! -s "$d/data/filebot/license.txt" ]]; then
+                log_info "FileBot license: copy your .psm to $d/data/filebot/license.txt (owner ${CFG[FILEBOT_UID]}), or use the GUI's license button."
+            fi ;;
         gvm)
             if [[ ! -f "$d/compose.yaml" ]]; then
                 if (( DRY_RUN )); then run curl -fsSL "${CFG[GVM_COMPOSE_URL]}"
@@ -2204,6 +2243,7 @@ render_tls_common() {
 render_proxy_location() {
     local up=$1 flags=",$2,"
     [[ "$flags" == *,admin,* ]] && printf '    location = / { return 302 /admin/; }\n'
+    [[ "$flags" == *,fbnode,* ]] && printf '    location = / { return 302 /filebot/; }\n'
     printf '    location / {\n'
     printf '        set $upstream %s;\n' "$up"
     printf '        proxy_pass $upstream;\n'
@@ -4253,6 +4293,8 @@ v_fname()     { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 v_url()       { valid_url "$1"; }
 v_dnsmasq()   { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9][A-Za-z0-9=,./:#_-]*(\;[A-Za-z0-9][A-Za-z0-9=,./:#_-]*)*$ ]]; }
 v_healthdns() { [[ "$1" =~ ^(pihole|host)$ ]]; }
+v_fbvariant() { [[ "$1" =~ ^(xpra|node|jlesage)$ ]]; }
+v_image_opt() { [[ -z "$1" ]] || v_image "$1"; }
 v_num()       { [[ "$1" =~ ^[0-9]{1,6}$ ]]; }
 v_smbuser()   { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9._@\ -]+$ && "$1" != *,* ]]; }
 v_smbvers()   { [[ -z "$1" || "$1" =~ ^(1\.0|2\.0|2\.1|3|3\.0|3\.02|3\.1\.1|default)$ ]]; }
@@ -4389,16 +4431,19 @@ cfg_app() {   # per-app settings
             ask_valid MESHCENTRAL_SUBDOMAIN "Name (-> $(fqdn "${CFG[MESHCENTRAL_SUBDOMAIN]}"))" v_sub
             ask_valid MESHCENTRAL_PORT "Direct HTTPS port, used by agents (- for none)" v_port_opt ;;
         filebot)
-            log_info "FileBot (jlesage/filebot): web GUI with its own login (user below, password in the vault)."
-            ask_valid FILEBOT_IMAGE "Image" v_image
+            log_info "xpra = official FileBot desktop in the browser (default) | node = official amc web UI | jlesage = community image"
+            ask_valid FILEBOT_VARIANT "Variant (xpra/node/jlesage)" v_fbvariant
+            log_info "Image: $(filebot_image) (enter one only to pin a tag; - for the variant's default)"
+            ask_valid FILEBOT_IMAGE "Image" v_image_opt
             ask_valid FILEBOT_SUBDOMAIN "Name (-> $(fqdn "${CFG[FILEBOT_SUBDOMAIN]}"))" v_sub
             ask_valid FILEBOT_WEB_PORT "Direct HTTPS port on the host (- for proxy only)" v_port_opt
-            ask_valid FILEBOT_WEB_USER "Web login user" v_user
+            [[ "$(filebot_variant)" == xpra ]] && log_info "Login: password only (vault FILEBOT_WEB_PASSWORD)." \
+                || ask_valid FILEBOT_WEB_USER "Web login user" v_user
             ask_valid FILEBOT_UID "Run as user ID (file owner on local folders and SMB mounts)" v_num
             ask_valid FILEBOT_GID "Run as group ID" v_num
-            log_info "Folders: NAME=SOURCE;...  NAME: storage, watch, output or /a/container/path"
+            log_info "Folders: NAME=SOURCE;...  NAME: volume1 (the official images' media folder), storage, watch, output or /a/container/path"
             log_info "  SOURCE: //server/share[/sub] (SMB), /host/path, or ./folder inside $(app_dir filebot)"
-            log_info "  e.g.  storage=//192.168.0.20/media;output=//192.168.0.20/media/sorted"
+            log_info "  e.g.  volume1=//192.168.0.20/media   (keep input and output under one share for MOVE/HARDLINK)"
             ask_valid FILEBOT_MOUNTS "Folders" v_fbmounts
             if filebot_has_smb; then
                 ask_valid FILEBOT_SMB_USER "SMB user (- for guest access)" v_smbuser
@@ -4532,6 +4577,7 @@ secret_change() {
     fi
     [[ "$v" == - ]] && die "'-' (no password) is only allowed for PIHOLE_PASSWORD."
     [[ "$k" == FILEBOT_SMB_PASSWORD && -z "$v" ]] && die "Enter the SMB share's password (it can't be generated)."
+    [[ "$k" == FILEBOT_WEB_PASSWORD && "$v" == *[,\$\"]* ]] && die "FILEBOT_WEB_PASSWORD may not contain , \$ or \" (xpra's login option syntax)."
     v=${v:-$(gen_password)}
     if [[ "$k" == GUAC_DB_PASSWORD ]] && docker ps -q --filter name='^guacamole-postgres$' | grep -q .; then
         printf 'ALTER USER "%s" WITH PASSWORD :%s;\n' "${CFG[GUAC_DB_USER]}" "'pw'" | guac_psql -v pw="$v" >/dev/null \
@@ -4747,8 +4793,12 @@ self_test() {
     st "filebot: mounts parsed"             '( set_default_config; CFG[FILEBOT_MOUNTS]="storage=//nas.lan/media; output=/srv/sorted;/media/tv=//10.0.0.5/tv/shows"; m=$(filebot_mounts); [[ "$m" == "/storage	smb	//nas.lan/media	smb_storage"*"/output	bind	/srv/sorted	"*"/media/tv	smb	//10.0.0.5/tv/shows	smb_media_tv" ]] )'
     st "filebot: bad mounts refused"        'set_default_config; ! v_fbmounts "music=//nas/m" && ! v_fbmounts "storage=nas/m" && ! v_fbmounts "storage=//nas" && ! v_fbmounts "storage=/a;storage=/b" && v_fbmounts "storage=./storage" && v_fbmounts "watch=//10.0.0.5/in;output=//10.0.0.5/out"'
     st "filebot: cifs options"              '( set_default_config; CFG[FILEBOT_SMB_USER]=matt; CFG[FILEBOT_SMB_DOMAIN]=HOME; o=$(filebot_cifs_opts //10.0.0.5/media); [[ "$o" == "addr=10.0.0.5,username=matt,password=\${FILEBOT_SMB_PASSWORD},domain=HOME,vers=3.0,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,iocharset=utf8" ]] && CFG[FILEBOT_SMB_USER]="" && [[ "$(filebot_cifs_opts //10.0.0.5/m)" == addr=10.0.0.5,guest,* ]] )'
-    st "filebot: compose (SMB + local)"     '( allcfg; CFG[APP_FILEBOT]=yes; CFG[FILEBOT_SMB_USER]=matt; CFG[FILEBOT_MOUNTS]="storage=//10.0.0.5/media;output=./out"; CFG[FILEBOT_WEB_PORT]=5800; c=$(render_app_filebot); [[ "$c" == *"- \"smb_storage:/storage\""* && "$c" == *"- \"./out:/output\""* && "$c" == *"type: cifs"* && "$c" == *",password=\${FILEBOT_SMB_PASSWORD},"* && "$c" != *"\$\${FILEBOT_SMB"* && "$c" == *"device: \"//10.0.0.5/media\""* && "$c" == *"WEB_AUTHENTICATION_PASSWORD: \"\${FILEBOT_WEB_PASSWORD:?err}\""* && "$c" == *"\"5800:5800\""* && "$c" == *"hostname: \"filebot.example.net\""* ]] )'
-    st "filebot: proxied over TLS"          '( allcfg; CFG[APP_FILEBOT]=yes; c=$(render_nginx | sed -n "/server_name filebot.example.net/,/^}/p"); [[ "$c" == *"set \$upstream https://filebot:5800;"* && "$c" == *"proxy_ssl_verify off"* && "$c" == *"Upgrade"* ]] )'
+    st "filebot: compose (SMB + local)"     '( allcfg; CFG[APP_FILEBOT]=yes; CFG[FILEBOT_VARIANT]=jlesage; CFG[FILEBOT_SMB_USER]=matt; CFG[FILEBOT_MOUNTS]="storage=//10.0.0.5/media;output=./out"; CFG[FILEBOT_WEB_PORT]=5800; c=$(render_app_filebot); [[ "$c" == *"- \"smb_storage:/storage\""* && "$c" == *"- \"./out:/output\""* && "$c" == *"type: cifs"* && "$c" == *",password=\${FILEBOT_SMB_PASSWORD},"* && "$c" != *"\$\${FILEBOT_SMB"* && "$c" == *"device: \"//10.0.0.5/media\""* && "$c" == *"WEB_AUTHENTICATION_PASSWORD: \"\${FILEBOT_WEB_PASSWORD:?err}\""* && "$c" == *"\"5800:5800\""* && "$c" == *"hostname: \"filebot.example.net\""* ]] )'
+    st "filebot: jlesage proxied over TLS"  '( allcfg; CFG[APP_FILEBOT]=yes; CFG[FILEBOT_VARIANT]=jlesage; c=$(render_nginx | sed -n "/server_name filebot.example.net/,/^}/p"); [[ "$c" == *"set \$upstream https://filebot:5800;"* && "$c" == *"proxy_ssl_verify off"* && "$c" == *"Upgrade"* ]] )'
+    st "filebot: xpra is the default"       '( allcfg; CFG[APP_FILEBOT]=yes; CFG[FILEBOT_MOUNTS]="volume1=//10.0.0.5/media"; CFG[FILEBOT_SMB_USER]=u; c=$(render_app_filebot); [[ "$c" == *"image: \"rednoah/filebot:xpra\""* && "$c" == *"XPRA_AUTH: \"password:value=\${FILEBOT_WEB_PASSWORD:?err}\""* && "$c" == *"PUID: \"1000\""* && "$c" == *"- \"./data:/data\""* && "$c" == *"- \"smb_volume1:/volume1\""* ]] && n=$(render_nginx | sed -n "/server_name filebot.example.net/,/^}/p") && [[ "$n" == *"set \$upstream http://filebot:5454;"* && "$n" != *proxy_ssl_verify* ]] )'
+    st "filebot: node variant"              '( allcfg; CFG[APP_FILEBOT]=yes; CFG[FILEBOT_VARIANT]=node; CFG[FILEBOT_WEB_PORT]=5452; c=$(render_app_filebot); [[ "$c" == *"rednoah/filebot:node"* && "$c" == *"FILEBOT_NODE_AUTH_PASS: \"\${FILEBOT_WEB_PASSWORD:?err}\""* && "$c" == *"\"5452:5452\""* ]] && n=$(render_nginx | sed -n "/server_name filebot.example.net/,/^}/p") && [[ "$n" == *"return 302 /filebot/"* ]] )'
+    st "filebot: image follows variant"     '( set_default_config; [[ $(filebot_image) == rednoah/filebot:xpra ]] && CFG[FILEBOT_IMAGE]=jlesage/filebot:latest && [[ $(filebot_image) == rednoah/filebot:xpra ]] && CFG[FILEBOT_IMAGE]=rednoah/filebot:5.1 && [[ $(filebot_image) == rednoah/filebot:5.1 ]] )'
+    st "filebot: v2.10 defaults migrate"    '( d=$(mktemp -d); CONF_FILE="$d/c"; printf "%s\n" "FILEBOT_MOUNTS='"'"'storage=./storage'"'"'" "FILEBOT_EXTRA_ENV='"'"'KEEP_APP_RUNNING=1;AMC_ENABLED=0'"'"'" >"$CONF_FILE"; load_config; [[ "${CFG[FILEBOT_MOUNTS]}" == volume1=./media && -z "${CFG[FILEBOT_EXTRA_ENV]}" ]] )'
     st "filebot: smb comma escaping"        '( SECRETS=([FILEBOT_SMB_PASSWORD]="a,b,,c"); app_dir() { echo "$t"; }; docker() { printf "%s" "$FILEBOT_SMB_PASSWORD"; }; [[ "$(compose_app filebot x)" == "a,,b,,,,c" ]] )'
     st "filebot: smb validators"            'v_smbvers 3.1.1 && v_smbvers "" && ! v_smbvers 4 && v_smbopts "noserverino,cache=none" && ! v_smbopts "password=x" && ! v_smbopts "a b" && v_smbuser "DOMAIN user" && ! v_smbuser "a,b"'
     st "nginx: pihole card clicks pass"     '( allcfg; c=$(render_nginx); p=$(sed -n "/server_name pihole/,/^}/p" <<<"$c"); g=$(sed -n "/server_name grafana/,/^}/p" <<<"$c"); [[ "$c" == *"map \"\$request_method:\$http_sec_fetch_site\" \$dd_fetch_site"* && "$p" == *"Sec-Fetch-Site \$dd_fetch_site"* && "$g" != *Sec-Fetch-Site* ]] )'
@@ -4776,7 +4826,7 @@ self_test() {
     st "meshcentral: agents port -> 443"    '( allcfg; [[ "$(render_app_meshcentral)" == *"\"3000:443\""* ]] )'
     st "gvm override drops host ports"      '( allcfg; c=$(render_app_gvm_override); [[ "$c" == *"ports: !reset []"* && "$c" == *gvm-web* ]] )'
     if (( have_yaml )); then
-        st "all app compose files are YAML" '( allcfg; CFG[APP_FILEBOT]=yes; CFG[FILEBOT_SMB_USER]=u; CFG[FILEBOT_MOUNTS]="storage=//10.0.0.5/m;output=./o"; for a in pihole portainer monitoring guacamole meshcentral filebot; do "render_app_$a" | python3 -c "import yaml,sys; d=yaml.safe_load(sys.stdin); assert d[\"networks\"][\"dd-proxy\"][\"external\"]" || exit 1; done; render_compose | python3 -c "import yaml,sys; yaml.safe_load(sys.stdin)" )'
+        st "all app compose files are YAML" '( allcfg; CFG[APP_FILEBOT]=yes; CFG[FILEBOT_SMB_USER]=u; CFG[FILEBOT_MOUNTS]="volume1=//10.0.0.5/m;output=./o"; for a in pihole portainer monitoring guacamole meshcentral filebot; do "render_app_$a" | python3 -c "import yaml,sys; d=yaml.safe_load(sys.stdin); assert d[\"networks\"][\"dd-proxy\"][\"external\"]" || exit 1; done; render_compose | python3 -c "import yaml,sys; yaml.safe_load(sys.stdin)" )'
     fi
     if (( have_py )); then
         st "services.json valid, apps first" '( allcfg; SVC_GROUP=(Links); SVC_NAME=("A\"b"); SVC_URL=(http://x/); SVC_DESC=(d); render_services_json | python3 -c "import json,sys; d=json.load(sys.stdin); g=d[\"groups\"]; assert g[0][\"name\"]==\"Apps\" and len(g[0][\"items\"])==6 and g[0][\"items\"][2][\"alt\"]==\"http://192.168.0.190:3030/\" and g[1][\"items\"][0][\"name\"]==\"A\\\"b\"" )'
