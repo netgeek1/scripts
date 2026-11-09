@@ -11,7 +11,7 @@ with a landing page, keeps them updated, and moves them from an old host to a ne
 | **Guacamole** | Clientless remote desktop with PostgreSQL. Schema upgrades are applied for you |
 | **MeshCentral** | Remote device management |
 | **Greenbone / OpenVAS** *(optional, off)* | Vulnerability scanning, using Greenbone's own compose file |
-| **FileBot** *(optional, off)* | Media renamer ([jlesage/filebot](https://github.com/jlesage/docker-filebot)) with a web GUI and login. Media can be on SMB shares |
+| **FileBot** *(optional, off)* | Media renamer, using the official [rednoah/filebot](https://github.com/filebot/filebot-docker) image: the FileBot desktop in your browser, behind a login. Media can be on SMB shares |
 
 Every app gets its own name, such as `https://grafana.example.net`, with one certificate (a wildcard or
 self-signed). Its original port can stay published as a fallback.
@@ -297,19 +297,34 @@ plain folders, so one copy of `/opt/stacks` backs up everything.
 
 Turn it on in **Apps** (or answer yes during install), then set it up with **Apps → E → FileBot**.
 
-- **Web GUI:** `https://filebot.<domain>`, behind its own login. The user is `FILEBOT_WEB_USER` (default `admin`);
-  the password is generated into the vault (`--show-secret FILEBOT_WEB_PASSWORD`). The container serves HTTPS
-  itself, and the proxy talks TLS to it. VNC is off.
-- **License:** copy your FileBot `.psm` license file into `/opt/stacks/filebot/config/`, then restart FileBot.
-- **Folders:** `FILEBOT_MOUNTS` is a list of `NAME=SOURCE` pairs separated by `;`. `NAME` is `storage`, `watch`,
-  `output` or an absolute path in the container. `SOURCE` is one of:
+**Variant** (`FILEBOT_VARIANT`). The image follows the variant; `FILEBOT_IMAGE` is only for pinning a tag.
+
+| Variant | Image | What you get | Login |
+|---|---|---|---|
+| `xpra` *(default)* | `rednoah/filebot:xpra` (official) | The FileBot desktop app in the browser | Password only |
+| `node` | `rednoah/filebot:node` (official) | FileBot's web UI for `amc` runs, at `/filebot/` (the root redirects there) | `FILEBOT_WEB_USER` + password |
+| `jlesage` | `jlesage/filebot` (community) | The desktop app in the browser, with a login page | `FILEBOT_WEB_USER` + password |
+
+- **Address:** `https://filebot.<domain>`. The password is generated into the vault
+  (`--show-secret FILEBOT_WEB_PASSWORD`). For `xpra`, a password you set yourself can't contain `,`, `$` or `"`.
+- **License:** official images read `/opt/stacks/filebot/data/filebot/license.txt`. Copy your `.psm` there, owned
+  by `FILEBOT_UID`, or use the license button in the GUI. For `jlesage`, put the `.psm` in
+  `/opt/stacks/filebot/config/`.
+- **Folders:** `FILEBOT_MOUNTS` is a list of `NAME=SOURCE` pairs separated by `;`. `NAME` is `volume1` (the
+  official images' media folder), `storage`, `watch`, `output` or an absolute path in the container. `SOURCE` is
+  one of:
   - `//server/share[/sub]`: an SMB share
   - `/host/path`: a folder on the host
   - `./folder`: a folder inside `/opt/stacks/filebot`
 
+  The default is `volume1=./media`. FileBot can only MOVE or HARDLINK within one mount, so keep input and output
+  folders under one share:
+
   ```
-  FILEBOT_MOUNTS='storage=//192.168.0.20/media;output=//192.168.0.20/media/sorted'
+  FILEBOT_MOUNTS='volume1=//192.168.0.20/media'
   ```
+
+- **Runs as** `FILEBOT_UID`/`FILEBOT_GID` (default 1000): `PUID`/`PGID` for the official images.
 
 **SMB shares** are mounted by Docker itself, as `cifs` volumes of the FileBot project, so nothing is added to
 `/etc/fstab`.
@@ -587,9 +602,10 @@ All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menu
 | `<APP>_*_PORT` | Direct ports. Blank = not published |
 | `PIHOLE_EXTRA_ENV`, `GRAFANA_EXTRA_ENV` | Extra settings as `K=V;K=V` |
 | `PIHOLE_NO_PASSWORD` | `yes` = Pi-hole web login without a password. Default `no` |
-| `FILEBOT_MOUNTS` | `storage=./storage`. FileBot folders: `NAME=SOURCE;...` (see **FileBot**) |
+| `FILEBOT_VARIANT`, `FILEBOT_IMAGE` | `xpra`, empty. Variant `xpra`/`node`/`jlesage`; the image only to pin a tag |
+| `FILEBOT_MOUNTS` | `volume1=./media`. FileBot folders: `NAME=SOURCE;...` (see **FileBot**) |
 | `FILEBOT_SMB_USER`, `FILEBOT_SMB_DOMAIN`, `FILEBOT_SMB_VERS`, `FILEBOT_SMB_OPTS` | SMB login and mount options (password: vault `FILEBOT_SMB_PASSWORD`) |
-| `FILEBOT_WEB_USER`, `FILEBOT_UID`, `FILEBOT_GID`, `FILEBOT_EXTRA_ENV` | `admin`, `1000`, `1000`, `KEEP_APP_RUNNING=1;AMC_ENABLED=0` |
+| `FILEBOT_WEB_USER`, `FILEBOT_UID`, `FILEBOT_GID`, `FILEBOT_EXTRA_ENV` | `admin`, `1000`, `1000`, empty. The web user isn't used by `xpra` |
 | `PIHOLE_DNSMASQ_LINES` | dnsmasq options, `;`-separated. Default `dns-forward-max=5096;min-cache-ttl=300`; `-` for none |
 | `PROMETHEUS_RETENTION`, `GRAFANA_PLUGINS` | Monitoring options |
 | `GUAC_POSTGRES_IMAGE` | Default `postgres:17`. Keep the major version once data exists |
@@ -627,7 +643,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 109 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 113 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
