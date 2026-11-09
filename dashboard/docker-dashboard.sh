@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.11.0"
+readonly SCRIPT_VERSION="2.11.1"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -185,6 +185,33 @@ run() {
 # On a terminal the command writes straight to it, so docker/apt keep their in-place progress bars
 # (a pipe makes them print one line per update); the log gets the command and its exit code.
 # Without a terminal (timers) the full output is teed into the log.
+# ---- Terminal check: Compose draws its progress with Unicode (braille spinners and bars) and redraws it in place,
+# padded to the full terminal width. A terminal that doesn't decode UTF-8 shows each of those characters as 2-3
+# (e.g. "â£¿"), so every line wraps, the redraw lands one line lower each time, and the progress scrolls.
+TERM_UTF8=""
+term_utf8_ok() {   # asks the terminal: print one 3-byte character at column 1, then read back the cursor column
+    if [[ -z "$TERM_UTF8" ]]; then
+        TERM_UTF8=yes
+        if [[ -t 0 && -t 1 && "${TERM:-dumb}" != dumb ]]; then
+            local _e _r col=""
+            printf '\r\xe2\xa3\xbf\e[6n' >/dev/tty          # (not read -p: its prompt goes to stderr)
+            IFS='[;' read -rs -d R -t 1 _e _r col </dev/tty 2>/dev/null || true
+            printf '\r   \r' >/dev/tty
+            [[ "$col" =~ ^[0-9]+$ ]] && (( col > 2 )) && TERM_UTF8=no
+        fi
+    fi
+    [[ "$TERM_UTF8" == yes ]]
+}
+DC_PROGRESS=""   # --progress for docker compose; "plain" when the terminal can't draw Compose's progress
+compose_progress_setup() {
+    term_utf8_ok && return 0
+    DC_PROGRESS=plain
+    log_warn "This terminal doesn't decode UTF-8, so Docker's progress bars can't redraw in place; using plain progress."
+    log_info "Fix it in the terminal: PuTTY: Window -> Translation -> Remote character set: UTF-8 (then reconnect)."
+    log_info "Windows Terminal / modern ssh: UTF-8 already; check the session's encoding setting if it still happens."
+}
+dcompose() { docker compose ${DC_PROGRESS:+--progress "$DC_PROGRESS"} "$@"; }
+
 run_logged() {
     if (( DRY_RUN )); then run "$@"; return 0; fi
     _log_file RUN "$*"
@@ -1246,9 +1273,9 @@ compose_app() {
         # cifs mount options are comma-separated; a comma inside the password is written as ",,"
         export FILEBOT_SMB_PASSWORD="${FILEBOT_SMB_PASSWORD//,/,,}"
         if [[ "$app" == gvm ]]; then
-            docker compose -p "$(app_project gvm)" -f compose.yaml -f compose.override.yaml "$@"
+            dcompose -p "$(app_project gvm)" -f compose.yaml -f compose.override.yaml "$@"
         else
-            docker compose -p "$(app_project "$app")" -f compose.yaml "$@"
+            dcompose -p "$(app_project "$app")" -f compose.yaml "$@"
         fi
     )
 }
@@ -1733,7 +1760,7 @@ used_subdomains() {
 custom_compose() {   # custom_compose NAME ARGS...  (runs in the app folder so its .env is used)
     local n=$1; shift
     local f; f=$(custom_compose_file "$n") || { log_error "$n: no compose file in $(custom_dir "$n")"; return 1; }
-    ( cd "$(custom_dir "$n")" && docker compose -p "$(custom_project "$n")" -f "$f" "$@" )
+    ( cd "$(custom_dir "$n")" && dcompose -p "$(custom_project "$n")" -f "$f" "$@" )
 }
 
 # published host ports from 'docker compose config --format json' -> "port/proto<TAB>label"
@@ -3098,7 +3125,7 @@ write_services_json() {   # only replace it when something other than the timest
     write_file "$f" 644 root:root <<<"$new"
 }
 
-compose_dd() { ( cd "$DEPLOY_DIR" && docker compose -p "$PROJECT_NAME" "$@" ); }
+compose_dd() { ( cd "$DEPLOY_DIR" && dcompose -p "$PROJECT_NAME" "$@" ); }
 
 publish_services() {   # services.json only (fast path for link edits)
     [[ -d "$DEPLOY_DIR/html" ]] || return 0
@@ -3623,7 +3650,7 @@ update_all() {
     return 0
 }
 
-compose_in() { local d=$1; shift; ( cd "$d" && docker compose "$@" ); }
+compose_in() { local d=$1; shift; ( cd "$d" && dcompose "$@" ); }
 
 # -----------------------------------------------------------------------------
 # SYSTEMD UNITS (health + scheduled updates) and installed copy
@@ -4801,6 +4828,7 @@ self_test() {
     st "filebot: v2.10 defaults migrate"    '( d=$(mktemp -d); CONF_FILE="$d/c"; printf "%s\n" "FILEBOT_MOUNTS='"'"'storage=./storage'"'"'" "FILEBOT_EXTRA_ENV='"'"'KEEP_APP_RUNNING=1;AMC_ENABLED=0'"'"'" >"$CONF_FILE"; load_config; [[ "${CFG[FILEBOT_MOUNTS]}" == volume1=./media && -z "${CFG[FILEBOT_EXTRA_ENV]}" ]] )'
     st "filebot: smb comma escaping"        '( SECRETS=([FILEBOT_SMB_PASSWORD]="a,b,,c"); app_dir() { echo "$t"; }; docker() { printf "%s" "$FILEBOT_SMB_PASSWORD"; }; [[ "$(compose_app filebot x)" == "a,,b,,,,c" ]] )'
     st "filebot: smb validators"            'v_smbvers 3.1.1 && v_smbvers "" && ! v_smbvers 4 && v_smbopts "noserverino,cache=none" && ! v_smbopts "password=x" && ! v_smbopts "a b" && v_smbuser "DOMAIN user" && ! v_smbuser "a,b"'
+    st "compose progress flag"              '( docker() { printf "%s " "$@"; }; DC_PROGRESS=""; [[ "$(dcompose pull)" == "compose pull " ]] && DC_PROGRESS=plain && [[ "$(dcompose pull)" == "compose --progress plain pull " ]] )'
     st "nginx: pihole card clicks pass"     '( allcfg; c=$(render_nginx); p=$(sed -n "/server_name pihole/,/^}/p" <<<"$c"); g=$(sed -n "/server_name grafana/,/^}/p" <<<"$c"); [[ "$c" == *"map \"\$request_method:\$http_sec_fetch_site\" \$dd_fetch_site"* && "$p" == *"Sec-Fetch-Site \$dd_fetch_site"* && "$g" != *Sec-Fetch-Site* ]] )'
     st "nginx: pihole / -> /admin/"         '( allcfg; c=$(render_nginx | sed -n "/server_name pihole/,/^}/p"); [[ "$c" == *"location = / { return 302 /admin/; }"* ]] )'
     st "nginx: tls upstream + websockets"   '( allcfg; c=$(render_nginx | sed -n "/server_name portainer/,/^}/p"); [[ "$c" == *"proxy_ssl_verify off"* && "$c" == *"Connection \$connection_upgrade"* && "$c" == *"client_max_body_size 0"* ]] )'
@@ -5110,6 +5138,7 @@ main() {
     fi
 
     check_root "${orig[@]}"
+    compose_progress_setup
 
     if [[ "$action" == health ]]; then   # timer: own lock, no run log
         acquire_lock "$DD_HEALTH_LOCK"
