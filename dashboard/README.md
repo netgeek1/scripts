@@ -53,7 +53,7 @@ scripts you `curl` onto other machines.
 | Docker | Installed for you if missing (Docker CE + compose plugin from download.docker.com) |
 | Network | The image registries (docker.io, ghcr.io, and registry.community.greenbone.net for GVM), plus github.com for first-run defaults |
 | Ports | 80/443 for the proxy, 53 for Pi-hole, and each app's fallback port if you keep it |
-| Terminal | UTF-8, for Docker's in-place progress bars (PuTTY: **Window → Translation → Remote character set: UTF-8**). The script checks the terminal; if it isn't UTF-8, Docker progress is shown as plain lines instead of a mess of `â£¿` characters |
+| Terminal | UTF-8, for Docker's in-place progress bars (PuTTY: **Window → Translation → Remote character set: UTF-8**). The script checks the terminal; if it isn't UTF-8, Docker progress is shown as plain lines instead of a mess of `â£¿` characters. `DD_TERM_PROBE=0` skips the check, e.g. when driving the menu from a script |
 
 The install prepares the host before writing anything:
 
@@ -249,6 +249,7 @@ Wildcard certificates (`custom`, `fetch`, `push`) don't contain the IP, so they 
 | 2 / 3 | `--settings` / `--apps` | Settings menu / turn apps on or off and edit their images, names and ports |
 | 4 | `--services`, `--add-service`, `--remove-service`, `--detect` | Custom links on the page |
 | K | `--secrets`, `--show-secret NAME`, `--set-secret NAME` | View or change stored passwords (see **Secrets**) |
+| Apps → F | `--filebot-shares`, `--filebot-add-share 'AS=//server/share'` | FileBot's SMB shares and folders, SMB login, test mount |
 | Apps → C → W | `--add-site 'N\|URL\|T\|D'` | Put a web UI on another machine behind the proxy (see **Sites on other machines**) |
 | P | `--change-ip NEW_IP` | Point names, links and Pi-hole records at a new host address, then apply |
 | C | `--cert-refresh`, `--cert-fetch-key`, `--cert-push-setup`, `--cert-receive` | Certificate actions |
@@ -296,7 +297,33 @@ plain folders, so one copy of `/opt/stacks` backs up everything.
 
 ### FileBot
 
-Turn it on in **Apps** (or answer yes during install), then set it up with **Apps → E → FileBot**.
+Turn it on in **Apps → T** (or answer yes during install). It then asks for the variant, the login, and its media
+folders.
+
+**Mounting SMB shares** (e.g. your NAS): **Apps → F**, or `sudo docker-dashboard --filebot-shares`:
+
+```
+  FileBot folders  (inside FileBot -> source)
+   1) /volume1       <- //192.168.0.20/Media   (SMB)
+   SMB login: matt (domain HOME), version 3.0, password stored
+
+   S) Add an SMB share   H) Add a folder on this host   R) Remove one   L) SMB login
+   T) Test the SMB shares   E) Edit as text   0) Done
+```
+
+**S** asks for these, in order:
+
+1. The server. It is checked for SMB on port 445 straight away.
+2. The share name. Spaces are fine.
+3. An optional sub-folder.
+4. Where FileBot sees it. The first share becomes `/volume1`, the official images' media folder.
+5. The first time, the SMB login: user (blank = guest), domain and password. The password goes into the vault.
+
+It then offers a read-only test mount. **L** changes the login, **T** tests every share, and **E** edits the list as
+text. Apply (or the menu's apply prompt) starts FileBot with the shares.
+
+Without the menu: `sudo docker-dashboard --filebot-add-share 'volume1=//192.168.0.20/Media'`, then
+`--set-secret FILEBOT_SMB_PASSWORD` and `--apply`.
 
 **Variant** (`FILEBOT_VARIANT`). The image follows the variant; `FILEBOT_IMAGE` is only for pinning a tag.
 
@@ -311,7 +338,7 @@ Turn it on in **Apps** (or answer yes during install), then set it up with **App
 - **License:** official images read `/opt/stacks/filebot/data/filebot/license.txt`. Copy your `.psm` there, owned
   by `FILEBOT_UID`, or use the license button in the GUI. For `jlesage`, put the `.psm` in
   `/opt/stacks/filebot/config/`.
-- **Folders:** `FILEBOT_MOUNTS` is a list of `NAME=SOURCE` pairs separated by `;`. `NAME` is `volume1` (the
+- **Folders as text:** `FILEBOT_MOUNTS` is a list of `NAME=SOURCE` pairs separated by `;`. `NAME` is `volume1` (the
   official images' media folder), `storage`, `watch`, `output` or an absolute path in the container. `SOURCE` is
   one of:
   - `//server/share[/sub]`: an SMB share
@@ -644,7 +671,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 114 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 118 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
