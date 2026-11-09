@@ -11,6 +11,7 @@ with a landing page, keeps them updated, and moves them from an old host to a ne
 | **Guacamole** | Clientless remote desktop with PostgreSQL. Schema upgrades are applied for you |
 | **MeshCentral** | Remote device management |
 | **Greenbone / OpenVAS** *(optional, off)* | Vulnerability scanning, using Greenbone's own compose file |
+| **FileBot** *(optional, off)* | Media renamer ([jlesage/filebot](https://github.com/jlesage/docker-filebot)) with a web GUI and login. Media can be on SMB shares |
 
 Every app gets its own name, such as `https://grafana.example.net`, with one certificate (a wildcard or
 self-signed). Its original port can stay published as a fallback.
@@ -292,6 +293,43 @@ plain folders, so one copy of `/opt/stacks` backs up everything.
   - A flood of those warnings can also mean a DNS loop or an upstream that doesn't answer. Raising the limit hides
     that, so check the upstreams if the warnings persist.
 
+### FileBot
+
+Turn it on in **Apps** (or answer yes during install), then set it up with **Apps → E → FileBot**.
+
+- **Web GUI:** `https://filebot.<domain>`, behind its own login. The user is `FILEBOT_WEB_USER` (default `admin`);
+  the password is generated into the vault (`--show-secret FILEBOT_WEB_PASSWORD`). The container serves HTTPS
+  itself, and the proxy talks TLS to it. VNC is off.
+- **License:** copy your FileBot `.psm` license file into `/opt/stacks/filebot/config/`, then restart FileBot.
+- **Folders:** `FILEBOT_MOUNTS` is a list of `NAME=SOURCE` pairs separated by `;`. `NAME` is `storage`, `watch`,
+  `output` or an absolute path in the container. `SOURCE` is one of:
+  - `//server/share[/sub]`: an SMB share
+  - `/host/path`: a folder on the host
+  - `./folder`: a folder inside `/opt/stacks/filebot`
+
+  ```
+  FILEBOT_MOUNTS='storage=//192.168.0.20/media;output=//192.168.0.20/media/sorted'
+  ```
+
+**SMB shares** are mounted by Docker itself, as `cifs` volumes of the FileBot project, so nothing is added to
+`/etc/fstab`.
+
+- **Login:** `FILEBOT_SMB_USER` (blank = guest) with `FILEBOT_SMB_DOMAIN`. The password is stored in the vault
+  (`--set-secret FILEBOT_SMB_PASSWORD`; the Apps menu asks for it). Commas in it are escaped for you.
+- **Mount options:** `FILEBOT_SMB_VERS` (default `3.0`) and `FILEBOT_SMB_OPTS` (e.g. `noserverino`). Files belong
+  to `FILEBOT_UID`/`FILEBOT_GID` (default 1000), the same IDs FileBot runs as.
+- **Before starting, apply checks each share:** the name resolves, port 445 answers, and a read-only test mount
+  with the same options works. Anything wrong is reported with the reason, and FileBot is not started.
+- **Changed settings or password:** FileBot is stopped and its share mounts are recreated. Only the mount
+  definitions are dropped, never data on the server.
+- **NAS not up yet at boot:** Docker doesn't retry a container whose share failed to mount. The health run
+  (every 2 minutes) starts FileBot again in exactly that case. A FileBot you stopped yourself stays stopped.
+- `cifs-utils` is installed the first time a share is used.
+
+**One app can't hold up the rest.** Each app is started on its own. If one fails, such as FileBot with its NAS
+down, apply reports it and carries on with the other apps, custom apps and the proxy. It ends with a list of what
+didn't start, and exits non-zero.
+
 ## Custom apps
 
 Any app with a compose file can join the proxy: its own name, the wildcard certificate, a card with a status dot,
@@ -459,6 +497,8 @@ present) or with openssl and a root-only key file. This is the same scheme as `m
 | `GRAFANA_ADMIN_PASSWORD` | Grafana's first start only | Change it in the Grafana UI |
 | `GUAC_DB_PASSWORD` | Guacamole's PostgreSQL user | The Secrets menu changes it in PostgreSQL too |
 | `GVM_ADMIN_PASSWORD` | Greenbone admin, via `--gvm-password` | Run `--gvm-password` again |
+| `FILEBOT_WEB_PASSWORD` | FileBot web login | Applies on the next apply |
+| `FILEBOT_SMB_PASSWORD` | FileBot's SMB shares (entered, never generated) | Applies on the next apply; the share mounts are recreated |
 
 **Viewing a password:**
 
@@ -547,6 +587,9 @@ All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menu
 | `<APP>_*_PORT` | Direct ports. Blank = not published |
 | `PIHOLE_EXTRA_ENV`, `GRAFANA_EXTRA_ENV` | Extra settings as `K=V;K=V` |
 | `PIHOLE_NO_PASSWORD` | `yes` = Pi-hole web login without a password. Default `no` |
+| `FILEBOT_MOUNTS` | `storage=./storage`. FileBot folders: `NAME=SOURCE;...` (see **FileBot**) |
+| `FILEBOT_SMB_USER`, `FILEBOT_SMB_DOMAIN`, `FILEBOT_SMB_VERS`, `FILEBOT_SMB_OPTS` | SMB login and mount options (password: vault `FILEBOT_SMB_PASSWORD`) |
+| `FILEBOT_WEB_USER`, `FILEBOT_UID`, `FILEBOT_GID`, `FILEBOT_EXTRA_ENV` | `admin`, `1000`, `1000`, `KEEP_APP_RUNNING=1;AMC_ENABLED=0` |
 | `PIHOLE_DNSMASQ_LINES` | dnsmasq options, `;`-separated. Default `dns-forward-max=5096;min-cache-ttl=300`; `-` for none |
 | `PROMETHEUS_RETENTION`, `GRAFANA_PLUGINS` | Monitoring options |
 | `GUAC_POSTGRES_IMAGE` | Default `postgres:17`. Keep the major version once data exists |
@@ -584,7 +627,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 102 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 109 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
