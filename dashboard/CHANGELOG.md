@@ -3,6 +3,22 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.12.0 — 2026-11-08 — Mount SMB shares for FileBot from the menu
+
+### Added
+- **Apps → F** (also `--filebot-shares`): FileBot's folders and SMB shares, managed from a menu.
+  - **Add an SMB share:** asks for the server (checked on port 445 straight away), the share (spaces are fine), an
+    optional sub-folder, and where FileBot sees it (`/volume1` first), then offers a read-only test mount.
+  - Add a host folder, remove an entry, set the SMB login (user / domain / password into the vault / version /
+    options), test all shares, or edit the list as text.
+- `--filebot-add-share 'volume1=//server/share[/sub]'` adds a share without the menu.
+- **Turning FileBot on** (Apps → T, or during install) goes straight into its setup, including the shares. They were
+  previously hidden behind "review per-app settings" and a raw `NAME=SOURCE` text prompt.
+- Share and folder names may contain spaces (`//nas/My Media`). Container paths still can't, and commas and quotes
+  are refused.
+- `DD_TERM_PROBE=0` skips the terminal UTF-8 check, which reads the terminal's reply and could eat scripted input.
+- Self-test: 118 checks.
+
 ## v2.11.1 — 2026-11-08 — Progress bars in non-UTF-8 terminals
 
 ### Fixed
