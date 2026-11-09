@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.11.1"
+readonly SCRIPT_VERSION="2.12.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -192,7 +192,8 @@ TERM_UTF8=""
 term_utf8_ok() {   # asks the terminal: print one 3-byte character at column 1, then read back the cursor column
     if [[ -z "$TERM_UTF8" ]]; then
         TERM_UTF8=yes
-        if [[ -t 0 && -t 1 && "${TERM:-dumb}" != dumb ]]; then
+        # DD_TERM_PROBE=0 skips it (the probe reads the reply from the terminal, so scripted/piped input could be eaten)
+        if [[ "${DD_TERM_PROBE:-1}" != 0 && -t 0 && -t 1 && "${TERM:-dumb}" != dumb ]]; then
             local _e _r col=""
             printf '\r\xe2\xa3\xbf\e[6n' >/dev/tty          # (not read -p: its prompt goes to stderr)
             IFS='[;' read -rs -d R -t 1 _e _r col </dev/tty 2>/dev/null || true
@@ -1109,9 +1110,11 @@ v_fbmounts() {
     out=$(filebot_mounts) || rc=1
     CFG[FILEBOT_MOUNTS]=$saved
     (( rc == 0 )) || return 1
-    # each container path once; SMB sources look like //server/share[/sub]; no quotes or spaces
+    # each container path once; SMB sources look like //server/share[/sub]; container paths without spaces;
+    # sources may contain spaces ("//nas/My Media") but no quotes or commas
     [[ -z "$(cut -f1 <<<"$out" | sort | uniq -d)" ]] || return 1
-    [[ "$1" != *[\"\'[:space:]]* ]] || return 1
+    [[ "$1" != *[\"\',]* ]] || return 1
+    ! cut -f1 <<<"$out" | grep -q '[[:space:]]' || return 1
     ! grep -P '\tsmb\t' <<<"$out" | cut -f3 | grep -vqE '^//[A-Za-z0-9._-]+/[^/]+(/.*)?$'
 }
 filebot_has_smb() { filebot_mounts 2>/dev/null | cut -f2 | grep -qx smb; }
@@ -1210,8 +1213,8 @@ filebot_refresh_volumes() {
 }
 
 # filebot_smb_check -- before starting: every share reachable and the login accepted (clear errors, no half-start)
-filebot_smb_check() {
-    local cpath kind src vol srv ip t err rc=0
+filebot_smb_check() {   # filebot_smb_check [CONTAINER_PATH] -- all SMB mounts, or just that one
+    local only=${1:-} cpath kind src vol srv ip t err rc=0
     filebot_has_smb || return 0
     if [[ -n "${CFG[FILEBOT_SMB_USER]}" ]] && ! secret_is_set FILEBOT_SMB_PASSWORD; then
         log_error "FileBot: no SMB password stored. Set it: sudo docker-dashboard --set-secret FILEBOT_SMB_PASSWORD"; return 1
@@ -1219,6 +1222,7 @@ filebot_smb_check() {
     command -v mount.cifs >/dev/null 2>&1 || { log_info "Installing cifs-utils (SMB mounts)"; run_logged apt-get install -y cifs-utils || true; }
     while IFS=$'\t' read -r cpath kind src vol; do
         [[ "$kind" == smb ]] || continue
+        [[ -z "$only" || "$only" == "$cpath" ]] || continue
         srv=$(smb_server "$src"); ip=$(resolve_ipv4 "$srv")
         if [[ -z "$ip" ]]; then log_error "FileBot: can't resolve SMB server '$srv' from this host."; rc=1; continue; fi
         if ! timeout 4 bash -c "exec 3<>/dev/tcp/$ip/445" 2>/dev/null; then
@@ -1239,6 +1243,150 @@ filebot_smb_check() {
         rmdir "$t" 2>/dev/null || true
     done < <(filebot_mounts)
     return $rc
+}
+
+# ---- FileBot folders & SMB shares: guided editing of FILEBOT_MOUNTS (Apps -> F, or --filebot-shares) ----------
+fb_mount_name_path() { case "$1" in storage|watch|output|volume1) echo "/$1" ;; *) echo "$1" ;; esac; }
+fb_mount_set() {   # fb_mount_set NAME SOURCE -- add, or replace the entry for the same container path
+    local name=$1 src=$2 e out="" target IFS=';'
+    target=$(fb_mount_name_path "$name")
+    for e in ${CFG[FILEBOT_MOUNTS]:-}; do
+        e=$(trim "$e"); [[ -n "$e" ]] || continue
+        [[ "$(fb_mount_name_path "$(trim "${e%%=*}")")" == "$target" ]] && continue
+        out+="${out:+;}$e"
+    done
+    CFG[FILEBOT_MOUNTS]="${out:+$out;}$name=$src"
+}
+fb_mount_del() {   # fb_mount_del INDEX (1-based)
+    local i=0 e out="" IFS=';'
+    for e in ${CFG[FILEBOT_MOUNTS]:-}; do
+        e=$(trim "$e"); [[ -n "$e" ]] || continue
+        i=$((i + 1)); (( i == $1 )) && continue
+        out+="${out:+;}$e"
+    done
+    CFG[FILEBOT_MOUNTS]=$out
+}
+fb_next_free() {   # first unused of volume1, /volume2, /volume3 ... (volume1 still on the default ./media counts as free)
+    local used n=2; used=$(filebot_mounts 2>/dev/null | cut -f1)
+    grep -qx /volume1 <<<"$used" || { echo volume1; return; }
+    filebot_mounts 2>/dev/null | grep -qx $'/volume1\tbind\t./media\t' && { echo volume1; return; }
+    while grep -qx "/volume$n" <<<"$used"; do n=$((n + 1)); done
+    echo "/volume$n"
+}
+fb_mounts_show() {
+    local i=0 cpath kind src vol
+    printf '\n  %sFileBot folders%s  (inside FileBot -> source)\n' "$B" "$NC"
+    while IFS=$'\t' read -r cpath kind src vol; do
+        [[ -n "$cpath" ]] || continue
+        i=$((i + 1))
+        printf '   %d) %-14s <- %s%s\n' "$i" "$cpath" "$src" "$( [[ "$kind" == smb ]] && echo "   (SMB)" || echo "   (folder on this host)")"
+    done < <(filebot_mounts 2>/dev/null)
+    (( i )) || printf '   none\n'
+    if filebot_has_smb; then
+        printf '   SMB login: %s%s, version %s%s\n' "${CFG[FILEBOT_SMB_USER]:-guest}" \
+            "${CFG[FILEBOT_SMB_DOMAIN]:+ (domain ${CFG[FILEBOT_SMB_DOMAIN]})}" "${CFG[FILEBOT_SMB_VERS]:-auto}" \
+            "$( [[ -n "${CFG[FILEBOT_SMB_USER]}" ]] && { secret_is_set FILEBOT_SMB_PASSWORD && echo ", password stored" || echo ", ${Y}no password stored${NC}"; })"
+    fi
+}
+fb_smb_login() {   # ask for the SMB account (shared by all shares)
+    local pw=""
+    ask_valid FILEBOT_SMB_USER "SMB user (- for guest access)" v_smbuser
+    if [[ -n "${CFG[FILEBOT_SMB_USER]}" ]]; then
+        ask_valid FILEBOT_SMB_DOMAIN "Domain / workgroup (- for none)" v_smbuser
+        load_secrets
+        if ! secret_is_set FILEBOT_SMB_PASSWORD || confirm "Change the stored SMB password?" n; then
+            read -rsp "  SMB password for ${CFG[FILEBOT_SMB_USER]}: " pw || true; echo
+            if [[ -n "$pw" ]]; then SECRETS[FILEBOT_SMB_PASSWORD]=$pw; save_secrets
+            else log_warn "No password entered; set it later: sudo docker-dashboard --set-secret FILEBOT_SMB_PASSWORD"; fi
+        fi
+    fi
+    ask_valid FILEBOT_SMB_VERS "SMB protocol version (3.1.1, 3.0, 2.1; - for automatic)" v_smbvers
+    ask_valid FILEBOT_SMB_OPTS "Extra mount options, comma-separated, e.g. noserverino (- for none)" v_smbopts
+}
+fb_add_smb() {
+    local srv share sub as src ip
+    read -rp "  SMB server (name or IP, e.g. 192.168.0.20 or nas.lan): " srv || return 0
+    srv=$(trim "${srv#//}"); srv=${srv%%/*}
+    valid_ipv4 "$srv" || valid_hostname "$srv" || { log_warn "Not a host name or IP: $srv"; return 0; }
+    ip=$(resolve_ipv4 "$srv")
+    if [[ -z "$ip" ]]; then log_warn "This host can't resolve '$srv' (use its IP, or add it to DNS)."
+    elif timeout 4 bash -c "exec 3<>/dev/tcp/$ip/445" 2>/dev/null; then log_ok "$srv ($ip) answers on SMB port 445"
+    else log_warn "$srv ($ip) does not answer on port 445 (firewall, or SMB off?)."; fi
+    read -rp "  Share name (e.g. media): " share || return 0
+    share=$(trim "$share"); share=${share#/}; share=${share%/}
+    [[ "$share" =~ ^[^/\\,\;\"\']+$ ]] || { log_warn "Invalid share name (no / \\ , ; or quotes)"; return 0; }
+    read -rp "  Sub-folder inside the share (blank for the whole share): " sub || return 0
+    sub=$(trim "$sub"); sub=${sub#/}; sub=${sub%/}
+    [[ -z "$sub" || "$sub" =~ ^[^\\,\;\"\']+$ ]] || { log_warn "Invalid sub-folder (no \\ , ; or quotes)"; return 0; }
+    src="//$srv/$share${sub:+/$sub}"
+    as=$(fb_next_free)
+    log_info "Where FileBot sees it: volume1 is the official images' media folder; or e.g. /volume2, /media/tv."
+    ask as "Mount inside FileBot as" "$as"
+    [[ "$as" == volume1 || "$as" == storage || "$as" == watch || "$as" == output || "$as" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+        || { log_warn "Use volume1, storage, watch, output or an absolute path"; return 0; }
+    local saved=${CFG[FILEBOT_MOUNTS]}
+    fb_mount_set "$as" "$src"
+    v_fbmounts "${CFG[FILEBOT_MOUNTS]}" || { CFG[FILEBOT_MOUNTS]=$saved; log_warn "That share can't be used: $src"; return 0; }
+    log_ok "Added $src -> $(fb_mount_name_path "$as")"
+    if [[ -z "${CFG[FILEBOT_SMB_USER]}" ]]; then
+        log_info "Now the SMB login (one login for all of FileBot's shares; L changes it later):"
+        fb_smb_login
+    fi
+    if confirm "Test-mount it now (read-only)?" y; then
+        filebot_smb_check "$(fb_mount_name_path "$as")" || log_warn "Fix the login (L) or the share, then test again (T)."
+    fi
+}
+fb_add_local() {
+    local path as
+    read -rp "  Folder on this host (absolute path, or ./name inside $(app_dir filebot)): " path || return 0
+    path=$(trim "$path")
+    [[ "$path" == /* || "$path" == ./* ]] || { log_warn "Use /absolute/path or ./name"; return 0; }
+    [[ "$path" == ./* || -d "$path" ]] || log_warn "$path does not exist yet; it is created on apply."
+    as=$(fb_next_free); ask as "Mount inside FileBot as" "$as"
+    local saved=${CFG[FILEBOT_MOUNTS]}
+    fb_mount_set "$as" "$path"
+    v_fbmounts "${CFG[FILEBOT_MOUNTS]}" || { CFG[FILEBOT_MOUNTS]=$saved; log_warn "Not valid: $as=$path"; return 0; }
+    log_ok "Added $path -> $(fb_mount_name_path "$as")"
+}
+filebot_shares_menu() {   # edits CFG[] (the caller saves); returns when done
+    local ch i
+    while :; do
+        fb_mounts_show
+        printf '\n   S) Add an SMB share   H) Add a folder on this host   R) Remove one   L) SMB login\n'
+        printf '   T) Test the SMB shares   E) Edit as text   0) Done\n'
+        read -rp "  Choice: " ch || return 0
+        case "${ch,,}" in
+            s) fb_add_smb ;;
+            h) fb_add_local ;;
+            r) read -rp "  Number: " i || continue
+               [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 )) || { log_warn "No such entry"; continue; }
+               fb_mount_del "$i" ;;
+            l) fb_smb_login ;;
+            t) filebot_has_smb && { filebot_smb_check && log_ok "All SMB shares mount"; } || log_info "No SMB shares yet." ;;
+            e) log_info "NAME=SOURCE;...  NAME: volume1, storage, watch, output or /path; SOURCE: //server/share[/sub], /host/path or ./folder"
+               ask_valid FILEBOT_MOUNTS "Folders" v_fbmounts ;;
+            0|q|"") return 0 ;;
+            *) printf '  %sInvalid choice%s\n' "$R" "$NC" ;;
+        esac
+    done
+}
+filebot_shares_cli() {   # --filebot-shares: the same menu, saved at the end, then optionally applied
+    require_config; is_tty || die "--filebot-shares needs a terminal (or use --filebot-add-share)."
+    load_secrets
+    filebot_shares_menu
+    save_config
+    app_on filebot || { log_warn "FileBot is off: turn it on in Apps (T) to use these folders."; return 0; }
+    confirm "Apply now (restarts FileBot with these folders)?" y && stack_apply
+    return 0
+}
+filebot_add_share_cli() {   # --filebot-add-share 'AS=//server/share[/sub]'
+    require_config
+    local as=${1%%=*} src=${1#*=}
+    [[ "$1" == *=//* ]] || die "Usage: --filebot-add-share 'volume1=//server/share[/sub]'  (login: Apps -> F -> L, or --set-secret FILEBOT_SMB_PASSWORD)"
+    fb_mount_set "$as" "$src"
+    v_fbmounts "${CFG[FILEBOT_MOUNTS]}" || die "Not a valid share: $1"
+    save_config
+    log_ok "FileBot share $src -> $(fb_mount_name_path "$as") saved. Apply to use it (--apply)."
 }
 
 # Docker doesn't retry a container whose volume failed to mount (e.g. the NAS was still booting). The health run
@@ -4468,26 +4616,13 @@ cfg_app() {   # per-app settings
                 || ask_valid FILEBOT_WEB_USER "Web login user" v_user
             ask_valid FILEBOT_UID "Run as user ID (file owner on local folders and SMB mounts)" v_num
             ask_valid FILEBOT_GID "Run as group ID" v_num
-            log_info "Folders: NAME=SOURCE;...  NAME: volume1 (the official images' media folder), storage, watch, output or /a/container/path"
-            log_info "  SOURCE: //server/share[/sub] (SMB), /host/path, or ./folder inside $(app_dir filebot)"
-            log_info "  e.g.  volume1=//192.168.0.20/media   (keep input and output under one share for MOVE/HARDLINK)"
-            ask_valid FILEBOT_MOUNTS "Folders" v_fbmounts
-            if filebot_has_smb; then
-                ask_valid FILEBOT_SMB_USER "SMB user (- for guest access)" v_smbuser
-                if [[ -n "${CFG[FILEBOT_SMB_USER]}" ]]; then
-                    ask_valid FILEBOT_SMB_DOMAIN "SMB domain/workgroup (- for none)" v_smbuser
-                    load_secrets
-                    if ! secret_is_set FILEBOT_SMB_PASSWORD || confirm "Change the stored SMB password?" n; then
-                        local pw=""
-                        if is_tty && (( ! ASSUME_YES )); then read -rsp "  SMB password for ${CFG[FILEBOT_SMB_USER]}: " pw || true; echo; fi
-                        if [[ -n "$pw" ]]; then SECRETS[FILEBOT_SMB_PASSWORD]=$pw; save_secrets
-                        else log_warn "No SMB password stored yet: sudo docker-dashboard --set-secret FILEBOT_SMB_PASSWORD"; fi
-                    fi
-                fi
-                ask_valid FILEBOT_SMB_VERS "SMB protocol version (3.1.1, 3.0, 2.1; - for automatic)" v_smbvers
-                ask_valid FILEBOT_SMB_OPTS "Extra mount options, comma-separated (- for none)" v_smbopts
-            fi
-            ask_valid FILEBOT_EXTRA_ENV "Extra settings, K=V;K=V (- to clear)" v_kv ;;
+            ask_valid FILEBOT_EXTRA_ENV "Extra settings, K=V;K=V (- to clear)" v_kv
+            if is_tty && (( ! ASSUME_YES )); then
+                load_secrets
+                log_info "Media folders: SMB shares (e.g. on your NAS) or folders on this host. Keep input and output under one"
+                log_info "mount: FileBot can only MOVE/HARDLINK within it."
+                filebot_shares_menu
+            fi ;;
         gvm)
             log_info "Greenbone needs ~8 GB RAM and a long first feed sync. It uses Greenbone's own compose file."
             ask_valid GVM_SUBDOMAIN "Name (-> $(fqdn "${CFG[GVM_SUBDOMAIN]}"))" v_sub
@@ -4528,6 +4663,8 @@ config_wizard() {
     cfg_page; cfg_apps_toggle
     if is_tty && (( ! ASSUME_YES )) && confirm "Review per-app settings (images, names, ports)?" n; then
         local a; for a in $(enabled_apps); do cfg_app "$a"; done
+    elif app_on filebot && is_tty && (( ! ASSUME_YES )); then
+        cfg_app filebot   # its media folders / SMB shares need answers either way
     fi
     cfg_ports; cfg_cert; cfg_files; cfg_health; cfg_updates; cfg_paths
     config_summary
@@ -4565,16 +4702,20 @@ menu_apps() {
             printf '   %d) %-44s %b\n' "$((i + 1))" "${APP_TITLE[$a]}" "$(app_on "$a" && echo "${G}on${NC}" || echo "${D}off${NC}")"
         done
         printf '   C) Custom apps (%s)\n' "$(custom_names | wc -l)"
+        app_on filebot && printf '   F) FileBot folders and SMB shares (%s)\n' "$(filebot_mounts 2>/dev/null | wc -l)"
         printf '\n   T) Toggle on/off   E) Edit settings   S) Save   A) Save + apply   0) Back (unsaved changes are discarded)\n'
         read -rp "  Choice: " ch || return 0
         case "${ch,,}" in
             c) menu_custom ;;
+            f) app_on filebot || { log_warn "Turn FileBot on first (T)."; continue; }
+               load_secrets; filebot_shares_menu; log_info "Save (S) or Save + apply (A) to use them." ;;
             t|e) read -rp "  App number: " i || continue
                  [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#APPS[@]} )) || { log_warn "No such app"; continue; }
                  a=${APPS[$((i - 1))]}
                  if [[ "${ch,,}" == t ]]; then
                      if app_on "$a"; then CFG[APP_${a^^}]=no; log_info "${APP_TITLE[$a]}: off (containers stop on apply; data is kept)"
-                     else CFG[APP_${a^^}]=yes; log_info "${APP_TITLE[$a]}: on"; fi
+                     else CFG[APP_${a^^}]=yes; log_info "${APP_TITLE[$a]}: on"
+                          [[ "$a" == filebot ]] && confirm "Set up FileBot now (variant, login, SMB shares)?" y && cfg_app filebot; fi
                  else cfg_app "$a"; fi ;;
             s) save_config ;;
             a) save_config; menu_action stack_apply ;;
@@ -4826,6 +4967,10 @@ self_test() {
     st "filebot: node variant"              '( allcfg; CFG[APP_FILEBOT]=yes; CFG[FILEBOT_VARIANT]=node; CFG[FILEBOT_WEB_PORT]=5452; c=$(render_app_filebot); [[ "$c" == *"rednoah/filebot:node"* && "$c" == *"FILEBOT_NODE_AUTH_PASS: \"\${FILEBOT_WEB_PASSWORD:?err}\""* && "$c" == *"\"5452:5452\""* ]] && n=$(render_nginx | sed -n "/server_name filebot.example.net/,/^}/p") && [[ "$n" == *"return 302 /filebot/"* ]] )'
     st "filebot: image follows variant"     '( set_default_config; [[ $(filebot_image) == rednoah/filebot:xpra ]] && CFG[FILEBOT_IMAGE]=jlesage/filebot:latest && [[ $(filebot_image) == rednoah/filebot:xpra ]] && CFG[FILEBOT_IMAGE]=rednoah/filebot:5.1 && [[ $(filebot_image) == rednoah/filebot:5.1 ]] )'
     st "filebot: v2.10 defaults migrate"    '( d=$(mktemp -d); CONF_FILE="$d/c"; printf "%s\n" "FILEBOT_MOUNTS='"'"'storage=./storage'"'"'" "FILEBOT_EXTRA_ENV='"'"'KEEP_APP_RUNNING=1;AMC_ENABLED=0'"'"'" >"$CONF_FILE"; load_config; [[ "${CFG[FILEBOT_MOUNTS]}" == volume1=./media && -z "${CFG[FILEBOT_EXTRA_ENV]}" ]] )'
+    st "filebot: share names with spaces"   '( set_default_config; v_fbmounts "volume1=//nas/My Media/TV Shows" && CFG[FILEBOT_MOUNTS]="volume1=//nas/My Media" && [[ "$(filebot_mounts | cut -f3)" == "//nas/My Media" ]] && ! v_fbmounts "/my dir=//nas/m" && ! v_fbmounts "volume1=//nas/a,b" )'
+    st "filebot: default ./media gives way" '( set_default_config; [[ $(fb_next_free) == volume1 ]] && fb_mount_set volume1 //nas/m && [[ "${CFG[FILEBOT_MOUNTS]}" == "volume1=//nas/m" && $(fb_next_free) == /volume2 ]] )'
+    st "filebot: share list editing"        '( set_default_config; fb_mount_set volume1 //nas/media; [[ "${CFG[FILEBOT_MOUNTS]}" == "volume1=//nas/media" ]] && [[ $(fb_next_free) == /volume2 ]] && fb_mount_set /volume2 /srv/x && fb_mount_set volume1 //nas/tv && [[ "${CFG[FILEBOT_MOUNTS]}" == "/volume2=/srv/x;volume1=//nas/tv" ]] && fb_mount_del 1 && [[ "${CFG[FILEBOT_MOUNTS]}" == "volume1=//nas/tv" ]] )'
+    st "filebot: add-share CLI"             '( set_default_config; CONF_FILE="$t/fbconf"; DRY_RUN=0; save_config() { :; }; require_config() { :; }; filebot_add_share_cli "volume1=//10.0.0.5/media/tv" >/dev/null && [[ "${CFG[FILEBOT_MOUNTS]}" == "volume1=//10.0.0.5/media/tv" ]] && ! ( filebot_add_share_cli "volume1=nas/x" ) 2>/dev/null )'
     st "filebot: smb comma escaping"        '( SECRETS=([FILEBOT_SMB_PASSWORD]="a,b,,c"); app_dir() { echo "$t"; }; docker() { printf "%s" "$FILEBOT_SMB_PASSWORD"; }; [[ "$(compose_app filebot x)" == "a,,b,,,,c" ]] )'
     st "filebot: smb validators"            'v_smbvers 3.1.1 && v_smbvers "" && ! v_smbvers 4 && v_smbopts "noserverino,cache=none" && ! v_smbopts "password=x" && ! v_smbopts "a b" && v_smbuser "DOMAIN user" && ! v_smbuser "a,b"'
     st "compose progress flag"              '( docker() { printf "%s " "$@"; }; DC_PROGRESS=""; [[ "$(dcompose pull)" == "compose pull " ]] && DC_PROGRESS=plain && [[ "$(dcompose pull)" == "compose --progress plain pull " ]] )'
@@ -5039,6 +5184,8 @@ Actions (default: interactive menu)
   --custom-apps              Custom apps menu (your own compose apps behind the proxy)
   --cert-refresh             Fetch / re-read the certificate and reload nginx if it changed
   --cert-fetch-key           Create (or show) the SSH key used by certificate fetch mode
+  --filebot-shares           FileBot: add/remove SMB shares and host folders, set the SMB login, test-mount
+  --filebot-add-share 'AS=//server/share[/sub]'   Add one SMB share without the menu (AS: volume1, /volume2, ...)
   --add-site 'N|URL|T|D'     Put a web UI on another machine behind the proxy: name | https://host[:port]/ | title | description
   --change-ip NEW_IP         Point every name, link and Pi-hole record at a new host address, then apply
   --show-secret NAME         Print one stored password (e.g. PIHOLE_PASSWORD)
@@ -5105,6 +5252,8 @@ main() {
             --cert-receive)    action=certreceive ;;
             --change-ip)       action=changeip; arg=${2:-}; shift ;;
             --add-site)        action=addsite; arg=${2:-}; shift ;;
+            --filebot-shares)  action=fbshares ;;
+            --filebot-add-share) action=fbaddshare; arg=${2:-}; shift ;;
             --show-secret)     action=showsecret; arg=${2:-}; shift ;;
             --set-secret)      action=setsecret; arg=${2:-}; shift ;;
             --cert-push-setup) action=certpush; [[ -n "${2:-}" && "${2:-}" != --* ]] && { arg=$2; shift; } ;;
@@ -5174,6 +5323,8 @@ main() {
         certreceive) cert_receive ;;
         changeip)    change_host_ip "$arg" ;;
         addsite)     site_add_cli "$arg" ;;
+        fbshares)    filebot_shares_cli ;;
+        fbaddshare)  filebot_add_share_cli "$arg" ;;
         showsecret)  ensure_config; show_secret "$arg" ;;
         setsecret)
             ensure_config
