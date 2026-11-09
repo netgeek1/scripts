@@ -3,6 +3,30 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.10.0 — 2026-11-08 — FileBot with SMB shares; one app can't block the rest
+
+### Added
+- **FileBot** (`jlesage/filebot`, optional, off by default) at `https://filebot.<domain>`.
+  - **Login:** a web login with a vault-generated password. HTTPS inside the container, so the login works without
+    "allow insecure"; the proxy talks TLS to it, and VNC is off.
+  - **Folders** (`FILEBOT_MOUNTS`): SMB shares (`//server/share[/sub]`), host folders, or folders in the app's
+    directory.
+  - **SMB shares** are Docker `cifs` volumes. The password comes from the vault, with commas escaped. The server
+    name is resolved to an address for the kernel client. Version and extra options are settings.
+  - **Before starting**, apply checks each share: the name resolves, port 445 answers, and a read-only test mount
+    with the same options works. Failures name the share and the reason.
+  - **Changed SMB settings or password** stop FileBot and recreate only its share mounts. Docker keeps a volume's
+    options from when it was created.
+  - **Boot recovery:** when the NAS wasn't up at boot (Docker doesn't retry a failed mount), the health run starts
+    FileBot again. It doesn't when FileBot was stopped on purpose.
+  - The FileBot license (`.psm`) goes in `/opt/stacks/filebot/config/`.
+
+### Changed
+- **One app failing no longer stops apply.** Each built-in app now starts on its own, like custom apps already
+  did. A failure is reported and the remaining apps, custom apps and the proxy still start. Apply ends with a list
+  of what didn't start and exits non-zero. `--change-ip` and the install summary still run.
+- Self-test: 109 checks.
+
 ## v2.9.0 — 2026-11-07 — Status dots look names up in Pi-hole
 
 ### Changed
