@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.1.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -978,8 +978,31 @@ page_on()   { [[ "$(dash_mode)" == full ]]; }
 
 # ---- Pi-hole direct HTTPS: Pi-hole's own web server on 443 inside, with this host's certificate ----------------
 PIHOLE_TLS_FILE="dd-tls.pem"   # in etc-pihole: key + full chain in one PEM, as FTL wants it
-pihole_tls_owner() {   # whoever owns pihole.toml (FTL's user inside the container); root until it has run
-    stat -c '%u:%g' "$(app_dir pihole)/etc-pihole/pihole.toml" 2>/dev/null || echo 0:0
+pihole_tls_owner() {   # FTL's user inside the container (it must read the key); asked from the container if it runs
+    local o
+    o=$(docker exec pihole sh -c 'printf "%s:%s" "$(id -u pihole)" "$(id -g pihole)"' 2>/dev/null || true)
+    [[ "$o" =~ ^[0-9]+:[0-9]+$ ]] && { printf '%s' "$o"; return 0; }
+    o=$(stat -c '%u:%g' "$(app_dir pihole)/etc-pihole/pihole.toml" 2>/dev/null || true)
+    [[ "$o" =~ ^[0-9]+:[0-9]+$ && "$o" != 0:0 ]] && { printf '%s' "$o"; return 0; }
+    printf '1000:1000'   # the Pi-hole image's default PIHOLE_UID/PIHOLE_GID
+}
+# pihole_https_verify -- after a start: does Pi-hole serve OUR certificate on its HTTPS port?
+pihole_https_verify() {
+    app_on pihole && [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]] && (( ! DRY_RUN )) || return 0
+    local want got i port=${CFG[PIHOLE_HTTPS_PORT]}
+    want=$(cert_fp "$DEPLOY_DIR/certs/dashboard.crt")
+    for (( i = 0; i < 20; i++ )); do
+        got=$(echo | timeout 5 openssl s_client -connect "127.0.0.1:$port" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')
+        [[ -n "$got" && "$got" == "$want" ]] && { log_ok "Pi-hole HTTPS: https://$(eff_host):$port/admin/ serves this host's certificate"; return 0; }
+        sleep 2
+    done
+    if [[ -z "$got" ]]; then
+        log_warn "Pi-hole HTTPS: nothing answers TLS on port $port. See: docker logs pihole 2>&1 | grep -iE 'tls|cert|webserver|443'"
+    else
+        log_warn "Pi-hole HTTPS: port $port serves a different certificate (Pi-hole's own?), not this host's."
+        log_warn "  Check: docker exec pihole ls -ln /etc/pihole/$PIHOLE_TLS_FILE ; docker logs pihole 2>&1 | grep -iE 'tls|cert'"
+    fi
+    return 0
 }
 # pihole_cert_sync -- write the PEM when HTTPS is on; returns 0 and sets WROTE=1 when the file changed
 pihole_cert_sync() {
@@ -2125,6 +2148,63 @@ custom_host_ports() {   # only apps this script starts; an external app's ports 
         custom_load "$n"
         custom_compose "$n" config --format json 2>/dev/null | tr -d '\n ' | compose_json_ports "${CA[TITLE]} (custom)"
     done
+    return 0
+}
+
+# ---- --urls: every address and port, proxied and direct ---------------------------------------------------
+port_listening() {   # port_listening PORT PROTO -> true when something listens on this host
+    local p=$1 proto=${2:-tcp} out
+    if [[ "$proto" == udp ]]; then out=$(ss -Hlun "sport = :$p" 2>/dev/null || true)
+    else out=$(ss -Hltn "sport = :$p" 2>/dev/null || true); fi
+    [[ -n "$out" ]]
+}
+urls_port_line() {   # urls_port_line "port/proto" LABEL
+    local pp=$1 label=$2 st
+    if port_listening "${pp%/*}" "${pp#*/}"; then st="${G}listening${NC}"; else st="${Y}not listening${NC}"; fi
+    printf '      %-12s %-30s %b\n' "$pp" "$label" "$st"
+}
+show_urls() {
+    ensure_config; detect_network; load_services
+    local a key title sub up flags fb desc h pp label shown
+    log_step "URLs and ports (mode ${CFG[DASH_MODE]:-full}, host $(eff_host))"
+    if proxy_on; then
+        printf '  %sProxy%s (nginx, %s)\n' "$B" "$NC" "$CONTAINER_NAME"
+        page_on && printf '      %-8s %s\n' page "$(dashboard_url)"
+        urls_port_line "${CFG[HTTP_PORT]}/tcp" "HTTP (redirects to HTTPS)"
+        urls_port_line "${CFG[HTTPS_PORT]}/tcp" "HTTPS (all app names)"
+        if app_on guacamole && [[ -n "${CFG[GUACAMOLE_TLS_PORT]}" ]]; then urls_port_line "${CFG[GUACAMOLE_TLS_PORT]}/tcp" "Guacamole legacy HTTPS"; fi
+    else
+        printf '  %sProxy%s: off (DASH_MODE=none)\n' "$B" "$NC"
+    fi
+    for a in $(enabled_apps); do
+        printf '\n  %s%s%s\n' "$B" "${APP_TITLE[$a]}" "$NC"
+        while IFS='|' read -r key title sub up flags fb desc; do
+            h=$(fqdn "$sub")
+            if proxy_on && [[ -n "$h" ]]; then
+                printf '      %-8s %s%s\n' proxy "$(endpoint_url "$sub" "")" "$( [[ "$flags" == *auth* ]] && echo "   (login)")"
+            fi
+            [[ -n "$fb" ]] && printf '      %-8s %s\n' direct "$fb"
+            if [[ -z "$fb" ]] && { [[ -z "$h" ]] || ! proxy_on; }; then
+                printf '      %-8s %b\n' "" "${Y}not reachable: no direct port and no proxy name${NC}"
+            fi
+        done < <(app_endpoints "$a")
+        while IFS=$'\t' read -r pp label; do
+            [[ -n "$pp" ]] && urls_port_line "$pp" "$label"
+        done < <(app_host_ports "$a")
+    done
+    shown=0
+    for a in $(enabled_customs); do
+        (( shown )) || printf '\n  %sCustom apps and sites%s\n' "$B" "$NC"
+        shown=1
+        while IFS='|' read -r key title sub up flags fb desc; do
+            printf '      %-22s %s%s\n' "$title" "$(proxy_on && [[ -n "$(fqdn "$sub")" ]] && endpoint_url "$sub" "")" "${fb:+   direct: $fb}"
+        done < <(custom_endpoint "$a")
+    done
+    while IFS=$'\t' read -r pp label; do [[ -n "$pp" ]] && urls_port_line "$pp" "$label"; done < <(custom_host_ports)
+    if (( ${#SVC_NAME[@]} )); then
+        printf '\n  %sLinks%s (custom, on the page)\n' "$B" "$NC"
+        local i; for i in "${!SVC_NAME[@]}"; do printf '      %-22s %s\n' "${SVC_NAME[$i]}" "${SVC_URL[$i]}"; done
+    fi
     return 0
 }
 
@@ -3531,8 +3611,9 @@ app_up() {   # app_up APP [pull] -- runs as "( app_up ) || ..." (errexit is off 
     [[ "$app" == filebot || "$app" == netboot ]] && share_refresh_volumes "$app"
     run_logged compose_app "$app" up -d --remove-orphans || { log_error "${APP_TITLE[$app]} did not start (see above)."; return 1; }
     if [[ "$app" == pihole && -n "${CFG[PIHOLE_HTTPS_PORT]}" ]]; then
-        local i; for i in 1 2 3 4 5 6 7 8 9 10; do [[ -f "$(app_dir pihole)/etc-pihole/pihole.toml" ]] && break; sleep 1; done
+        local i; for i in $(seq 1 60); do [[ -f "$(app_dir pihole)/etc-pihole/pihole.toml" ]] && break; sleep 1; done
         pihole_cert_reload    # first start: the PEM gets FTL's owner now, and Pi-hole restarts once to read it
+        pihole_https_verify
     fi
     log_ok "${APP_TITLE[$app]} is up"
 }
@@ -5257,6 +5338,7 @@ self_test() {
     st "netboot: direct port avoids MeshCentral" '( allcfg; CFG[APP_NETBOOT]=yes; CFG[NETBOOT_ACCESS]=direct; [[ $(netboot_web_port) == 3001 ]] && CFG[APP_MESHCENTRAL]=no && [[ $(netboot_web_port) == 3000 ]] )'
     st "netboot: htpasswd line"             '( allcfg; SECRETS[NETBOOT_WEB_PASSWORD]=s3cret; l=$(netboot_htpasswd_line); [[ "$l" == "admin:\$apr1\$"* ]] )'
     st "netboot: shares like FileBot"       '( set_default_config; [[ $(share_next_free netboot) == assets ]] && share_mount_set netboot assets "//nas/ISO Store" && [[ "${CFG[NETBOOT_MOUNTS]}" == "assets=//nas/ISO Store" && $(share_next_free netboot) == /assets/share2 ]] && v_nbmounts "assets=//nas/isos;/assets/win=//nas2/w" && ! v_nbmounts "volume1=//nas/x" )'
+    st "urls: every app, proxy + direct"   '( allcfg; CONFIG_LOADED=1; detect_network() { :; }; load_services() { :; }; CFG[APP_NETBOOT]=yes; STACKS_DIR="$t/u"; ss() { :; }; o=$(show_urls 2>&1); [[ "$o" == *"https://netboot.example.net/   (login)"* && "$o" == *"69/udp"*"netboot.xyz TFTP"* && "$o" == *"8080/tcp"*"netboot.xyz assets"* && "$o" == *"direct   https://192.168.0.190:8444/admin/"* && "$o" == *"8444/tcp"* ]] )'
     st "nginx: pihole card clicks pass"     '( allcfg; c=$(render_nginx); p=$(sed -n "/server_name pihole/,/^}/p" <<<"$c"); g=$(sed -n "/server_name grafana/,/^}/p" <<<"$c"); [[ "$c" == *"map \"\$request_method:\$http_sec_fetch_site\" \$dd_fetch_site"* && "$p" == *"Sec-Fetch-Site \$dd_fetch_site"* && "$g" != *Sec-Fetch-Site* ]] )'
     st "nginx: pihole / -> /admin/"         '( allcfg; c=$(render_nginx | sed -n "/server_name pihole/,/^}/p"); [[ "$c" == *"location = / { return 302 /admin/; }"* ]] )'
     st "nginx: tls upstream + websockets"   '( allcfg; c=$(render_nginx | sed -n "/server_name portainer/,/^}/p"); [[ "$c" == *"proxy_ssl_verify off"* && "$c" == *"Connection \$connection_upgrade"* && "$c" == *"client_max_body_size 0"* ]] )'
@@ -5404,6 +5486,7 @@ main_menu() {
         printf '   6) Update ALL containers        (apps, compose projects, docker-run containers)\n'
         printf '   7) Check for updates            (pull images, report, change nothing)\n'
         printf '   8) Status   9) Health check (links + host)   H) Host health   D) DNS records   L) Logs\n'
+        printf '   R) URLs and ports            (proxied and direct, with what is listening)\n'
         printf '  %sMigrate%s\n' "$B" "$NC"
         printf '   E) Export this host to a bundle   I) Import a bundle\n'
         printf '  %sMaintenance%s\n' "$B" "$NC"
@@ -5429,6 +5512,7 @@ main_menu() {
             9) menu_action health_check ;;
             h) menu_action host_now ;;
             d) menu_action dns_records ;;
+            r) menu_action show_urls ;;
             l) menu_logs ;;
             e) menu_action export_bundle ;;
             i) local f; read -rp "  Bundle file: " f || continue
@@ -5473,6 +5557,7 @@ Actions (default: interactive menu)
   --netboot-shares           netboot.xyz: assets folders and SMB shares, SMB login, test-mount
   --netboot-add-share 'assets=//server/share[/sub]'   Add one netboot.xyz SMB share without the menu
   --add-site 'N|URL|T|D'     Put a web UI on another machine behind the proxy: name | https://host[:port]/ | title | description
+  --urls (or --ports)        Every address (proxy name and direct link) and every published port, with what is listening
   --change-ip NEW_IP         Point every name, link and Pi-hole record at a new host address, then apply
   --show-secret NAME         Print one stored password (e.g. PIHOLE_PASSWORD)
   --set-secret NAME          Change one (prompted, or first line of stdin; empty = generate; - = no Pi-hole password)
@@ -5537,6 +5622,7 @@ main() {
             --cert-fetch-key)  action=certkey ;;
             --cert-receive)    action=certreceive ;;
             --change-ip)       action=changeip; arg=${2:-}; shift ;;
+            --urls|--ports)    action=urls ;;
             --add-site)        action=addsite; arg=${2:-}; shift ;;
             --filebot-shares)  action=fbshares ;;
             --filebot-add-share) action=fbaddshare; arg=${2:-}; shift ;;
@@ -5610,6 +5696,7 @@ main() {
         certkey)     ensure_config; cert_fetch_key ;;
         certreceive) cert_receive ;;
         changeip)    change_host_ip "$arg" ;;
+        urls)        show_urls ;;
         addsite)     site_add_cli "$arg" ;;
         fbshares)    shares_cli filebot ;;
         fbaddshare)  filebot_add_share_cli "$arg" ;;
