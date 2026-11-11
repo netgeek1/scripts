@@ -167,7 +167,7 @@ API_KEY_TRUENAS=""
 # LOGGING / DEBUG / CLI
 ###############################################################################
 
-SCRIPT_VERSION="3.2.0"          # bump on every change
+SCRIPT_VERSION="3.2.1"          # bump on every change
 VERBOSITY=1                     # 0=quiet(warn/error)  1=info(default)  2=debug
 DRY_RUN=0                       # 1 = report intended actions, change nothing
 MODE="deploy"                   # "deploy" (default) or "digest" (--digest)
@@ -1630,8 +1630,8 @@ main() {
     run_device "$DEPLOY_FGT"     "FortiGate"     install_fgt_cert
     run_device "$DEPLOY_UCG"     "UCG"           install_ucg_cert
     run_device "$DEPLOY_RM1"     "RM1"           install_rm1_cert
-    run_device "$DEPLOY_DOCKER"  "Docker-190"    install_docker_cert "$DOCKER_IP"  "$DOCKER_HTTPS_PORT"  "$DOCKER_SSH_USER"  "$DOCKER_SSH_PORT"  "$DOCKER_SSH_KEY"
-    run_device "$DEPLOY_DOCKER2" "docker-05"     install_docker_cert "$DOCKER2_IP" "$DOCKER2_HTTPS_PORT" "$DOCKER2_SSH_USER" "$DOCKER2_SSH_PORT" "$DOCKER2_SSH_KEY"
+    run_device "$DEPLOY_DOCKER"  "Docker-190"    install_docker_cert "Docker-190" "$DOCKER_IP"  "$DOCKER_HTTPS_PORT"  "$DOCKER_SSH_USER"  "$DOCKER_SSH_PORT"  "$DOCKER_SSH_KEY"
+    run_device "$DEPLOY_DOCKER2" "docker-05"     install_docker_cert "docker-05"  "$DOCKER2_IP" "$DOCKER2_HTTPS_PORT" "$DOCKER2_SSH_USER" "$DOCKER2_SSH_PORT" "$DOCKER2_SSH_KEY"
     run_device "$DEPLOY_TRUENAS" "TrueNAS"       install_truenas_cert
     run_device "$DEPLOY_FMG"     "FortiManager"  install_fortinet_cert "FortiManager"  "$FMG_IP" "$API_KEY_FMG"
     run_device "$DEPLOY_FAZ"     "FortiAnalyzer" install_fortinet_cert "FortiAnalyzer" "$FAZ_IP" "$API_KEY_FAZ"
