@@ -12,12 +12,27 @@ with a landing page, keeps them updated, and moves them from an old host to a ne
 | **MeshCentral** | Remote device management |
 | **Greenbone / OpenVAS** *(optional, off)* | Vulnerability scanning, using Greenbone's own compose file |
 | **FileBot** *(optional, off)* | Media renamer, using the official [rednoah/filebot](https://github.com/filebot/filebot-docker) image: the FileBot desktop in your browser, behind a login. Media can be on SMB shares |
+| **netboot.xyz** *(optional, off)* | PXE network boot menus, using the official `ghcr.io/netbootxyz/netbootxyz` image, with a web UI (optionally behind a login). Its ISOs and assets can be on SMB shares |
 
 Every app gets its own name, such as `https://grafana.example.net`, with one certificate (a wildcard or
 self-signed). Its original port can stay published as a fallback.
 
 The landing page shows a live up/down dot for each app, your own extra links, and an optional `/files/` share for
 scripts you `curl` onto other machines.
+
+**Dashboard mode** (`DASH_MODE`; the install asks, or use Settings → Page):
+
+| Mode | nginx on 80/443 | App names (`https://grafana.<domain>`) | Landing page |
+|---|---|---|---|
+| `full` *(default)* | yes | yes | yes |
+| `proxy` | yes | yes | no; unknown names and the bare IP get a 404 |
+| `none` | no | no | no; apps only on their direct ports |
+
+With `none`:
+- Pi-hole's records for the app names are removed.
+- The status checks use the direct links.
+- External sites are skipped.
+- Apply warns about any app that has no direct port. Guacamole has `GUACAMOLE_HTTP_PORT` for this.
 
 > Version: see `SCRIPT_VERSION` in the script. History: [CHANGELOG.md](CHANGELOG.md).
 
@@ -249,6 +264,7 @@ Wildcard certificates (`custom`, `fetch`, `push`) don't contain the IP, so they 
 | 2 / 3 | `--settings` / `--apps` | Settings menu / turn apps on or off and edit their images, names and ports |
 | 4 | `--services`, `--add-service`, `--remove-service`, `--detect` | Custom links on the page |
 | K | `--secrets`, `--show-secret NAME`, `--set-secret NAME` | View or change stored passwords (see **Secrets**) |
+| Apps → N | `--netboot-shares`, `--netboot-add-share 'assets=//server/share'` | netboot.xyz assets folders and SMB shares |
 | Apps → F | `--filebot-shares`, `--filebot-add-share 'AS=//server/share'` | FileBot's SMB shares and folders, SMB login, test mount |
 | Apps → C → W | `--add-site 'N\|URL\|T\|D'` | Put a web UI on another machine behind the proxy (see **Sites on other machines**) |
 | P | `--change-ip NEW_IP` | Point names, links and Pi-hole records at a new host address, then apply |
@@ -280,6 +296,11 @@ plain folders, so one copy of `/opt/stacks` backs up everything.
 - **Ports:** every app's direct port is a setting. Blank means proxy only.
 
 **Pi-hole specifics** (each one can be overridden by setting the same `FTLCONF_*` key in `PIHOLE_EXTRA_ENV`):
+
+- **Direct HTTPS:** `https://<host>:8444/admin/` (`PIHOLE_HTTPS_PORT`; `-` turns it off). Pi-hole's own web server
+  serves it with this host's certificate. The script writes the key and chain to `etc-pihole/dd-tls.pem` and sets
+  `FTLCONF_webserver_tls_cert`. When the certificate is renewed (refresh or push), Pi-hole is restarted to load it,
+  which interrupts DNS for a few seconds. The plain-HTTP port (`PIHOLE_WEB_PORT`, 8081) can be turned off with `-`.
 
 - **Hostname:** the container's hostname is its proxy name, e.g. `pihole.certifiedgeeks.net` (or `pihole` without a
   domain), instead of a container ID.
@@ -368,6 +389,30 @@ Without the menu: `sudo docker-dashboard --filebot-add-share 'volume1=//192.168.
 - **NAS not up yet at boot:** Docker doesn't retry a container whose share failed to mount. The health run
   (every 2 minutes) starts FileBot again in exactly that case. A FileBot you stopped yourself stays stopped.
 - `cifs-utils` is installed the first time a share is used.
+
+### netboot.xyz
+
+Turn it on in **Apps → T**. It then asks for the settings below and for its assets.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `NETBOOT_ACCESS` | `proxy-auth` | Web UI: `proxy-auth` = `https://netboot.<domain>` behind a login (user `NETBOOT_WEB_USER`, password in the vault as `NETBOOT_WEB_PASSWORD`); `proxy` = the same without a login; `direct` = `http://<host>:3000` only (3001 when MeshCentral already uses 3000). Without the proxy (`DASH_MODE=none`) it is always `direct` |
+| `NETBOOT_WEB_PORT` | empty | Extra direct web UI port. It has no login of its own |
+| `NETBOOT_TFTP_PORT` | `69` | TFTP for PXE clients, which only ever ask port 69. Runs with `--tftp-single-port`, so nothing else needs publishing |
+| `NETBOOT_ASSETS_PORT` | `8080` | The HTTP server for local assets (ISOs, kernels) |
+| `NETBOOT_MENU_VERSION` | empty | Pin a menu version; empty = latest |
+
+**Assets on SMB:** **Apps → N** (or `--netboot-shares`; `--netboot-add-share 'assets=//server/share'` without the
+menu) works exactly like FileBot's shares, with its own SMB login (`NETBOOT_SMB_*`, password `NETBOOT_SMB_PASSWORD`).
+The first share becomes `/assets`. Further shares mount under it, e.g. `/assets/share2`. Menus and settings stay
+local in `/opt/stacks/netboot/config`.
+
+**Point DHCP at it.** The summary prints these too:
+- next-server / TFTP server: this host
+- boot file: `netboot.xyz.kpxe` (BIOS) or `netboot.xyz.efi` (UEFI)
+
+In OPNsense that's **Services → ISC DHCPv4 → [LAN] → Network booting**. To serve local ISOs, set `live_endpoint` to
+`http://<host>:8080` in the web UI.
 
 **One app can't hold up the rest.** Each app is started on its own. If one fails, such as FileBot with its NAS
 down, apply reports it and carries on with the other apps, custom apps and the proxy. It ends with a list of what
@@ -541,6 +586,8 @@ present) or with openssl and a root-only key file. This is the same scheme as `m
 | `GUAC_DB_PASSWORD` | Guacamole's PostgreSQL user | The Secrets menu changes it in PostgreSQL too |
 | `GVM_ADMIN_PASSWORD` | Greenbone admin, via `--gvm-password` | Run `--gvm-password` again |
 | `FILEBOT_WEB_PASSWORD` | FileBot web login | Applies on the next apply |
+| `NETBOOT_WEB_PASSWORD` | netboot.xyz web login at the proxy (`proxy-auth`) | Applies on the next apply |
+| `NETBOOT_SMB_PASSWORD` | netboot.xyz's SMB shares (entered, never generated) | Applies on the next apply; the share mounts are recreated |
 | `FILEBOT_SMB_PASSWORD` | FileBot's SMB shares (entered, never generated) | Applies on the next apply; the share mounts are recreated |
 
 **Viewing a password:**
@@ -631,6 +678,10 @@ All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menu
 | `PIHOLE_EXTRA_ENV`, `GRAFANA_EXTRA_ENV` | Extra settings as `K=V;K=V` |
 | `PIHOLE_NO_PASSWORD` | `yes` = Pi-hole web login without a password. Default `no` |
 | `FILEBOT_VARIANT`, `FILEBOT_IMAGE` | `xpra`, empty. Variant `xpra`/`node`/`jlesage`; the image only to pin a tag |
+| `DASH_MODE` | `full`. `full`, `proxy` (no landing page) or `none` (no nginx) |
+| `PIHOLE_HTTPS_PORT` | `8444`. Pi-hole's direct HTTPS port, with this host's certificate |
+| `GUACAMOLE_HTTP_PORT` | empty. Direct HTTP port for Guacamole, e.g. without the proxy |
+| `APP_NETBOOT`, `NETBOOT_*` | See **netboot.xyz** |
 | `FILEBOT_MOUNTS` | `volume1=./media`. FileBot folders: `NAME=SOURCE;...` (see **FileBot**) |
 | `FILEBOT_SMB_USER`, `FILEBOT_SMB_DOMAIN`, `FILEBOT_SMB_VERS`, `FILEBOT_SMB_OPTS` | SMB login and mount options (password: vault `FILEBOT_SMB_PASSWORD`) |
 | `FILEBOT_WEB_USER`, `FILEBOT_UID`, `FILEBOT_GID`, `FILEBOT_EXTRA_ENV` | `admin`, `1000`, `1000`, empty. The web user isn't used by `xpra` |
@@ -671,7 +722,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 118 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 128 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
