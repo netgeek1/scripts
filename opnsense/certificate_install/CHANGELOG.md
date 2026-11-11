@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [3.2.1] - 2026-11-10
+
+### Fixed
+- Docker hosts failed with `parameter not set` (both reported FAILED). The
+  `main()` calls did not pass the device label as `install_docker_cert`'s first
+  argument, so the function received only five of its six parameters and tripped
+  `set -u`. Both calls now pass the label explicitly, matching how
+  `install_fortinet_cert` is invoked.
+
 ## [3.2.0] - 2026-11-10
 
 ### Added
