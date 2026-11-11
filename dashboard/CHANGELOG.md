@@ -3,6 +3,37 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.0.0 — 2026-11-10 — Dashboard modes, Pi-hole direct HTTPS, netboot.xyz
+
+### Added
+- **`DASH_MODE`**, asked at install (Settings → Page):
+  - `full`: proxy and landing page, as before.
+  - `proxy`: app names behind nginx, no landing page; unknown names and the bare IP get a 404.
+  - `none`: no nginx at all. The proxy container is removed and 80/443 are free. Apps are on their direct ports,
+    the status checks use the direct links, and Pi-hole's app-name records are emptied. Apply warns about apps
+    without a direct port.
+- **Pi-hole direct HTTPS** on `PIHOLE_HTTPS_PORT` (default 8444). FTL serves it with this host's certificate,
+  written as key + chain to `etc-pihole/dd-tls.pem`. After the first start the file is given FTL's owner, and
+  Pi-hole restarts once. Certificate renewals (refresh or push) restart Pi-hole to load the new one. The direct
+  link on the page prefers HTTPS. Export carries over an old host's 443 mapping.
+- **netboot.xyz** (official `ghcr.io/netbootxyz/netbootxyz`; the linuxserver.io image has been deprecated since May
+  2025):
+  - TFTP on 69/udp with `--tftp-single-port`, an assets web server (8080), and the web UI on 3000.
+  - **Web UI access** (`NETBOOT_ACCESS`): `proxy-auth` (default, nginx basic auth with a vault password), `proxy`,
+    or `direct`. Without the proxy it is always `direct`, on 3000, or 3001 when MeshCentral uses 3000.
+  - **Assets on SMB**, the same way as FileBot: Apps → N, `--netboot-shares`, `--netboot-add-share`, with its own
+    login.
+  - The DHCP settings to use (next-server and boot files, plus the OPNsense path) are printed on first setup and
+    in the summary.
+- `GUACAMOLE_HTTP_PORT`: an optional direct port for Guacamole, e.g. for `DASH_MODE=none`.
+
+### Changed
+- The FileBot share code is now generic (`share_*` functions with a per-app prefix). FileBot and netboot.xyz each
+  have their own mounts, SMB login, test mount, volume refresh and boot recovery.
+- The install summary lists each app's address: the proxy name and the direct link.
+- Major version: `DASH_MODE` changes which containers and ports exist. Existing installs keep `full`.
+- Self-test: 128 checks.
+
 ## v2.12.0 — 2026-11-08 — Mount SMB shares for FileBot from the menu
 
 ### Added
