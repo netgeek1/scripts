@@ -45,7 +45,8 @@ ACME_MATCH_SAN="*.example.com"
 DEPLOY_FGT=1          # FortiGate
 DEPLOY_UCG=1          # Ubiquiti Cloud Gateway
 DEPLOY_RM1=1          # GL-Net RM1 / GL-KVM
-DEPLOY_DOCKER=0       # Docker host (docker-dashboard --cert-receive)
+DEPLOY_DOCKER=0       # Docker host "Docker-190" (docker-dashboard --cert-receive)
+DEPLOY_DOCKER2=0      # Docker host "docker-05"  (docker-dashboard --cert-receive)
 DEPLOY_TRUENAS=1      # TrueNAS SCALE
 DEPLOY_FMG=0          # FortiManager
 DEPLOY_FAZ=0          # FortiAnalyzer
@@ -66,15 +67,27 @@ RM1_SSH_USER="root"
 RM1_SSH_PORT="22"
 RM1_SSH_KEY="/root/.ssh/rm1_ed25519"
 
-# Docker host running docker-dashboard in certificate PUSH mode. The chain + key
-# are streamed over SSH to a forced command (no scp, no remote command). The
-# user is created by 'docker-dashboard --cert-push-setup' and is fixed as
-# 'ddcertpush'. See the README section "Docker host (docker-dashboard)".
+# Docker hosts running docker-dashboard in certificate PUSH mode. The chain +
+# key are streamed over SSH to a forced command (no scp, no remote command).
+# The user is created by 'docker-dashboard --cert-push-setup' and is fixed as
+# 'ddcertpush'. The SAME OPNsense push key can be authorized on every host
+# (run --cert-push-setup with the same .pub on each), so the two hosts below
+# usually differ only by IP. Reported as "Docker-190" and "docker-05".
+# See the README section "Docker host (docker-dashboard)".
+#
+# Host "Docker-190":
 DOCKER_IP="192.0.2.60"        # docker-dashboard host
 DOCKER_HTTPS_PORT="443"       # port the proxy serves TLS on (probed/verified)
 DOCKER_SSH_USER="ddcertpush"
 DOCKER_SSH_PORT="22"
 DOCKER_SSH_KEY="/root/ssl_certs/docker_push_ed25519"
+#
+# Host "docker-05" (second docker-dashboard host; same key by default):
+DOCKER2_IP="192.0.2.61"
+DOCKER2_HTTPS_PORT="443"
+DOCKER2_SSH_USER="ddcertpush"
+DOCKER2_SSH_PORT="22"
+DOCKER2_SSH_KEY="/root/ssl_certs/docker_push_ed25519"
 
 TRUENAS_IP="192.0.2.50"       # TrueNAS SCALE        (v2.0 REST API, bearer token)
 TRUENAS_CERT_NAME=""          # defaults to $DOMAIN if left empty
