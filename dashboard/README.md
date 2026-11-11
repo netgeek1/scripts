@@ -267,6 +267,7 @@ Wildcard certificates (`custom`, `fetch`, `push`) don't contain the IP, so they 
 | Apps → N | `--netboot-shares`, `--netboot-add-share 'assets=//server/share'` | netboot.xyz assets folders and SMB shares |
 | Apps → F | `--filebot-shares`, `--filebot-add-share 'AS=//server/share'` | FileBot's SMB shares and folders, SMB login, test mount |
 | Apps → C → W | `--add-site 'N\|URL\|T\|D'` | Put a web UI on another machine behind the proxy (see **Sites on other machines**) |
+| R | `--urls` (or `--ports`) | Every address (proxy name and direct link, login noted) and every published port, including netboot.xyz's TFTP and assets ports, each marked listening / not listening |
 | P | `--change-ip NEW_IP` | Point names, links and Pi-hole records at a new host address, then apply |
 | C | `--cert-refresh`, `--cert-fetch-key`, `--cert-push-setup`, `--cert-receive` | Certificate actions |
 | 5 | `--apply` | Converge everything: compose files, proxy config, page, DNS file, timers |
@@ -298,7 +299,8 @@ plain folders, so one copy of `/opt/stacks` backs up everything.
 **Pi-hole specifics** (each one can be overridden by setting the same `FTLCONF_*` key in `PIHOLE_EXTRA_ENV`):
 
 - **Direct HTTPS:** `https://<host>:8444/admin/` (`PIHOLE_HTTPS_PORT`; `-` turns it off). Pi-hole's own web server
-  serves it with this host's certificate. The script writes the key and chain to `etc-pihole/dd-tls.pem` and sets
+  serves it with this host's certificate. Apply then checks that the port really serves that certificate and says
+  so, or says what it found instead. The script writes the key and chain to `etc-pihole/dd-tls.pem` and sets
   `FTLCONF_webserver_tls_cert`. When the certificate is renewed (refresh or push), Pi-hole is restarted to load it,
   which interrupts DNS for a few seconds. The plain-HTTP port (`PIHOLE_WEB_PORT`, 8081) can be turned off with `-`.
 
@@ -722,7 +724,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 128 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 129 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
