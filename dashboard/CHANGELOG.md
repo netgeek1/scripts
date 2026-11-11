@@ -3,6 +3,23 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.2.0 — 2026-11-10 — Pi-hole back to HTTP; netboot.xyz/FileBot reachable without a domain
+
+### Removed
+- **Pi-hole direct HTTPS** (v3.0.0–v3.1.0). It didn't work reliably, so Pi-hole's direct port is plain HTTP again
+  (`PIHOLE_WEB_PORT`, 8081). The proxy name (`https://pihole.<domain>`) is unaffected.
+  - `PIHOLE_HTTPS_PORT` is ignored, the 443 mapping and TLS settings are gone from Pi-hole's compose file, and
+    the certificate copy `etc-pihole/dd-tls.pem` is deleted on the next apply.
+  - Certificate refresh and push no longer restart Pi-hole.
+
+### Fixed
+- **netboot.xyz had no card and no web UI on a host without a domain.** With `NETBOOT_ACCESS=proxy-auth` (the
+  default) it was only reachable by its proxy name, and without a domain there is none. Now it falls back to
+  `direct` (`http://<host>:3000`) whenever there's no proxy name or no proxy.
+- **FileBot**, for the same reason, gets its variant's own port as a direct port when there's no proxy name and
+  `FILEBOT_WEB_PORT` is empty.
+- Self-test: 128 checks.
+
 ## v3.1.0 — 2026-11-10 — URL and port overview; Pi-hole HTTPS checked
 
 ### Added
