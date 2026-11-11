@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [3.2.0] - 2026-11-10
+
+### Added
+- **Second Docker host.** `install_docker_cert()` is now parameterized (label,
+  IP, HTTPS port, SSH user/port/key) like `install_fortinet_cert`, so any number
+  of docker-dashboard hosts share one implementation — each is one config block
+  plus one line in `main()`.
+  - New config: `DEPLOY_DOCKER2` and `DOCKER2_*` (IP, HTTPS port, SSH
+    user/port/key). The same OPNsense push key can be authorized on every host,
+    so hosts usually differ only by IP.
+  - Wired into `validate_config` (via a shared `_vreq_docker` check),
+    `preflight`, `preflight_common`, the `--digest` report, and the run summary.
+
+### Changed
+- Docker hosts are now labelled by host in all output: the existing host is
+  `Docker-190` (was `Docker`) and the new one is `docker-05`. Labels appear in
+  the summary, the digest, and log lines.
+
 ## [3.1.0] - 2026-10-28
 
 ### Added
