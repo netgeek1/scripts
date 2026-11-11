@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.2.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -91,7 +91,7 @@ CONF_KEYS=( DASH_MODE DASH_TITLE DOMAIN DASH_SUBDOMAIN HOST_ADDR EXTRA_NAMES HTT
             HOST_PANEL HOST_DISK_WARN HOST_DISK_CRIT HOST_MEM_WARN HOST_MEM_CRIT HOST_LOAD_WARN HOST_LOAD_CRIT
             UPDATE_SCHEDULE UPDATE_DAY UPDATE_TIME UPDATE_PRUNE UPDATE_EXCLUDE UPDATE_DELEGATE WATCHTOWER_IMAGE
             SECRETS_BACKEND
-            APP_PIHOLE PIHOLE_IMAGE PIHOLE_SUBDOMAIN PIHOLE_WEB_PORT PIHOLE_HTTPS_PORT PIHOLE_DNS_PORT PIHOLE_LOCAL_DNS PIHOLE_EXTRA_ENV PIHOLE_NO_PASSWORD PIHOLE_DNSMASQ_LINES
+            APP_PIHOLE PIHOLE_IMAGE PIHOLE_SUBDOMAIN PIHOLE_WEB_PORT PIHOLE_DNS_PORT PIHOLE_LOCAL_DNS PIHOLE_EXTRA_ENV PIHOLE_NO_PASSWORD PIHOLE_DNSMASQ_LINES
             APP_PORTAINER PORTAINER_IMAGE PORTAINER_SUBDOMAIN PORTAINER_HTTPS_PORT PORTAINER_EDGE_PORT
             APP_MONITORING GRAFANA_IMAGE PROMETHEUS_IMAGE NODEEXP_IMAGE BLACKBOX_IMAGE SPEEDTEST_IMAGE
             GRAFANA_SUBDOMAIN PROMETHEUS_SUBDOMAIN GRAFANA_PORT PROMETHEUS_PORT NODEEXP_PORT BLACKBOX_PORT SPEEDTEST_PORT
@@ -408,7 +408,6 @@ set_default_config() {
         [PIHOLE_IMAGE]="pihole/pihole:latest"
         [PIHOLE_SUBDOMAIN]="pihole"
         [PIHOLE_WEB_PORT]="8081"
-        [PIHOLE_HTTPS_PORT]="8444"
         [PIHOLE_DNS_PORT]="53"
         [PIHOLE_LOCAL_DNS]="yes"
         [PIHOLE_NO_PASSWORD]="no"
@@ -898,7 +897,6 @@ app_endpoints() {
         pihole)
             local fb=""
             [[ -n "${CFG[PIHOLE_WEB_PORT]}" ]] && fb="http://$ip:${CFG[PIHOLE_WEB_PORT]}/admin/"
-            [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]] && fb="https://$ip:${CFG[PIHOLE_HTTPS_PORT]}/admin/"
             printf 'pihole|Pi-hole|%s|http://pihole:80|ws,admin|%s|DNS filtering\n' "${CFG[PIHOLE_SUBDOMAIN]}" "$fb" ;;
         portainer)
             p=${CFG[PORTAINER_HTTPS_PORT]}
@@ -919,7 +917,7 @@ app_endpoints() {
         gvm)
             printf 'gvm|Greenbone|%s|https://gvm-web:443|tls,big||Vulnerability scanning\n' "${CFG[GVM_SUBDOMAIN]}" ;;
         filebot)
-            p=${CFG[FILEBOT_WEB_PORT]}
+            p=$(filebot_web_port)
             case "$(filebot_variant)" in
                 node)    printf 'filebot|FileBot|%s|http://filebot:5452|ws,fbnode|%s|Rename and organize media (amc web UI)\n' "${CFG[FILEBOT_SUBDOMAIN]}" "${p:+http://$ip:$p/filebot/}" ;;
                 jlesage) printf 'filebot|FileBot|%s|https://filebot:5800|ws,tls,stream|%s|Rename and organize media\n' "${CFG[FILEBOT_SUBDOMAIN]}" "${p:+https://$ip:$p/}" ;;
@@ -946,8 +944,7 @@ app_host_ports() {
     local p
     case "$1" in
         pihole)      printf '%s/tcp\tPi-hole DNS\n%s/udp\tPi-hole DNS\n' "${CFG[PIHOLE_DNS_PORT]}" "${CFG[PIHOLE_DNS_PORT]}"
-                     [[ -n "${CFG[PIHOLE_WEB_PORT]}" ]] && printf '%s/tcp\tPi-hole web\n' "${CFG[PIHOLE_WEB_PORT]}"
-                     [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]] && printf '%s/tcp\tPi-hole web (HTTPS)\n' "${CFG[PIHOLE_HTTPS_PORT]}" ;;
+                     [[ -n "${CFG[PIHOLE_WEB_PORT]}" ]] && printf '%s/tcp\tPi-hole web\n' "${CFG[PIHOLE_WEB_PORT]}" ;;
         portainer)   for p in PORTAINER_HTTPS_PORT PORTAINER_EDGE_PORT; do [[ -n "${CFG[$p]}" ]] && printf '%s/tcp\tPortainer\n' "${CFG[$p]}"; done ;;
         monitoring)  for p in GRAFANA_PORT PROMETHEUS_PORT NODEEXP_PORT BLACKBOX_PORT SPEEDTEST_PORT; do
                          [[ -n "${CFG[$p]}" ]] && printf '%s/tcp\t%s\n' "${CFG[$p]}" "${p%_PORT}"
@@ -955,7 +952,7 @@ app_host_ports() {
         guacamole)   proxy_on && [[ -n "${CFG[GUACAMOLE_TLS_PORT]}" ]] && printf '%s/tcp\tGuacamole (via dashboard)\n' "${CFG[GUACAMOLE_TLS_PORT]}"
                      [[ -n "${CFG[GUACAMOLE_HTTP_PORT]}" ]] && printf '%s/tcp\tGuacamole (direct HTTP)\n' "${CFG[GUACAMOLE_HTTP_PORT]}" ;;
         meshcentral) [[ -n "${CFG[MESHCENTRAL_PORT]}" ]] && printf '%s/tcp\tMeshCentral (agents)\n' "${CFG[MESHCENTRAL_PORT]}" ;;
-        filebot)     [[ -n "${CFG[FILEBOT_WEB_PORT]}" ]] && printf '%s/tcp\tFileBot web\n' "${CFG[FILEBOT_WEB_PORT]}" ;;
+        filebot)     p=$(filebot_web_port); [[ -n "$p" ]] && printf '%s/tcp\tFileBot web\n' "$p" ;;
         netboot)     printf '%s/udp\tnetboot.xyz TFTP\n' "${CFG[NETBOOT_TFTP_PORT]:-69}"
                      [[ -n "${CFG[NETBOOT_ASSETS_PORT]}" ]] && printf '%s/tcp\tnetboot.xyz assets\n' "${CFG[NETBOOT_ASSETS_PORT]}"
                      p=$(netboot_web_port); [[ -n "$p" ]] && printf '%s/tcp\tnetboot.xyz web UI\n' "$p" ;;
@@ -976,56 +973,6 @@ dash_mode() { local m=${CFG[DASH_MODE]:-full}; [[ "$m" =~ ^(full|proxy|none)$ ]]
 proxy_on()  { [[ "$(dash_mode)" != none ]]; }
 page_on()   { [[ "$(dash_mode)" == full ]]; }
 
-# ---- Pi-hole direct HTTPS: Pi-hole's own web server on 443 inside, with this host's certificate ----------------
-PIHOLE_TLS_FILE="dd-tls.pem"   # in etc-pihole: key + full chain in one PEM, as FTL wants it
-pihole_tls_owner() {   # FTL's user inside the container (it must read the key); asked from the container if it runs
-    local o
-    o=$(docker exec pihole sh -c 'printf "%s:%s" "$(id -u pihole)" "$(id -g pihole)"' 2>/dev/null || true)
-    [[ "$o" =~ ^[0-9]+:[0-9]+$ ]] && { printf '%s' "$o"; return 0; }
-    o=$(stat -c '%u:%g' "$(app_dir pihole)/etc-pihole/pihole.toml" 2>/dev/null || true)
-    [[ "$o" =~ ^[0-9]+:[0-9]+$ && "$o" != 0:0 ]] && { printf '%s' "$o"; return 0; }
-    printf '1000:1000'   # the Pi-hole image's default PIHOLE_UID/PIHOLE_GID
-}
-# pihole_https_verify -- after a start: does Pi-hole serve OUR certificate on its HTTPS port?
-pihole_https_verify() {
-    app_on pihole && [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]] && (( ! DRY_RUN )) || return 0
-    local want got i port=${CFG[PIHOLE_HTTPS_PORT]}
-    want=$(cert_fp "$DEPLOY_DIR/certs/dashboard.crt")
-    for (( i = 0; i < 20; i++ )); do
-        got=$(echo | timeout 5 openssl s_client -connect "127.0.0.1:$port" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')
-        [[ -n "$got" && "$got" == "$want" ]] && { log_ok "Pi-hole HTTPS: https://$(eff_host):$port/admin/ serves this host's certificate"; return 0; }
-        sleep 2
-    done
-    if [[ -z "$got" ]]; then
-        log_warn "Pi-hole HTTPS: nothing answers TLS on port $port. See: docker logs pihole 2>&1 | grep -iE 'tls|cert|webserver|443'"
-    else
-        log_warn "Pi-hole HTTPS: port $port serves a different certificate (Pi-hole's own?), not this host's."
-        log_warn "  Check: docker exec pihole ls -ln /etc/pihole/$PIHOLE_TLS_FILE ; docker logs pihole 2>&1 | grep -iE 'tls|cert'"
-    fi
-    return 0
-}
-# pihole_cert_sync -- write the PEM when HTTPS is on; returns 0 and sets WROTE=1 when the file changed
-pihole_cert_sync() {
-    WROTE=0
-    app_on pihole && [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]] || return 0
-    local crt="$DEPLOY_DIR/certs/dashboard.crt" key="$DEPLOY_DIR/certs/dashboard.key" f
-    [[ -s "$crt" && -s "$key" ]] || return 0
-    f="$(app_dir pihole)/etc-pihole/$PIHOLE_TLS_FILE"
-    write_file "$f" 600 "$(pihole_tls_owner)" < <(cat "$key" "$crt")
-    # ownership can be fixed after the first start (pihole.toml only exists then)
-    if (( ! DRY_RUN )) && [[ -f "$f" && "$(stat -c '%u:%g' "$f")" != "$(pihole_tls_owner)" ]]; then
-        chown "$(pihole_tls_owner)" "$f" 2>/dev/null && WROTE=1
-    fi
-    return 0
-}
-pihole_cert_reload() {   # after a certificate change: FTL reads the PEM at start, so restart Pi-hole (a few seconds)
-    pihole_cert_sync
-    (( WROTE && ! DRY_RUN )) || return 0
-    docker ps -q --filter name='^pihole$' --filter status=running 2>/dev/null | grep -q . || return 0
-    if docker restart pihole >/dev/null 2>&1; then log_ok "Pi-hole restarted with the new certificate (https://$(eff_host):${CFG[PIHOLE_HTTPS_PORT]}/admin/)"
-    else log_warn "Restarting Pi-hole for the new certificate failed: docker restart pihole"; fi
-}
-
 pihole_extra_has() { kv_pairs "${CFG[PIHOLE_EXTRA_ENV]}" | cut -f1 | grep -qx "$1"; }   # set by hand in PIHOLE_EXTRA_ENV
 
 render_app_pihole() {
@@ -1037,7 +984,6 @@ render_app_pihole() {
     printf '    ports:\n'
     printf '      - "%s:53/tcp"\n      - "%s:53/udp"\n' "${CFG[PIHOLE_DNS_PORT]}" "${CFG[PIHOLE_DNS_PORT]}"
     [[ -n "${CFG[PIHOLE_WEB_PORT]}" ]] && printf '      - "%s:80/tcp"\n' "${CFG[PIHOLE_WEB_PORT]}"
-    [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]] && printf '      - "%s:443/tcp"\n' "${CFG[PIHOLE_HTTPS_PORT]}"
     printf '    environment:\n      TZ: %s\n' "$(yaml_str "${CFG[TIMEZONE]}")"
     # only when we manage the password: an imported Pi-hole without one keeps its pihole.toml password
     if [[ "${CFG[PIHOLE_NO_PASSWORD]}" == yes ]]; then
@@ -1055,11 +1001,6 @@ render_app_pihole() {
     # inside Docker that is the container's bridge IP, useless to clients. Pin it to this host, where the proxy is.
     pihole_extra_has FTLCONF_dns_reply_host_force4 || printf '      FTLCONF_dns_reply_host_force4: "true"\n'
     pihole_extra_has FTLCONF_dns_reply_host_IPv4   || printf '      FTLCONF_dns_reply_host_IPv4: %s\n' "$(yaml_str "$(eff_host)")"
-    # direct HTTPS: FTL serves 443 itself with this host's certificate (key + chain in one PEM)
-    if [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]]; then
-        pihole_extra_has FTLCONF_webserver_port || printf '      FTLCONF_webserver_port: "80o,443os,[::]:80o,[::]:443os"\n'
-        pihole_extra_has FTLCONF_webserver_tls_cert || printf '      FTLCONF_webserver_tls_cert: "/etc/pihole/%s"\n' "$PIHOLE_TLS_FILE"
-    fi
     # extra dnsmasq options, e.g. dns-forward-max (default 150: "Maximum number of concurrent DNS queries reached")
     if [[ -n "${CFG[PIHOLE_DNSMASQ_LINES]}" ]] && ! pihole_extra_has FTLCONF_misc_dnsmasq_lines; then
         printf '      FTLCONF_misc_dnsmasq_lines: %s\n' "$(yaml_str "${CFG[PIHOLE_DNSMASQ_LINES]}")"
@@ -1182,6 +1123,12 @@ filebot_image() {   # FILEBOT_IMAGE overrides (e.g. a pinned tag); empty or anot
     case "$i" in ""|rednoah/filebot:xpra|rednoah/filebot:node|jlesage/filebot:latest) filebot_default_image "$v" ;; *) printf '%s\n' "$i" ;; esac
 }
 filebot_port() { case "$(filebot_variant)" in node) echo 5452 ;; jlesage) echo 5800 ;; *) echo 5454 ;; esac; }
+proxy_name_ok() { proxy_on && [[ -n "$(fqdn "$1")" ]]; }   # proxy_name_ok SUBDOMAIN -> reachable by name
+filebot_web_port() {   # FILEBOT_WEB_PORT, or the variant's own port when there is no proxy name to reach it by
+    local p=${CFG[FILEBOT_WEB_PORT]:-}
+    [[ -z "$p" ]] && ! proxy_name_ok "${CFG[FILEBOT_SUBDOMAIN]}" && p=$(filebot_port)
+    printf '%s' "$p"
+}
 filebot_datadir() { [[ "$(filebot_variant)" == jlesage ]] && echo config || echo data; }
 
 # -----------------------------------------------------------------------------
@@ -1519,7 +1466,8 @@ render_app_filebot() {
     local variant; variant=$(filebot_variant)
     printf '  filebot:\n    image: %s\n    container_name: filebot\n    restart: unless-stopped\n' "$(yaml_str "$(filebot_image)")"
     printf '    hostname: %s\n' "$(yaml_str "$hn")"
-    [[ -n "${CFG[FILEBOT_WEB_PORT]}" ]] && { printf '    ports:\n'; render_port "${CFG[FILEBOT_WEB_PORT]}" "$(filebot_port)"; }
+    local wp; wp=$(filebot_web_port)
+    [[ -n "$wp" ]] && { printf '    ports:\n'; render_port "$wp" "$(filebot_port)"; }
     printf '    environment:\n      TZ: %s\n' "$(yaml_str "${CFG[TIMEZONE]}")"
     case "$variant" in
         jlesage)
@@ -1556,7 +1504,8 @@ render_app_filebot() {
 netboot_access() {
     local a=${CFG[NETBOOT_ACCESS]:-proxy-auth}
     [[ "$a" =~ ^(proxy-auth|proxy|direct)$ ]] || a=proxy-auth
-    [[ "$(dash_mode)" == none ]] && a=direct    # no proxy on this host
+    # no proxy on this host, or no domain (so no proxy name): the web UI can only be direct
+    [[ "$(dash_mode)" == none || -z "$(fqdn "${CFG[NETBOOT_SUBDOMAIN]}")" ]] && a=direct
     printf '%s' "$a"
 }
 netboot_web_port() {   # direct web UI port ("" = none); direct access always has one
@@ -1716,7 +1665,8 @@ app_prepare() {   # app_prepare APP -- folders, ownership, first-run config
     case "$app" in
         pihole)
             run mkdir -p "$d/etc-pihole"
-            pihole_cert_sync ;;
+            # v3.0-3.1 tried Pi-hole's own HTTPS; that is gone again, so drop its certificate copy
+            [[ -f "$d/etc-pihole/dd-tls.pem" ]] && run rm -f "$d/etc-pihole/dd-tls.pem" ;;
         portainer)
             run mkdir -p "$d/data" ;;
         monitoring)
@@ -3406,7 +3356,6 @@ cert_receive() {
     before=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
     ensure_cert >&2
     after=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
-    pihole_cert_reload >&2
     if [[ "$before" != "$after" ]] || cert_not_live; then
         dashboard_reload >&2; state=changed
     fi
@@ -3539,7 +3488,6 @@ cert_refresh() {
     before=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
     ensure_cert
     after=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
-    pihole_cert_reload
     if [[ "$before" != "$after" ]] || cert_not_live; then dashboard_reload; log_ok "New certificate is live"
     else log_info "Certificate unchanged"; fi
     (( CERT_FETCH_FAILED == 0 ))   # non-zero for the timer's journal when the fetch itself failed
@@ -3610,11 +3558,6 @@ app_up() {   # app_up APP [pull] -- runs as "( app_up ) || ..." (errexit is off 
     if [[ "$app" == guacamole ]]; then guac_db_prepare || return 1; fi
     [[ "$app" == filebot || "$app" == netboot ]] && share_refresh_volumes "$app"
     run_logged compose_app "$app" up -d --remove-orphans || { log_error "${APP_TITLE[$app]} did not start (see above)."; return 1; }
-    if [[ "$app" == pihole && -n "${CFG[PIHOLE_HTTPS_PORT]}" ]]; then
-        local i; for i in $(seq 1 60); do [[ -f "$(app_dir pihole)/etc-pihole/pihole.toml" ]] && break; sleep 1; done
-        pihole_cert_reload    # first start: the PEM gets FTL's owner now, and Pi-hole restarts once to read it
-        pihole_https_verify
-    fi
     log_ok "${APP_TITLE[$app]} is up"
 }
 
@@ -4309,7 +4252,6 @@ export_pihole() {
     ex_set APP_PIHOLE yes
     ex_set PIHOLE_IMAGE "$(c_image "$c")"
     ex_set PIHOLE_WEB_PORT "$(c_hostport "$c" 80/tcp)"
-    v=$(c_hostport "$c" 443/tcp); [[ -n "$v" ]] && ex_set PIHOLE_HTTPS_PORT "$v"
     v=$(c_hostport "$c" 53/udp); [[ -n "$v" ]] || v=$(c_hostport "$c" 53/tcp)
     ex_set PIHOLE_DNS_PORT "${v:-53}"
     pw=$(c_env "$c" FTLCONF_webserver_api_password); [[ -n "$pw" ]] || pw=$(c_env "$c" WEBPASSWORD)
@@ -4889,8 +4831,7 @@ cfg_app() {   # per-app settings
             ask_valid PIHOLE_IMAGE "Image" v_image
             ask_valid PIHOLE_SUBDOMAIN "Name (-> $(fqdn "${CFG[PIHOLE_SUBDOMAIN]}"))" v_sub
             ask_valid PIHOLE_DNS_PORT "DNS port on the host" v_port
-            ask_valid PIHOLE_WEB_PORT "Direct HTTP web port on the host (- for none)" v_port_opt
-            ask_valid PIHOLE_HTTPS_PORT "Direct HTTPS web port, with this host's certificate (- for none)" v_port_opt
+            ask_valid PIHOLE_WEB_PORT "Direct web port on the host (- for proxy only)" v_port_opt
             ask_valid PIHOLE_LOCAL_DNS "Answer the dashboard's names itself (yes/no)" v_yesno
             ask_valid PIHOLE_NO_PASSWORD "Web login WITHOUT a password (yes/no)" v_yesno
             ask_valid PIHOLE_DNSMASQ_LINES "Extra dnsmasq lines, a;b (- for none)" v_dnsmasq
@@ -5328,17 +5269,16 @@ self_test() {
     st "filebot: smb comma escaping"        '( SECRETS=([FILEBOT_SMB_PASSWORD]="a,b,,c" [NETBOOT_SMB_PASSWORD]="x,y"); app_dir() { echo "$t"; }; docker() { printf "%s" "$FILEBOT_SMB_PASSWORD"; }; [[ "$(compose_app filebot x)" == "a,,b,,,,c" ]] )'
     st "filebot: smb validators"            'v_smbvers 3.1.1 && v_smbvers "" && ! v_smbvers 4 && v_smbopts "noserverino,cache=none" && ! v_smbopts "password=x" && ! v_smbopts "a b" && v_smbuser "DOMAIN user" && ! v_smbuser "a,b"'
     st "compose progress flag"              '( docker() { printf "%s " "$@"; }; DC_PROGRESS=""; [[ "$(dcompose pull)" == "compose pull " ]] && DC_PROGRESS=plain && [[ "$(dcompose pull)" == "compose --progress plain pull " ]] )'
-    st "pihole: direct HTTPS"               '( allcfg; c=$(render_app_pihole); [[ "$c" == *"\"8444:443/tcp\""* && "$c" == *"FTLCONF_webserver_tls_cert: \"/etc/pihole/dd-tls.pem\""* && "$c" == *"FTLCONF_webserver_port: \"80o,443os"* ]] && [[ "$(app_endpoints pihole | cut -d"|" -f6)" == https://192.168.0.190:8444/admin/ ]] && CFG[PIHOLE_HTTPS_PORT]="" && [[ "$(render_app_pihole)" != *tls_cert* ]] )'
-    st "pihole: TLS PEM = key + chain"      '( allcfg; DEPLOY_DIR="$t/dep"; STACKS_DIR="$t/stk"; DRY_RUN=0; mkdir -p "$DEPLOY_DIR/certs" "$STACKS_DIR/pihole/etc-pihole"; echo KEY >"$DEPLOY_DIR/certs/dashboard.key"; echo CRT >"$DEPLOY_DIR/certs/dashboard.crt"; pihole_cert_sync; [[ "$(cat "$STACKS_DIR/pihole/etc-pihole/dd-tls.pem")" == $'"'"'KEY\nCRT'"'"' && $WROTE == 1 ]] && pihole_cert_sync && [[ $WROTE == 0 ]] )'
     st "mode proxy: no landing page"        '( allcfg; CFG[DASH_MODE]=proxy; c=$(render_nginx); d=$(sed -n "/listen 443 ssl default_server/,/^}/p" <<<"$c"); [[ "$d" == *"return 404"* && "$d" != *"index index.html"* && "$c" == *"server_name grafana.example.net;"* ]] )'
-    st "mode none: direct links, no ports"  '( allcfg; CFG[DASH_MODE]=none; [[ "$(health_targets | head -1)" == "https://192.168.0.190:8444/admin/	" ]] && STACKS_DIR="$t/none"; [[ "$(ports_wanted)" != *"dashboard HTTP"* ]] && CFG[DASH_MODE]=full && [[ "$(ports_wanted)" == *"dashboard HTTPS"* ]] )'
+    st "mode none: direct links, no ports"  '( allcfg; CFG[DASH_MODE]=none; [[ "$(health_targets | head -1)" == "http://192.168.0.190:8081/admin/	" ]] && STACKS_DIR="$t/none"; [[ "$(ports_wanted)" != *"dashboard HTTP"* ]] && CFG[DASH_MODE]=full && [[ "$(ports_wanted)" == *"dashboard HTTPS"* ]] )'
     st "netboot: compose"                   '( allcfg; CFG[APP_NETBOOT]=yes; CFG[NETBOOT_SMB_USER]=matt; CFG[NETBOOT_MOUNTS]="assets=//10.0.0.5/isos"; c=$(render_app_netboot); [[ "$c" == *"image: \"ghcr.io/netbootxyz/netbootxyz:latest\""* && "$c" == *"\"69:69/udp\""* && "$c" == *"\"8080:80\""* && "$c" != *":3000\""* && "$c" == *"TFTPD_OPTS: \"--tftp-single-port\""* && "$c" == *"- \"smb_assets:/assets\""* && "$c" == *"password=\${NETBOOT_SMB_PASSWORD},"* && "$c" == *"- \"./config:/config\""* ]] )'
     st "netboot: proxy login"               '( allcfg; CFG[APP_NETBOOT]=yes; n=$(render_nginx | sed -n "/server_name netboot.example.net/,/^}/p"); [[ "$n" == *"auth_basic_user_file /etc/nginx/conf.d/netboot.htpasswd;"* && "$n" == *"set \$upstream http://netboot:3000;"* ]] && CFG[NETBOOT_ACCESS]=proxy && [[ "$(render_nginx | sed -n "/server_name netboot.example.net/,/^}/p")" != *auth_basic* ]] )'
     st "netboot: direct access"             '( allcfg; CFG[APP_NETBOOT]=yes; CFG[NETBOOT_ACCESS]=direct; [[ "$(render_app_netboot)" == *"\"3001:3000\""* && "$(render_nginx)" != *netboot.example.net* && "$(app_endpoints netboot | cut -d"|" -f6)" == http://192.168.0.190:3001/ ]] && CFG[NETBOOT_ACCESS]=proxy-auth && CFG[DASH_MODE]=none && [[ $(netboot_access) == direct ]] )'
     st "netboot: direct port avoids MeshCentral" '( allcfg; CFG[APP_NETBOOT]=yes; CFG[NETBOOT_ACCESS]=direct; [[ $(netboot_web_port) == 3001 ]] && CFG[APP_MESHCENTRAL]=no && [[ $(netboot_web_port) == 3000 ]] )'
+    st "no domain: netboot/FileBot direct"  '( allcfg; CFG[DOMAIN]=""; CFG[APP_NETBOOT]=yes; CFG[APP_FILEBOT]=yes; CFG[APP_MESHCENTRAL]=no; [[ $(netboot_access) == direct && "$(app_endpoints netboot | cut -d"|" -f6)" == http://192.168.0.190:3000/ && "$(app_endpoints filebot | cut -d"|" -f6)" == http://192.168.0.190:5454/ && "$(render_app_filebot)" == *"\"5454:5454\""* ]] && CFG[DOMAIN]=example.net && [[ -z "$(filebot_web_port)" && $(netboot_access) == proxy-auth ]] )'
     st "netboot: htpasswd line"             '( allcfg; SECRETS[NETBOOT_WEB_PASSWORD]=s3cret; l=$(netboot_htpasswd_line); [[ "$l" == "admin:\$apr1\$"* ]] )'
     st "netboot: shares like FileBot"       '( set_default_config; [[ $(share_next_free netboot) == assets ]] && share_mount_set netboot assets "//nas/ISO Store" && [[ "${CFG[NETBOOT_MOUNTS]}" == "assets=//nas/ISO Store" && $(share_next_free netboot) == /assets/share2 ]] && v_nbmounts "assets=//nas/isos;/assets/win=//nas2/w" && ! v_nbmounts "volume1=//nas/x" )'
-    st "urls: every app, proxy + direct"   '( allcfg; CONFIG_LOADED=1; detect_network() { :; }; load_services() { :; }; CFG[APP_NETBOOT]=yes; STACKS_DIR="$t/u"; ss() { :; }; o=$(show_urls 2>&1); [[ "$o" == *"https://netboot.example.net/   (login)"* && "$o" == *"69/udp"*"netboot.xyz TFTP"* && "$o" == *"8080/tcp"*"netboot.xyz assets"* && "$o" == *"direct   https://192.168.0.190:8444/admin/"* && "$o" == *"8444/tcp"* ]] )'
+    st "urls: every app, proxy + direct"   '( allcfg; CONFIG_LOADED=1; detect_network() { :; }; load_services() { :; }; CFG[APP_NETBOOT]=yes; STACKS_DIR="$t/u"; ss() { :; }; o=$(show_urls 2>&1); [[ "$o" == *"https://netboot.example.net/   (login)"* && "$o" == *"69/udp"*"netboot.xyz TFTP"* && "$o" == *"8080/tcp"*"netboot.xyz assets"* && "$o" == *"direct   http://192.168.0.190:8081/admin/"* ]] )'
     st "nginx: pihole card clicks pass"     '( allcfg; c=$(render_nginx); p=$(sed -n "/server_name pihole/,/^}/p" <<<"$c"); g=$(sed -n "/server_name grafana/,/^}/p" <<<"$c"); [[ "$c" == *"map \"\$request_method:\$http_sec_fetch_site\" \$dd_fetch_site"* && "$p" == *"Sec-Fetch-Site \$dd_fetch_site"* && "$g" != *Sec-Fetch-Site* ]] )'
     st "nginx: pihole / -> /admin/"         '( allcfg; c=$(render_nginx | sed -n "/server_name pihole/,/^}/p"); [[ "$c" == *"location = / { return 302 /admin/; }"* ]] )'
     st "nginx: tls upstream + websockets"   '( allcfg; c=$(render_nginx | sed -n "/server_name portainer/,/^}/p"); [[ "$c" == *"proxy_ssl_verify off"* && "$c" == *"Connection \$connection_upgrade"* && "$c" == *"client_max_body_size 0"* ]] )'
@@ -5373,7 +5313,7 @@ self_test() {
     fi
     st "health targets go via local proxy"  '( allcfg; [[ "$(health_targets | head -1)" == "https://pihole.example.net/	pihole.example.net" ]] )'
     st "dns hosts list"                     '( allcfg; l=$(render_dns_hosts); [[ $(wc -l <<<"$l") == 7 && "$l" == "192.168.0.190 dashboard.example.net"* ]] )'
-    st "host ports per app"                 '( allcfg; [[ "$(app_host_ports pihole | cut -f1 | xargs)" == "53/tcp 53/udp 8081/tcp 8444/tcp" && "$(app_host_ports guacamole | cut -f1)" == 8443/tcp ]] )'
+    st "host ports per app"                 '( allcfg; [[ "$(app_host_ports pihole | cut -f1 | xargs)" == "53/tcp 53/udp 8081/tcp" && "$(app_host_ports guacamole | cut -f1)" == 8443/tcp ]] )'
     st "port parser skips own projects"     '[[ "$(printf "pihole\t0.0.0.0:53->53/udp, 0.0.0.0:80->80/tcp\tpi-hole\npihole2\t0.0.0.0:53->53/udp\tdd-pihole\ndocker-dashboard\t0.0.0.0:80->80/tcp\tdocker-dashboard\n" | docker_ps_port_users 53 udp | xargs)" == pihole ]]'
     st "port parser respects protocol"      '[[ -z "$(printf "x\t0.0.0.0:53->53/udp\tp\n" | docker_ps_port_users 53 tcp)" ]]'
     if command -v openssl >/dev/null 2>&1; then
