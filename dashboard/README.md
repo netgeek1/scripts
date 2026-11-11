@@ -298,12 +298,6 @@ plain folders, so one copy of `/opt/stacks` backs up everything.
 
 **Pi-hole specifics** (each one can be overridden by setting the same `FTLCONF_*` key in `PIHOLE_EXTRA_ENV`):
 
-- **Direct HTTPS:** `https://<host>:8444/admin/` (`PIHOLE_HTTPS_PORT`; `-` turns it off). Pi-hole's own web server
-  serves it with this host's certificate. Apply then checks that the port really serves that certificate and says
-  so, or says what it found instead. The script writes the key and chain to `etc-pihole/dd-tls.pem` and sets
-  `FTLCONF_webserver_tls_cert`. When the certificate is renewed (refresh or push), Pi-hole is restarted to load it,
-  which interrupts DNS for a few seconds. The plain-HTTP port (`PIHOLE_WEB_PORT`, 8081) can be turned off with `-`.
-
 - **Hostname:** the container's hostname is its proxy name, e.g. `pihole.certifiedgeeks.net` (or `pihole` without a
   domain), instead of a container ID.
 - **Its own name and `pi.hole` resolve to this host.** Pi-hole answers its hostname and `pi.hole` with the address of
@@ -376,6 +370,8 @@ Without the menu: `sudo docker-dashboard --filebot-add-share 'volume1=//192.168.
   ```
 
 - **Runs as** `FILEBOT_UID`/`FILEBOT_GID` (default 1000): `PUID`/`PGID` for the official images.
+- **No domain or no proxy:** FileBot gets a direct port of its own (`xpra` 5454, `node` 5452, `jlesage` 5800),
+  unless `FILEBOT_WEB_PORT` is set.
 
 **SMB shares** are mounted by Docker itself, as `cifs` volumes of the FileBot project, so nothing is added to
 `/etc/fstab`.
@@ -398,7 +394,7 @@ Turn it on in **Apps → T**. It then asks for the settings below and for its as
 
 | Setting | Default | What it does |
 |---|---|---|
-| `NETBOOT_ACCESS` | `proxy-auth` | Web UI: `proxy-auth` = `https://netboot.<domain>` behind a login (user `NETBOOT_WEB_USER`, password in the vault as `NETBOOT_WEB_PASSWORD`); `proxy` = the same without a login; `direct` = `http://<host>:3000` only (3001 when MeshCentral already uses 3000). Without the proxy (`DASH_MODE=none`) it is always `direct` |
+| `NETBOOT_ACCESS` | `proxy-auth` | Web UI: `proxy-auth` = `https://netboot.<domain>` behind a login (user `NETBOOT_WEB_USER`, password in the vault as `NETBOOT_WEB_PASSWORD`); `proxy` = the same without a login; `direct` = `http://<host>:3000` only (3001 when MeshCentral already uses 3000). Without the proxy (`DASH_MODE=none`) or without a domain (no proxy name) it is always `direct` |
 | `NETBOOT_WEB_PORT` | empty | Extra direct web UI port. It has no login of its own |
 | `NETBOOT_TFTP_PORT` | `69` | TFTP for PXE clients, which only ever ask port 69. Runs with `--tftp-single-port`, so nothing else needs publishing |
 | `NETBOOT_ASSETS_PORT` | `8080` | The HTTP server for local assets (ISOs, kernels) |
@@ -681,7 +677,6 @@ All settings live in `/etc/docker-dashboard/dashboard.conf` (0600). Use the menu
 | `PIHOLE_NO_PASSWORD` | `yes` = Pi-hole web login without a password. Default `no` |
 | `FILEBOT_VARIANT`, `FILEBOT_IMAGE` | `xpra`, empty. Variant `xpra`/`node`/`jlesage`; the image only to pin a tag |
 | `DASH_MODE` | `full`. `full`, `proxy` (no landing page) or `none` (no nginx) |
-| `PIHOLE_HTTPS_PORT` | `8444`. Pi-hole's direct HTTPS port, with this host's certificate |
 | `GUACAMOLE_HTTP_PORT` | empty. Direct HTTP port for Guacamole, e.g. without the proxy |
 | `APP_NETBOOT`, `NETBOOT_*` | See **netboot.xyz** |
 | `FILEBOT_MOUNTS` | `volume1=./media`. FileBot folders: `NAME=SOURCE;...` (see **FileBot**) |
@@ -724,7 +719,7 @@ never touched.
 ## Testing
 
 ```bash
-./docker-dashboard.sh --self-test      # 129 checks, no root or Docker needed
+./docker-dashboard.sh --self-test      # 128 checks, no root or Docker needed
 ```
 
 The self-test covers the compose file and nginx config of every app (YAML-validated), the page JSON, endpoint
