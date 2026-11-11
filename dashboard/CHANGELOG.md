@@ -3,6 +3,22 @@
 All notable changes to **docker-dashboard.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.1.0 — 2026-11-10 — URL and port overview; Pi-hole HTTPS checked
+
+### Added
+- **`--urls`** (or `--ports`; menu **R**): for the proxy, every app, custom app and link, it shows the proxy name
+  (with "login" where nginx asks for one), the direct link, and every published host port with its purpose. That
+  includes netboot.xyz's TFTP (69/udp), assets and web UI ports. Each port is marked listening or not listening on
+  this host.
+
+### Fixed
+- Pi-hole direct HTTPS could be reported as set up while it didn't work.
+  - Apply now checks that the HTTPS port serves this host's certificate. It reports OK, nothing answering, or a
+    different certificate (Pi-hole's own), each with the command to look further.
+  - The owner of the certificate file is asked from the container (`id pihole`), falling back to `pihole.toml`'s
+    owner, then 1000:1000. The first start waits up to 60 s for Pi-hole's config before fixing the owner.
+- Self-test: 129 checks.
+
 ## v3.0.0 — 2026-11-10 — Dashboard modes, Pi-hole direct HTTPS, netboot.xyz
 
 ### Added
