@@ -24,7 +24,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.12.0"
+readonly SCRIPT_VERSION="3.0.0"
 readonly SCRIPT_NAME="docker-dashboard"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -72,18 +72,18 @@ readonly GVM_COMPOSE_DEFAULT="https://greenbone.github.io/docs/latest/_static/co
 # -----------------------------------------------------------------------------
 # APP CATALOG
 # -----------------------------------------------------------------------------
-APPS=( pihole portainer monitoring guacamole meshcentral gvm filebot )
+APPS=( pihole portainer monitoring guacamole meshcentral gvm filebot netboot )
 declare -A APP_TITLE=( [pihole]="Pi-hole" [portainer]="Portainer" [monitoring]="Internet monitoring (Grafana + Prometheus)"
-                       [guacamole]="Guacamole" [meshcentral]="MeshCentral" [gvm]="Greenbone / OpenVAS (GVM)" [filebot]="FileBot" )
+                       [guacamole]="Guacamole" [meshcentral]="MeshCentral" [gvm]="Greenbone / OpenVAS (GVM)" [filebot]="FileBot" [netboot]="netboot.xyz (PXE boot)" )
 # Secrets each app needs (generated if not imported or entered)
 declare -A APP_SECRETS=( [pihole]="PIHOLE_PASSWORD" [portainer]="" [monitoring]="GRAFANA_ADMIN_PASSWORD"
-                         [guacamole]="GUAC_DB_PASSWORD" [meshcentral]="" [gvm]="GVM_ADMIN_PASSWORD" [filebot]="FILEBOT_WEB_PASSWORD" )
-SECRET_KEYS=( PIHOLE_PASSWORD GRAFANA_ADMIN_PASSWORD GUAC_DB_PASSWORD GVM_ADMIN_PASSWORD FILEBOT_WEB_PASSWORD FILEBOT_SMB_PASSWORD )
+                         [guacamole]="GUAC_DB_PASSWORD" [meshcentral]="" [gvm]="GVM_ADMIN_PASSWORD" [filebot]="FILEBOT_WEB_PASSWORD" [netboot]="NETBOOT_WEB_PASSWORD" )
+SECRET_KEYS=( PIHOLE_PASSWORD GRAFANA_ADMIN_PASSWORD GUAC_DB_PASSWORD GVM_ADMIN_PASSWORD FILEBOT_WEB_PASSWORD FILEBOT_SMB_PASSWORD NETBOOT_WEB_PASSWORD NETBOOT_SMB_PASSWORD )
 
 # -----------------------------------------------------------------------------
 # CONFIG MODEL (-> $CONF_FILE)
 # -----------------------------------------------------------------------------
-CONF_KEYS=( DASH_TITLE DOMAIN DASH_SUBDOMAIN HOST_ADDR EXTRA_NAMES HTTP_PORT HTTPS_PORT TIMEZONE
+CONF_KEYS=( DASH_MODE DASH_TITLE DOMAIN DASH_SUBDOMAIN HOST_ADDR EXTRA_NAMES HTTP_PORT HTTPS_PORT TIMEZONE
             DEPLOY_DIR STACKS_DIR NGINX_IMAGE
             CERT_MODE CERT_FILE CERT_KEY_FILE CERT_DAYS CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY
             CERT_PUSH_USER CERT_PUSH_FROM
@@ -91,17 +91,20 @@ CONF_KEYS=( DASH_TITLE DOMAIN DASH_SUBDOMAIN HOST_ADDR EXTRA_NAMES HTTP_PORT HTT
             HOST_PANEL HOST_DISK_WARN HOST_DISK_CRIT HOST_MEM_WARN HOST_MEM_CRIT HOST_LOAD_WARN HOST_LOAD_CRIT
             UPDATE_SCHEDULE UPDATE_DAY UPDATE_TIME UPDATE_PRUNE UPDATE_EXCLUDE UPDATE_DELEGATE WATCHTOWER_IMAGE
             SECRETS_BACKEND
-            APP_PIHOLE PIHOLE_IMAGE PIHOLE_SUBDOMAIN PIHOLE_WEB_PORT PIHOLE_DNS_PORT PIHOLE_LOCAL_DNS PIHOLE_EXTRA_ENV PIHOLE_NO_PASSWORD PIHOLE_DNSMASQ_LINES
+            APP_PIHOLE PIHOLE_IMAGE PIHOLE_SUBDOMAIN PIHOLE_WEB_PORT PIHOLE_HTTPS_PORT PIHOLE_DNS_PORT PIHOLE_LOCAL_DNS PIHOLE_EXTRA_ENV PIHOLE_NO_PASSWORD PIHOLE_DNSMASQ_LINES
             APP_PORTAINER PORTAINER_IMAGE PORTAINER_SUBDOMAIN PORTAINER_HTTPS_PORT PORTAINER_EDGE_PORT
             APP_MONITORING GRAFANA_IMAGE PROMETHEUS_IMAGE NODEEXP_IMAGE BLACKBOX_IMAGE SPEEDTEST_IMAGE
             GRAFANA_SUBDOMAIN PROMETHEUS_SUBDOMAIN GRAFANA_PORT PROMETHEUS_PORT NODEEXP_PORT BLACKBOX_PORT SPEEDTEST_PORT
             PROMETHEUS_RETENTION GRAFANA_PLUGINS GRAFANA_EXTRA_ENV
-            APP_GUACAMOLE GUACAMOLE_IMAGE GUACD_IMAGE GUAC_POSTGRES_IMAGE GUACAMOLE_SUBDOMAIN GUACAMOLE_TLS_PORT
+            APP_GUACAMOLE GUACAMOLE_IMAGE GUACD_IMAGE GUAC_POSTGRES_IMAGE GUACAMOLE_SUBDOMAIN GUACAMOLE_TLS_PORT GUACAMOLE_HTTP_PORT
             GUAC_DB_NAME GUAC_DB_USER
             APP_MESHCENTRAL MESHCENTRAL_IMAGE MESHCENTRAL_SUBDOMAIN MESHCENTRAL_PORT
             APP_GVM GVM_SUBDOMAIN GVM_COMPOSE_URL
             APP_FILEBOT FILEBOT_VARIANT FILEBOT_IMAGE FILEBOT_SUBDOMAIN FILEBOT_WEB_PORT FILEBOT_WEB_USER FILEBOT_UID FILEBOT_GID
-            FILEBOT_MOUNTS FILEBOT_SMB_USER FILEBOT_SMB_DOMAIN FILEBOT_SMB_VERS FILEBOT_SMB_OPTS FILEBOT_EXTRA_ENV )
+            FILEBOT_MOUNTS FILEBOT_SMB_USER FILEBOT_SMB_DOMAIN FILEBOT_SMB_VERS FILEBOT_SMB_OPTS FILEBOT_EXTRA_ENV
+            APP_NETBOOT NETBOOT_IMAGE NETBOOT_SUBDOMAIN NETBOOT_ACCESS NETBOOT_WEB_PORT NETBOOT_WEB_USER NETBOOT_ASSETS_PORT
+            NETBOOT_TFTP_PORT NETBOOT_MENU_VERSION NETBOOT_UID NETBOOT_GID
+            NETBOOT_MOUNTS NETBOOT_SMB_USER NETBOOT_SMB_DOMAIN NETBOOT_SMB_VERS NETBOOT_SMB_OPTS NETBOOT_EXTRA_ENV )
 declare -A CFG=()
 declare -A SECRETS=()
 SECRETS_LOADED=0
@@ -360,6 +363,7 @@ detect_domain() {
 
 set_default_config() {
     CFG=(
+        [DASH_MODE]="full"
         [DASH_TITLE]="Docker Host"
         [DOMAIN]=""
         [DASH_SUBDOMAIN]="dashboard"
@@ -404,6 +408,7 @@ set_default_config() {
         [PIHOLE_IMAGE]="pihole/pihole:latest"
         [PIHOLE_SUBDOMAIN]="pihole"
         [PIHOLE_WEB_PORT]="8081"
+        [PIHOLE_HTTPS_PORT]="8444"
         [PIHOLE_DNS_PORT]="53"
         [PIHOLE_LOCAL_DNS]="yes"
         [PIHOLE_NO_PASSWORD]="no"
@@ -436,6 +441,7 @@ set_default_config() {
         [GUAC_POSTGRES_IMAGE]="postgres:17"
         [GUACAMOLE_SUBDOMAIN]="guacamole"
         [GUACAMOLE_TLS_PORT]="8443"
+        [GUACAMOLE_HTTP_PORT]=""
         [GUAC_DB_NAME]="guacamole_db"
         [GUAC_DB_USER]="guacamole_user"
         [APP_MESHCENTRAL]="no"
@@ -459,6 +465,23 @@ set_default_config() {
         [FILEBOT_SMB_VERS]="3.0"
         [FILEBOT_SMB_OPTS]=""
         [FILEBOT_EXTRA_ENV]=""
+        [APP_NETBOOT]="no"
+        [NETBOOT_IMAGE]="ghcr.io/netbootxyz/netbootxyz:latest"
+        [NETBOOT_SUBDOMAIN]="netboot"
+        [NETBOOT_ACCESS]="proxy-auth"
+        [NETBOOT_WEB_PORT]=""
+        [NETBOOT_WEB_USER]="admin"
+        [NETBOOT_ASSETS_PORT]="8080"
+        [NETBOOT_TFTP_PORT]="69"
+        [NETBOOT_MENU_VERSION]=""
+        [NETBOOT_UID]="1000"
+        [NETBOOT_GID]="1000"
+        [NETBOOT_MOUNTS]="assets=./assets"
+        [NETBOOT_SMB_USER]=""
+        [NETBOOT_SMB_DOMAIN]=""
+        [NETBOOT_SMB_VERS]="3.0"
+        [NETBOOT_SMB_OPTS]=""
+        [NETBOOT_EXTRA_ENV]=""
     )
 }
 
@@ -873,8 +896,10 @@ app_endpoints() {
     local p
     case "$1" in
         pihole)
-            p=${CFG[PIHOLE_WEB_PORT]}
-            printf 'pihole|Pi-hole|%s|http://pihole:80|ws,admin|%s|DNS filtering\n' "${CFG[PIHOLE_SUBDOMAIN]}" "${p:+http://$ip:$p/admin/}" ;;
+            local fb=""
+            [[ -n "${CFG[PIHOLE_WEB_PORT]}" ]] && fb="http://$ip:${CFG[PIHOLE_WEB_PORT]}/admin/"
+            [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]] && fb="https://$ip:${CFG[PIHOLE_HTTPS_PORT]}/admin/"
+            printf 'pihole|Pi-hole|%s|http://pihole:80|ws,admin|%s|DNS filtering\n' "${CFG[PIHOLE_SUBDOMAIN]}" "$fb" ;;
         portainer)
             p=${CFG[PORTAINER_HTTPS_PORT]}
             printf 'portainer|Portainer|%s|https://portainer:9443|ws,tls,big|%s|Container management\n' "${CFG[PORTAINER_SUBDOMAIN]}" "${p:+https://$ip:$p/}" ;;
@@ -884,8 +909,10 @@ app_endpoints() {
             p=${CFG[PROMETHEUS_PORT]}
             printf 'prometheus|Prometheus|%s|http://prometheus:9090||%s|Metrics (speedtest, ping, node)\n' "${CFG[PROMETHEUS_SUBDOMAIN]}" "${p:+http://$ip:$p/}" ;;
         guacamole)
-            p=${CFG[GUACAMOLE_TLS_PORT]}
-            printf 'guacamole|Guacamole|%s|http://guacamole:8080|ws,stream|%s|Clientless remote desktop gateway\n' "${CFG[GUACAMOLE_SUBDOMAIN]}" "${p:+https://$ip:$p/}" ;;
+            local gfb=""
+            p=${CFG[GUACAMOLE_TLS_PORT]}; proxy_on && [[ -n "$p" ]] && gfb="https://$ip:$p/"   # served by the proxy
+            [[ -z "$gfb" && -n "${CFG[GUACAMOLE_HTTP_PORT]}" ]] && gfb="http://$ip:${CFG[GUACAMOLE_HTTP_PORT]}/"
+            printf 'guacamole|Guacamole|%s|http://guacamole:8080|ws,stream|%s|Clientless remote desktop gateway\n' "${CFG[GUACAMOLE_SUBDOMAIN]}" "$gfb" ;;
         meshcentral)
             p=${CFG[MESHCENTRAL_PORT]}
             printf 'meshcentral|MeshCentral|%s|https://meshcentral:443|ws,tls,big,stream|%s|Remote device management\n' "${CFG[MESHCENTRAL_SUBDOMAIN]}" "${p:+https://$ip:$p/}" ;;
@@ -898,6 +925,12 @@ app_endpoints() {
                 jlesage) printf 'filebot|FileBot|%s|https://filebot:5800|ws,tls,stream|%s|Rename and organize media\n' "${CFG[FILEBOT_SUBDOMAIN]}" "${p:+https://$ip:$p/}" ;;
                 *)       printf 'filebot|FileBot|%s|http://filebot:5454|ws,stream|%s|Rename and organize media\n' "${CFG[FILEBOT_SUBDOMAIN]}" "${p:+http://$ip:$p/}" ;;
             esac ;;
+        netboot)
+            p=$(netboot_web_port)
+            local sub=${CFG[NETBOOT_SUBDOMAIN]} fl=ws
+            [[ "$(netboot_access)" == direct ]] && sub=""
+            [[ "$(netboot_access)" == proxy-auth ]] && fl+=",auth"
+            printf 'netboot|netboot.xyz|%s|http://netboot:3000|%s|%s|PXE boot menus and ISOs\n' "$sub" "$fl" "${p:+http://$ip:$p/}" ;;
     esac
 }
 
@@ -913,14 +946,19 @@ app_host_ports() {
     local p
     case "$1" in
         pihole)      printf '%s/tcp\tPi-hole DNS\n%s/udp\tPi-hole DNS\n' "${CFG[PIHOLE_DNS_PORT]}" "${CFG[PIHOLE_DNS_PORT]}"
-                     [[ -n "${CFG[PIHOLE_WEB_PORT]}" ]] && printf '%s/tcp\tPi-hole web\n' "${CFG[PIHOLE_WEB_PORT]}" ;;
+                     [[ -n "${CFG[PIHOLE_WEB_PORT]}" ]] && printf '%s/tcp\tPi-hole web\n' "${CFG[PIHOLE_WEB_PORT]}"
+                     [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]] && printf '%s/tcp\tPi-hole web (HTTPS)\n' "${CFG[PIHOLE_HTTPS_PORT]}" ;;
         portainer)   for p in PORTAINER_HTTPS_PORT PORTAINER_EDGE_PORT; do [[ -n "${CFG[$p]}" ]] && printf '%s/tcp\tPortainer\n' "${CFG[$p]}"; done ;;
         monitoring)  for p in GRAFANA_PORT PROMETHEUS_PORT NODEEXP_PORT BLACKBOX_PORT SPEEDTEST_PORT; do
                          [[ -n "${CFG[$p]}" ]] && printf '%s/tcp\t%s\n' "${CFG[$p]}" "${p%_PORT}"
                      done ;;
-        guacamole)   [[ -n "${CFG[GUACAMOLE_TLS_PORT]}" ]] && printf '%s/tcp\tGuacamole (via dashboard)\n' "${CFG[GUACAMOLE_TLS_PORT]}" ;;
+        guacamole)   proxy_on && [[ -n "${CFG[GUACAMOLE_TLS_PORT]}" ]] && printf '%s/tcp\tGuacamole (via dashboard)\n' "${CFG[GUACAMOLE_TLS_PORT]}"
+                     [[ -n "${CFG[GUACAMOLE_HTTP_PORT]}" ]] && printf '%s/tcp\tGuacamole (direct HTTP)\n' "${CFG[GUACAMOLE_HTTP_PORT]}" ;;
         meshcentral) [[ -n "${CFG[MESHCENTRAL_PORT]}" ]] && printf '%s/tcp\tMeshCentral (agents)\n' "${CFG[MESHCENTRAL_PORT]}" ;;
         filebot)     [[ -n "${CFG[FILEBOT_WEB_PORT]}" ]] && printf '%s/tcp\tFileBot web\n' "${CFG[FILEBOT_WEB_PORT]}" ;;
+        netboot)     printf '%s/udp\tnetboot.xyz TFTP\n' "${CFG[NETBOOT_TFTP_PORT]:-69}"
+                     [[ -n "${CFG[NETBOOT_ASSETS_PORT]}" ]] && printf '%s/tcp\tnetboot.xyz assets\n' "${CFG[NETBOOT_ASSETS_PORT]}"
+                     p=$(netboot_web_port); [[ -n "$p" ]] && printf '%s/tcp\tnetboot.xyz web UI\n' "$p" ;;
     esac
     return 0
 }
@@ -933,6 +971,38 @@ render_port() { [[ -n "$1" ]] && printf '      - "%s:%s"\n' "$1" "$2"; return 0;
 render_labels() { printf '    labels:\n      dev.docker-dashboard.app: "%s"\n' "$1"; }
 render_header() { printf '# Managed by %s v%s -- regenerated on every apply; change settings instead.\nname: %s\nservices:\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" "$(app_project "$1")"; }
 
+# DASH_MODE: full = proxy + landing page | proxy = app names behind nginx, no page | none = no nginx (direct ports)
+dash_mode() { local m=${CFG[DASH_MODE]:-full}; [[ "$m" =~ ^(full|proxy|none)$ ]] || m=full; printf '%s' "$m"; }
+proxy_on()  { [[ "$(dash_mode)" != none ]]; }
+page_on()   { [[ "$(dash_mode)" == full ]]; }
+
+# ---- Pi-hole direct HTTPS: Pi-hole's own web server on 443 inside, with this host's certificate ----------------
+PIHOLE_TLS_FILE="dd-tls.pem"   # in etc-pihole: key + full chain in one PEM, as FTL wants it
+pihole_tls_owner() {   # whoever owns pihole.toml (FTL's user inside the container); root until it has run
+    stat -c '%u:%g' "$(app_dir pihole)/etc-pihole/pihole.toml" 2>/dev/null || echo 0:0
+}
+# pihole_cert_sync -- write the PEM when HTTPS is on; returns 0 and sets WROTE=1 when the file changed
+pihole_cert_sync() {
+    WROTE=0
+    app_on pihole && [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]] || return 0
+    local crt="$DEPLOY_DIR/certs/dashboard.crt" key="$DEPLOY_DIR/certs/dashboard.key" f
+    [[ -s "$crt" && -s "$key" ]] || return 0
+    f="$(app_dir pihole)/etc-pihole/$PIHOLE_TLS_FILE"
+    write_file "$f" 600 "$(pihole_tls_owner)" < <(cat "$key" "$crt")
+    # ownership can be fixed after the first start (pihole.toml only exists then)
+    if (( ! DRY_RUN )) && [[ -f "$f" && "$(stat -c '%u:%g' "$f")" != "$(pihole_tls_owner)" ]]; then
+        chown "$(pihole_tls_owner)" "$f" 2>/dev/null && WROTE=1
+    fi
+    return 0
+}
+pihole_cert_reload() {   # after a certificate change: FTL reads the PEM at start, so restart Pi-hole (a few seconds)
+    pihole_cert_sync
+    (( WROTE && ! DRY_RUN )) || return 0
+    docker ps -q --filter name='^pihole$' --filter status=running 2>/dev/null | grep -q . || return 0
+    if docker restart pihole >/dev/null 2>&1; then log_ok "Pi-hole restarted with the new certificate (https://$(eff_host):${CFG[PIHOLE_HTTPS_PORT]}/admin/)"
+    else log_warn "Restarting Pi-hole for the new certificate failed: docker restart pihole"; fi
+}
+
 pihole_extra_has() { kv_pairs "${CFG[PIHOLE_EXTRA_ENV]}" | cut -f1 | grep -qx "$1"; }   # set by hand in PIHOLE_EXTRA_ENV
 
 render_app_pihole() {
@@ -944,6 +1014,7 @@ render_app_pihole() {
     printf '    ports:\n'
     printf '      - "%s:53/tcp"\n      - "%s:53/udp"\n' "${CFG[PIHOLE_DNS_PORT]}" "${CFG[PIHOLE_DNS_PORT]}"
     [[ -n "${CFG[PIHOLE_WEB_PORT]}" ]] && printf '      - "%s:80/tcp"\n' "${CFG[PIHOLE_WEB_PORT]}"
+    [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]] && printf '      - "%s:443/tcp"\n' "${CFG[PIHOLE_HTTPS_PORT]}"
     printf '    environment:\n      TZ: %s\n' "$(yaml_str "${CFG[TIMEZONE]}")"
     # only when we manage the password: an imported Pi-hole without one keeps its pihole.toml password
     if [[ "${CFG[PIHOLE_NO_PASSWORD]}" == yes ]]; then
@@ -961,6 +1032,11 @@ render_app_pihole() {
     # inside Docker that is the container's bridge IP, useless to clients. Pin it to this host, where the proxy is.
     pihole_extra_has FTLCONF_dns_reply_host_force4 || printf '      FTLCONF_dns_reply_host_force4: "true"\n'
     pihole_extra_has FTLCONF_dns_reply_host_IPv4   || printf '      FTLCONF_dns_reply_host_IPv4: %s\n' "$(yaml_str "$(eff_host)")"
+    # direct HTTPS: FTL serves 443 itself with this host's certificate (key + chain in one PEM)
+    if [[ -n "${CFG[PIHOLE_HTTPS_PORT]}" ]]; then
+        pihole_extra_has FTLCONF_webserver_port || printf '      FTLCONF_webserver_port: "80o,443os,[::]:80o,[::]:443os"\n'
+        pihole_extra_has FTLCONF_webserver_tls_cert || printf '      FTLCONF_webserver_tls_cert: "/etc/pihole/%s"\n' "$PIHOLE_TLS_FILE"
+    fi
     # extra dnsmasq options, e.g. dns-forward-max (default 150: "Maximum number of concurrent DNS queries reached")
     if [[ -n "${CFG[PIHOLE_DNSMASQ_LINES]}" ]] && ! pihole_extra_has FTLCONF_misc_dnsmasq_lines; then
         printf '      FTLCONF_misc_dnsmasq_lines: %s\n' "$(yaml_str "${CFG[PIHOLE_DNSMASQ_LINES]}")"
@@ -1049,6 +1125,7 @@ render_app_guacamole() {
     printf '    volumes:\n      - "./drive:/drive"\n      - "./record:/record"\n'
     render_labels guacamole
     printf '  guacamole:\n    image: %s\n    container_name: guacamole\n    restart: unless-stopped\n' "$(yaml_str "${CFG[GUACAMOLE_IMAGE]}")"
+    [[ -n "${CFG[GUACAMOLE_HTTP_PORT]}" ]] && { printf '    ports:\n'; render_port "${CFG[GUACAMOLE_HTTP_PORT]}" 8080; }
     printf '    depends_on:\n      postgres:\n        condition: service_healthy\n      guacd:\n        condition: service_started\n'
     printf '    environment:\n      GUACD_HOSTNAME: "guacd"\n      POSTGRESQL_HOSTNAME: "postgres"\n'
     printf '      POSTGRESQL_DATABASE: %s\n      POSTGRESQL_USERNAME: %s\n      POSTGRESQL_PASSWORD: "${GUAC_DB_PASSWORD:?err}"\n' \
@@ -1084,19 +1161,31 @@ filebot_image() {   # FILEBOT_IMAGE overrides (e.g. a pinned tag); empty or anot
 filebot_port() { case "$(filebot_variant)" in node) echo 5452 ;; jlesage) echo 5800 ;; *) echo 5454 ;; esac; }
 filebot_datadir() { [[ "$(filebot_variant)" == jlesage ]] && echo config || echo data; }
 
-# FILEBOT_MOUNTS: "NAME=SOURCE;..."  NAME = volume1 | storage | watch | output | /absolute/container/path
-#                 SOURCE = //server/share[/sub] (SMB, mounted by Docker's cifs volume driver) | /host/path | ./in-app-folder
-# filebot_mounts -> "container_path<TAB>kind(smb|bind)<TAB>source<TAB>volume_name" per entry
-filebot_mounts() {
-    local e name src cpath vol IFS=';'
-    for e in ${CFG[FILEBOT_MOUNTS]:-}; do
+# -----------------------------------------------------------------------------
+# SHARES: folders and SMB shares for apps that work on files (FileBot, netboot.xyz)
+# <APP>_MOUNTS: "NAME=SOURCE;..."  NAME = a short name the app knows (see share_names) | /absolute/container/path
+#               SOURCE = //server/share[/sub] (SMB, mounted by Docker's cifs volume driver) | /host/path | ./in-app-folder
+# Each app has its own SMB login: <APP>_SMB_USER/_DOMAIN/_VERS/_OPTS, password <APP>_SMB_PASSWORD in the vault.
+# -----------------------------------------------------------------------------
+share_pfx()   { printf '%s' "${1^^}"; }                                  # filebot -> FILEBOT
+share_names() { case "$1" in filebot) echo "volume1 storage watch output" ;; netboot) echo "assets" ;; esac; }
+share_first() { case "$1" in filebot) echo volume1 ;; netboot) echo assets ;; esac; }   # where the first share goes
+share_placeholder() { case "$1" in filebot) echo ./media ;; netboot) echo ./assets ;; esac; }   # the default local folder
+share_title() { case "$1" in filebot) echo FileBot ;; netboot) echo netboot.xyz ;; esac; }
+
+share_name_path() {   # share_name_path APP NAME -> container path
+    local n; for n in $(share_names "$1"); do [[ "$2" == "$n" ]] && { echo "/$n"; return 0; }; done
+    echo "$2"
+}
+# share_mounts APP -> "container_path<TAB>kind(smb|bind)<TAB>source<TAB>volume_name" per entry
+share_mounts() {
+    local app=$1 e name src cpath vol P; P=$(share_pfx "$app")
+    local IFS=';'
+    for e in ${CFG[${P}_MOUNTS]:-}; do
         e=$(trim "$e"); [[ -n "$e" ]] || continue
         name=$(trim "${e%%=*}"); src=$(trim "${e#*=}")
-        case "$name" in
-            storage|watch|output|volume1) cpath="/$name" ;;
-            /*) cpath=$name ;;
-            *) return 1 ;;
-        esac
+        cpath=$(IFS=' '; share_name_path "$app" "$name")
+        [[ "$cpath" == /* ]] || return 1
         vol="smb_$(tr -c 'a-z0-9\n' '_' <<<"${cpath#/}" | sed 's/_*$//')"
         if [[ "$src" == //* ]]; then printf '%s\tsmb\t%s\t%s\n' "$cpath" "$src" "$vol"
         elif [[ "$src" == /* || "$src" == ./* ]]; then printf '%s\tbind\t%s\t\n' "$cpath" "$src"
@@ -1104,40 +1193,300 @@ filebot_mounts() {
     done
     return 0
 }
-v_fbmounts() {
-    local saved=${CFG[FILEBOT_MOUNTS]:-} out rc=0
-    CFG[FILEBOT_MOUNTS]=$1
-    out=$(filebot_mounts) || rc=1
-    CFG[FILEBOT_MOUNTS]=$saved
+v_shares() {   # v_shares APP VALUE
+    local app=$1 P out rc=0 saved; P=$(share_pfx "$app")
+    saved=${CFG[${P}_MOUNTS]:-}
+    CFG[${P}_MOUNTS]=$2
+    out=$(share_mounts "$app") || rc=1
+    CFG[${P}_MOUNTS]=$saved
     (( rc == 0 )) || return 1
     # each container path once; SMB sources look like //server/share[/sub]; container paths without spaces;
     # sources may contain spaces ("//nas/My Media") but no quotes or commas
     [[ -z "$(cut -f1 <<<"$out" | sort | uniq -d)" ]] || return 1
-    [[ "$1" != *[\"\',]* ]] || return 1
+    [[ "$2" != *[\"\',]* ]] || return 1
     ! cut -f1 <<<"$out" | grep -q '[[:space:]]' || return 1
     ! grep -P '\tsmb\t' <<<"$out" | cut -f3 | grep -vqE '^//[A-Za-z0-9._-]+/[^/]+(/.*)?$'
 }
-filebot_has_smb() { filebot_mounts 2>/dev/null | cut -f2 | grep -qx smb; }
+v_fbmounts() { v_shares filebot "$1"; }
+v_nbmounts() { v_shares netboot "$1"; }
+share_has_smb() { share_mounts "$1" 2>/dev/null | cut -f2 | grep -qx smb; }
 smb_server() { local x=${1#//}; printf '%s' "${x%%/*}"; }      # //nas/media/tv -> nas
 resolve_ipv4() {   # resolve_ipv4 NAME -> IPv4 (the kernel cifs client needs an address)
     valid_ipv4 "$1" && { printf '%s' "$1"; return 0; }
     getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
 }
-# filebot_cifs_opts SOURCE -> mount options for Docker's cifs volume (password is a compose variable)
-filebot_cifs_opts() {
-    local ip o
-    ip=$(resolve_ipv4 "$(smb_server "$1")"); ip=${ip:-$(smb_server "$1")}
+# share_cifs_opts APP SOURCE -> mount options for Docker's cifs volume (password is a compose variable)
+share_cifs_opts() {
+    local P ip o; P=$(share_pfx "$1")
+    ip=$(resolve_ipv4 "$(smb_server "$2")"); ip=${ip:-$(smb_server "$2")}
     o="addr=$ip"
-    if [[ -n "${CFG[FILEBOT_SMB_USER]}" ]]; then
-        o+=",username=${CFG[FILEBOT_SMB_USER]},password=\${FILEBOT_SMB_PASSWORD}"
-        [[ -n "${CFG[FILEBOT_SMB_DOMAIN]}" ]] && o+=",domain=${CFG[FILEBOT_SMB_DOMAIN]}"
+    if [[ -n "${CFG[${P}_SMB_USER]:-}" ]]; then
+        o+=",username=${CFG[${P}_SMB_USER]},password=\${${P}_SMB_PASSWORD}"
+        [[ -n "${CFG[${P}_SMB_DOMAIN]:-}" ]] && o+=",domain=${CFG[${P}_SMB_DOMAIN]}"
     else
         o+=",guest"
     fi
-    [[ -n "${CFG[FILEBOT_SMB_VERS]}" ]] && o+=",vers=${CFG[FILEBOT_SMB_VERS]}"
-    o+=",uid=${CFG[FILEBOT_UID]},gid=${CFG[FILEBOT_GID]},file_mode=0664,dir_mode=0775,iocharset=utf8"
-    [[ -n "${CFG[FILEBOT_SMB_OPTS]}" ]] && o+=",${CFG[FILEBOT_SMB_OPTS]}"
+    [[ -n "${CFG[${P}_SMB_VERS]:-}" ]] && o+=",vers=${CFG[${P}_SMB_VERS]}"
+    o+=",uid=${CFG[${P}_UID]:-1000},gid=${CFG[${P}_GID]:-1000},file_mode=0664,dir_mode=0775,iocharset=utf8"
+    [[ -n "${CFG[${P}_SMB_OPTS]:-}" ]] && o+=",${CFG[${P}_SMB_OPTS]}"
     printf '%s' "$o"
+}
+render_share_volumes() {   # service-level volume lines for APP's mounts
+    local cpath kind src vol
+    while IFS=$'\t' read -r cpath kind src vol; do
+        [[ -n "$cpath" ]] || continue
+        if [[ "$kind" == smb ]]; then printf '      - "%s:%s"\n' "$vol" "$cpath"
+        else printf '      - "%s:%s"\n' "$src" "$cpath"; fi
+    done < <(share_mounts "$1")
+}
+render_share_volume_defs() {   # top-level "volumes:" with one cifs volume per SMB share
+    local app=$1 P cpath kind src vol o; P=$(share_pfx "$app")
+    share_has_smb "$app" || return 0
+    printf 'volumes:\n'
+    while IFS=$'\t' read -r cpath kind src vol; do
+        [[ "$kind" == smb ]] || continue
+        printf '  %s:\n    driver: local\n    driver_opts:\n      type: cifs\n' "$vol"
+        # yaml_str escapes "$" so values are never interpolated; the password variable is the one exception
+        o=$(yaml_str "$(share_cifs_opts "$app" "$src")"); o=${o//"\$\${${P}_SMB_PASSWORD}"/"\${${P}_SMB_PASSWORD}"}
+        printf '      device: %s\n      o: %s\n' "$(yaml_str "$src")" "$o"
+    done < <(share_mounts "$app")
+}
+
+# The SMB volumes must match the current settings and password. Docker keeps a volume's mount options from
+# creation, so when they change: stop the app and drop its SMB volumes (only the mount definitions -- the data
+# lives on the server). Compose recreates them on the next up.
+share_fingerprint() {
+    local P; P=$(share_pfx "$1")
+    { printf '%s\n' "${SECRETS[${P}_SMB_PASSWORD]:-}"; render_share_volume_defs "$1"; } | sha256sum | cut -c1-16
+}
+share_refresh_volumes() {
+    local app=$1 fp vol proj; proj=$(app_project "$app")
+    fp=$(share_fingerprint "$app")
+    [[ "$(state_get "${app}_smb")" == "$fp" ]] && return 0
+    if docker volume ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null | grep -q .; then
+        log_info "SMB settings changed: recreating $(share_title "$app")'s share mounts"
+        run_logged compose_app "$app" down || true
+        for vol in $(docker volume ls -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null); do
+            [[ "$vol" == "${proj}"_smb_* ]] && run docker volume rm "$vol" >/dev/null
+        done
+    fi
+    state_set "${app}_smb" "$fp"
+}
+
+# share_smb_check APP [CONTAINER_PATH] -- before starting: every share reachable and the login accepted
+share_smb_check() {
+    local app=$1 only=${2:-} P T cpath kind src vol srv ip t err rc=0
+    P=$(share_pfx "$app"); T=$(share_title "$app")
+    share_has_smb "$app" || return 0
+    if [[ -n "${CFG[${P}_SMB_USER]:-}" ]] && ! secret_is_set "${P}_SMB_PASSWORD"; then
+        log_error "$T: no SMB password stored. Set it: sudo docker-dashboard --set-secret ${P}_SMB_PASSWORD"; return 1
+    fi
+    command -v mount.cifs >/dev/null 2>&1 || { log_info "Installing cifs-utils (SMB mounts)"; run_logged apt-get install -y cifs-utils || true; }
+    while IFS=$'\t' read -r cpath kind src vol; do
+        [[ "$kind" == smb ]] || continue
+        [[ -z "$only" || "$only" == "$cpath" ]] || continue
+        srv=$(smb_server "$src"); ip=$(resolve_ipv4 "$srv")
+        if [[ -z "$ip" ]]; then log_error "$T: can't resolve SMB server '$srv' from this host."; rc=1; continue; fi
+        if ! timeout 4 bash -c "exec 3<>/dev/tcp/$ip/445" 2>/dev/null; then
+            log_error "$T: SMB server $srv ($ip) does not answer on port 445."; rc=1; continue
+        fi
+        (( DRY_RUN )) && continue
+        command -v mount.cifs >/dev/null 2>&1 || continue
+        t=$(mktemp -d)
+        # test mount with the same options; PASSWD keeps the password off the command line
+        if err=$(PASSWD="${SECRETS[${P}_SMB_PASSWORD]:-}" mount -t cifs "$src" "$t" \
+                 -o "$(share_cifs_opts "$app" "$src" | sed -E 's/,password=[^,]*//; s/^addr=[^,]*,?/ip='"$ip"',/'),ro" 2>&1); then
+            umount "$t" 2>/dev/null || umount -l "$t" 2>/dev/null || true
+            log_ok "SMB $src -> $cpath"
+        else
+            log_error "$T: mounting $src failed: ${err:-unknown error} (see: dmesg | grep -i cifs)"
+            rc=1
+        fi
+        rmdir "$t" 2>/dev/null || true
+    done < <(share_mounts "$app")
+    return $rc
+}
+share_prepare_local() {   # create ./folders inside the app dir, owned by the app's user
+    local app=$1 d P cpath kind src vol; d=$(app_dir "$app"); P=$(share_pfx "$app")
+    while IFS=$'\t' read -r cpath kind src vol; do
+        [[ "$kind" == bind && "$src" == ./* ]] || continue
+        run mkdir -p "$d/${src#./}"
+        (( DRY_RUN )) || chown "${CFG[${P}_UID]:-1000}:${CFG[${P}_GID]:-1000}" "$d/${src#./}" 2>/dev/null || true
+    done < <(share_mounts "$app")
+}
+
+# ---- guided editing of <APP>_MOUNTS (Apps -> F / N, --filebot-shares, --netboot-shares) ----------------------
+share_mount_set() {   # share_mount_set APP NAME SOURCE -- add, or replace the entry for the same container path
+    local app=$1 name=$2 src=$3 P e out="" target; P=$(share_pfx "$app")
+    target=$(share_name_path "$app" "$name")
+    local IFS=';'
+    for e in ${CFG[${P}_MOUNTS]:-}; do
+        e=$(trim "$e"); [[ -n "$e" ]] || continue
+        [[ "$(IFS=' '; share_name_path "$app" "$(trim "${e%%=*}")")" == "$target" ]] && continue
+        out+="${out:+;}$e"
+    done
+    CFG[${P}_MOUNTS]="${out:+$out;}$name=$src"
+}
+share_mount_del() {   # share_mount_del APP INDEX (1-based)
+    local P i=0 e out=""; P=$(share_pfx "$1")
+    local IFS=';'
+    for e in ${CFG[${P}_MOUNTS]:-}; do
+        e=$(trim "$e"); [[ -n "$e" ]] || continue
+        i=$((i + 1)); (( i == $2 )) && continue
+        out+="${out:+;}$e"
+    done
+    CFG[${P}_MOUNTS]=$out
+}
+share_next_free() {   # the first share's name if unused (or still on the default local folder), else a numbered one
+    local app=$1 first used n=2 base; first=$(share_first "$app")
+    used=$(share_mounts "$app" 2>/dev/null | cut -f1)
+    grep -qx "/$first" <<<"$used" || { echo "$first"; return; }
+    share_mounts "$app" 2>/dev/null | grep -qx "/$first"$'\tbind\t'"$(share_placeholder "$app")"$'\t' && { echo "$first"; return; }
+    case "$app" in filebot) base=/volume ;; *) base="/$first/share" ;; esac
+    while grep -qx "$base$n" <<<"$used"; do n=$((n + 1)); done
+    echo "$base$n"
+}
+share_show() {
+    local app=$1 P i=0 cpath kind src vol; P=$(share_pfx "$app")
+    printf '\n  %s%s folders%s  (inside %s -> source)\n' "$B" "$(share_title "$app")" "$NC" "$(share_title "$app")"
+    while IFS=$'\t' read -r cpath kind src vol; do
+        [[ -n "$cpath" ]] || continue
+        i=$((i + 1))
+        printf '   %d) %-16s <- %s%s\n' "$i" "$cpath" "$src" "$( [[ "$kind" == smb ]] && echo "   (SMB)" || echo "   (folder on this host)")"
+    done < <(share_mounts "$app" 2>/dev/null)
+    (( i )) || printf '   none\n'
+    if share_has_smb "$app"; then
+        printf '   SMB login: %s%s, version %s%s\n' "${CFG[${P}_SMB_USER]:-guest}" \
+            "${CFG[${P}_SMB_DOMAIN]:+ (domain ${CFG[${P}_SMB_DOMAIN]})}" "${CFG[${P}_SMB_VERS]:-auto}" \
+            "$( [[ -n "${CFG[${P}_SMB_USER]:-}" ]] && { secret_is_set "${P}_SMB_PASSWORD" && echo ", password stored" || echo ", ${Y}no password stored${NC}"; })"
+    fi
+}
+share_smb_login() {   # ask for the app's SMB account (shared by all its shares)
+    local app=$1 P pw=""; P=$(share_pfx "$app")
+    ask_valid "${P}_SMB_USER" "SMB user (- for guest access)" v_smbuser
+    if [[ -n "${CFG[${P}_SMB_USER]}" ]]; then
+        ask_valid "${P}_SMB_DOMAIN" "Domain / workgroup (- for none)" v_smbuser
+        load_secrets
+        if ! secret_is_set "${P}_SMB_PASSWORD" || confirm "Change the stored SMB password?" n; then
+            read -rsp "  SMB password for ${CFG[${P}_SMB_USER]}: " pw || true; echo
+            if [[ -n "$pw" ]]; then SECRETS[${P}_SMB_PASSWORD]=$pw; save_secrets
+            else log_warn "No password entered; set it later: sudo docker-dashboard --set-secret ${P}_SMB_PASSWORD"; fi
+        fi
+    fi
+    ask_valid "${P}_SMB_VERS" "SMB protocol version (3.1.1, 3.0, 2.1; - for automatic)" v_smbvers
+    ask_valid "${P}_SMB_OPTS" "Extra mount options, comma-separated, e.g. noserverino (- for none)" v_smbopts
+}
+share_add_smb() {
+    local app=$1 P srv share sub as src ip saved; P=$(share_pfx "$app")
+    read -rp "  SMB server (name or IP, e.g. 192.168.0.20 or nas.lan): " srv || return 0
+    srv=$(trim "${srv#//}"); srv=${srv%%/*}
+    valid_ipv4 "$srv" || valid_hostname "$srv" || { log_warn "Not a host name or IP: $srv"; return 0; }
+    ip=$(resolve_ipv4 "$srv")
+    if [[ -z "$ip" ]]; then log_warn "This host can't resolve '$srv' (use its IP, or add it to DNS)."
+    elif timeout 4 bash -c "exec 3<>/dev/tcp/$ip/445" 2>/dev/null; then log_ok "$srv ($ip) answers on SMB port 445"
+    else log_warn "$srv ($ip) does not answer on port 445 (firewall, or SMB off?)."; fi
+    read -rp "  Share name (e.g. media): " share || return 0
+    share=$(trim "$share"); share=${share#/}; share=${share%/}
+    [[ "$share" =~ ^[^/\\,\;\"\']+$ ]] || { log_warn "Invalid share name (no / \\ , ; or quotes)"; return 0; }
+    read -rp "  Sub-folder inside the share (blank for the whole share): " sub || return 0
+    sub=$(trim "$sub"); sub=${sub#/}; sub=${sub%/}
+    [[ -z "$sub" || "$sub" =~ ^[^\\,\;\"\']+$ ]] || { log_warn "Invalid sub-folder (no \\ , ; or quotes)"; return 0; }
+    src="//$srv/$share${sub:+/$sub}"
+    as=$(share_next_free "$app")
+    case "$app" in
+        filebot) log_info "Where FileBot sees it: volume1 is the official images' media folder; or e.g. /volume2, /media/tv." ;;
+        netboot) log_info "Where netboot.xyz sees it: assets is what it serves to clients (ISOs, boot files); or e.g. /assets/isos." ;;
+    esac
+    ask as "Mount inside $(share_title "$app") as" "$as"
+    [[ " $(share_names "$app") " == *" $as "* || "$as" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+        || { log_warn "Use $(share_names "$app" | sed 's/ /, /g') or an absolute path"; return 0; }
+    saved=${CFG[${P}_MOUNTS]}
+    share_mount_set "$app" "$as" "$src"
+    v_shares "$app" "${CFG[${P}_MOUNTS]}" || { CFG[${P}_MOUNTS]=$saved; log_warn "That share can't be used: $src"; return 0; }
+    log_ok "Added $src -> $(share_name_path "$app" "$as")"
+    if [[ -z "${CFG[${P}_SMB_USER]:-}" ]]; then
+        log_info "Now the SMB login (one login for all of $(share_title "$app")'s shares; L changes it later):"
+        share_smb_login "$app"
+    fi
+    if confirm "Test-mount it now (read-only)?" y; then
+        share_smb_check "$app" "$(share_name_path "$app" "$as")" || log_warn "Fix the login (L) or the share, then test again (T)."
+    fi
+}
+share_add_local() {
+    local app=$1 P path as saved; P=$(share_pfx "$app")
+    read -rp "  Folder on this host (absolute path, or ./name inside $(app_dir "$app")): " path || return 0
+    path=$(trim "$path")
+    [[ "$path" == /* || "$path" == ./* ]] || { log_warn "Use /absolute/path or ./name"; return 0; }
+    [[ "$path" == ./* || -d "$path" ]] || log_warn "$path does not exist yet; it is created on apply."
+    as=$(share_next_free "$app"); ask as "Mount inside $(share_title "$app") as" "$as"
+    saved=${CFG[${P}_MOUNTS]}
+    share_mount_set "$app" "$as" "$path"
+    v_shares "$app" "${CFG[${P}_MOUNTS]}" || { CFG[${P}_MOUNTS]=$saved; log_warn "Not valid: $as=$path"; return 0; }
+    log_ok "Added $path -> $(share_name_path "$app" "$as")"
+}
+shares_menu() {   # shares_menu APP -- edits CFG[] (the caller saves); returns when done
+    local app=$1 P ch i; P=$(share_pfx "$app")
+    while :; do
+        share_show "$app"
+        printf '\n   S) Add an SMB share   H) Add a folder on this host   R) Remove one   L) SMB login\n'
+        printf '   T) Test the SMB shares   E) Edit as text   0) Done\n'
+        read -rp "  Choice: " ch || return 0
+        case "${ch,,}" in
+            s) share_add_smb "$app" ;;
+            h) share_add_local "$app" ;;
+            r) read -rp "  Number: " i || continue
+               [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 )) || { log_warn "No such entry"; continue; }
+               share_mount_del "$app" "$i" ;;
+            l) share_smb_login "$app" ;;
+            t) if share_has_smb "$app"; then share_smb_check "$app" && log_ok "All SMB shares mount"; else log_info "No SMB shares yet."; fi ;;
+            e) log_info "NAME=SOURCE;...  NAME: $(share_names "$app" | sed 's/ /, /g') or /path; SOURCE: //server/share[/sub], /host/path or ./folder"
+               ask_valid "${P}_MOUNTS" "Folders" "v_shares_$app" ;;
+            0|q|"") return 0 ;;
+            *) printf '  %sInvalid choice%s\n' "$R" "$NC" ;;
+        esac
+    done
+}
+v_shares_filebot() { v_shares filebot "$1"; }
+v_shares_netboot() { v_shares netboot "$1"; }
+shares_cli() {   # --filebot-shares / --netboot-shares: the menu, saved at the end, then optionally applied
+    local app=$1
+    require_config; is_tty || die "This needs a terminal (or use --$app-add-share)."
+    load_secrets
+    shares_menu "$app"
+    save_config
+    app_on "$app" || { log_warn "$(share_title "$app") is off: turn it on in Apps (T) to use these folders."; return 0; }
+    confirm "Apply now (restarts $(share_title "$app") with these folders)?" y && stack_apply
+    return 0
+}
+add_share_cli() {   # --filebot-add-share / --netboot-add-share 'AS=//server/share[/sub]'
+    local app=$1 as=${2%%=*} src=${2#*=} P; P=$(share_pfx "$1")
+    require_config
+    [[ "$2" == *=//* ]] || die "Usage: --$app-add-share '$(share_first "$app")=//server/share[/sub]'  (login: --set-secret ${P}_SMB_PASSWORD; user in Apps)"
+    share_mount_set "$app" "$as" "$src"
+    v_shares "$app" "${CFG[${P}_MOUNTS]}" || die "Not a valid share: $2"
+    save_config
+    log_ok "$(share_title "$app") share $src -> $(share_name_path "$app" "$as") saved. Apply to use it (--apply)."
+}
+# FileBot names kept for the menu and the self-test
+filebot_mounts()   { share_mounts filebot; }
+filebot_has_smb()  { share_has_smb filebot; }
+filebot_cifs_opts() { share_cifs_opts filebot "$1"; }
+fb_mount_set()  { share_mount_set filebot "$@"; }
+fb_mount_del()  { share_mount_del filebot "$@"; }
+fb_next_free()  { share_next_free filebot; }
+filebot_add_share_cli() { add_share_cli filebot "$1"; }
+
+# Docker doesn't retry a container whose volume failed to mount (e.g. the NAS was still booting). The health run
+# starts such an app again in exactly that case -- never after a deliberate stop (no mount error recorded then).
+share_recover() {   # share_recover APP CONTAINER
+    app_on "$1" || return 0
+    local st err
+    st=$(docker inspect -f '{{.State.Status}}' "$2" 2>/dev/null) || return 0
+    [[ "$st" == running || "$st" == restarting ]] && return 0
+    err=$(docker inspect -f '{{.State.Error}}' "$2" 2>/dev/null)
+    [[ "${err,,}" == *mount* || "${err,,}" == *cifs* ]] || return 0
+    if docker start "$2" >/dev/null 2>&1; then _log_file INFO "health: started $2 after an earlier mount failure"
+    else _log_file WARN "health: $2 still can't mount its shares: $err"; fi
 }
 
 render_app_filebot() {
@@ -1172,234 +1521,74 @@ render_app_filebot() {
     done < <(kv_pairs "${CFG[FILEBOT_EXTRA_ENV]}")
     if [[ "$variant" == jlesage ]]; then printf '    volumes:\n      - "./config:/config"\n'
     else printf '    volumes:\n      - "./data:/data"\n'; fi
-    while IFS=$'\t' read -r cpath kind src vol; do
-        [[ -n "$cpath" ]] || continue
-        if [[ "$kind" == smb ]]; then printf '      - "%s:%s"\n' "$vol" "$cpath"
-        else printf '      - "%s:%s"\n' "$src" "$cpath"; fi
-    done < <(filebot_mounts)
+    render_share_volumes filebot
     render_labels filebot
     render_proxy_net filebot
-    if filebot_has_smb; then
-        printf 'volumes:\n'
-        while IFS=$'\t' read -r cpath kind src vol; do
-            [[ "$kind" == smb ]] || continue
-            printf '  %s:\n    driver: local\n    driver_opts:\n      type: cifs\n' "$vol"
-            # yaml_str escapes "$" so values are never interpolated; the password variable is the one exception
-            local o; o=$(yaml_str "$(filebot_cifs_opts "$src")"); o=${o//'$${FILEBOT_SMB_PASSWORD}'/'${FILEBOT_SMB_PASSWORD}'}
-            printf '      device: %s\n      o: %s\n' "$(yaml_str "$src")" "$o"
-        done < <(filebot_mounts)
-    fi
+    render_share_volume_defs filebot
     render_net_footer
 }
 
-# The SMB volumes must match the current settings and password. Docker keeps a volume's mount options from
-# creation, so when they change: stop FileBot and drop its SMB volumes (only the mount definitions -- the data
-# lives on the server). Compose recreates them on the next up.
-filebot_smb_fingerprint() {
-    { printf '%s\n' "${SECRETS[FILEBOT_SMB_PASSWORD]:-}"; render_app_filebot | sed -n '/^volumes:/,$p'; } | sha256sum | cut -c1-16
+# ---- netboot.xyz: official ghcr.io/netbootxyz/netbootxyz -- TFTP (PXE), asset web server, web UI on 3000 ------
+# NETBOOT_ACCESS: proxy-auth (https://netboot.<domain> behind a login) | proxy (no login) | direct (http://IP:port)
+netboot_access() {
+    local a=${CFG[NETBOOT_ACCESS]:-proxy-auth}
+    [[ "$a" =~ ^(proxy-auth|proxy|direct)$ ]] || a=proxy-auth
+    [[ "$(dash_mode)" == none ]] && a=direct    # no proxy on this host
+    printf '%s' "$a"
 }
-filebot_refresh_volumes() {
-    local fp vol
-    fp=$(filebot_smb_fingerprint)
-    [[ "$(state_get filebot_smb)" == "$fp" ]] && return 0
-    if docker volume ls -q --filter "label=com.docker.compose.project=$(app_project filebot)" 2>/dev/null | grep -q .; then
-        log_info "SMB settings changed: recreating FileBot's share mounts"
-        run_logged compose_app filebot down || true
-        for vol in $(docker volume ls -q --filter "label=com.docker.compose.project=$(app_project filebot)" 2>/dev/null); do
-            [[ "$vol" == "$(app_project filebot)"_smb_* ]] && run docker volume rm "$vol" >/dev/null
-        done
+netboot_web_port() {   # direct web UI port ("" = none); direct access always has one
+    local p=${CFG[NETBOOT_WEB_PORT]:-}
+    if [[ -z "$p" && "$(netboot_access)" == direct ]]; then
+        p=3000   # MeshCentral's agent port defaults to 3000 too
+        app_on meshcentral && [[ "${CFG[MESHCENTRAL_PORT]}" == 3000 ]] && p=3001
     fi
-    state_set filebot_smb "$fp"
+    printf '%s' "$p"
 }
-
-# filebot_smb_check -- before starting: every share reachable and the login accepted (clear errors, no half-start)
-filebot_smb_check() {   # filebot_smb_check [CONTAINER_PATH] -- all SMB mounts, or just that one
-    local only=${1:-} cpath kind src vol srv ip t err rc=0
-    filebot_has_smb || return 0
-    if [[ -n "${CFG[FILEBOT_SMB_USER]}" ]] && ! secret_is_set FILEBOT_SMB_PASSWORD; then
-        log_error "FileBot: no SMB password stored. Set it: sudo docker-dashboard --set-secret FILEBOT_SMB_PASSWORD"; return 1
-    fi
-    command -v mount.cifs >/dev/null 2>&1 || { log_info "Installing cifs-utils (SMB mounts)"; run_logged apt-get install -y cifs-utils || true; }
-    while IFS=$'\t' read -r cpath kind src vol; do
-        [[ "$kind" == smb ]] || continue
-        [[ -z "$only" || "$only" == "$cpath" ]] || continue
-        srv=$(smb_server "$src"); ip=$(resolve_ipv4 "$srv")
-        if [[ -z "$ip" ]]; then log_error "FileBot: can't resolve SMB server '$srv' from this host."; rc=1; continue; fi
-        if ! timeout 4 bash -c "exec 3<>/dev/tcp/$ip/445" 2>/dev/null; then
-            log_error "FileBot: SMB server $srv ($ip) does not answer on port 445."; rc=1; continue
-        fi
-        (( DRY_RUN )) && continue
-        command -v mount.cifs >/dev/null 2>&1 || continue
-        t=$(mktemp -d)
-        # test mount with the same options; PASSWD keeps the password off the command line
-        if err=$(PASSWD="${SECRETS[FILEBOT_SMB_PASSWORD]:-}" mount -t cifs "$src" "$t" \
-                 -o "$(filebot_cifs_opts "$src" | sed -E 's/,password=[^,]*//; s/^addr=[^,]*,?/ip='"$ip"',/'),ro" 2>&1); then
-            umount "$t" 2>/dev/null || umount -l "$t" 2>/dev/null || true
-            log_ok "SMB $src -> $cpath"
-        else
-            log_error "FileBot: mounting $src failed: ${err:-unknown error} (see: dmesg | grep -i cifs)"
-            rc=1
-        fi
-        rmdir "$t" 2>/dev/null || true
-    done < <(filebot_mounts)
-    return $rc
+NETBOOT_HTPASSWD="netboot.htpasswd"   # in $DEPLOY_DIR/nginx (mounted at /etc/nginx/conf.d)
+render_app_netboot() {
+    render_header netboot
+    local hn k v p
+    hn=$(fqdn "${CFG[NETBOOT_SUBDOMAIN]}"); hn=${hn:-netbootxyz}
+    printf '  netbootxyz:\n    image: %s\n    container_name: netbootxyz\n    restart: unless-stopped\n' "$(yaml_str "${CFG[NETBOOT_IMAGE]}")"
+    printf '    hostname: %s\n' "$(yaml_str "$hn")"
+    printf '    ports:\n'
+    render_port "${CFG[NETBOOT_TFTP_PORT]:-69}" "69/udp"
+    render_port "${CFG[NETBOOT_ASSETS_PORT]}" 80
+    p=$(netboot_web_port); render_port "$p" 3000
+    printf '    environment:\n      TZ: %s\n' "$(yaml_str "${CFG[TIMEZONE]}")"
+    printf '      PUID: "%s"\n      PGID: "%s"\n' "${CFG[NETBOOT_UID]}" "${CFG[NETBOOT_GID]}"
+    # all TFTP traffic on port 69: no ephemeral data ports to publish through Docker's NAT
+    printf '      TFTPD_OPTS: "--tftp-single-port"\n'
+    [[ -n "${CFG[NETBOOT_MENU_VERSION]}" ]] && printf '      MENU_VERSION: %s\n' "$(yaml_str "${CFG[NETBOOT_MENU_VERSION]}")"
+    while IFS=$'\t' read -r k v; do
+        [[ "$k" =~ ^(TZ|PUID|PGID|TFTPD_OPTS)$ ]] && continue
+        printf '      %s: %s\n' "$k" "$(yaml_str "$v")"
+    done < <(kv_pairs "${CFG[NETBOOT_EXTRA_ENV]}")
+    printf '    volumes:\n      - "./config:/config"\n'
+    render_share_volumes netboot
+    render_labels netboot
+    render_proxy_net netboot
+    render_share_volume_defs netboot
+    render_net_footer
 }
-
-# ---- FileBot folders & SMB shares: guided editing of FILEBOT_MOUNTS (Apps -> F, or --filebot-shares) ----------
-fb_mount_name_path() { case "$1" in storage|watch|output|volume1) echo "/$1" ;; *) echo "$1" ;; esac; }
-fb_mount_set() {   # fb_mount_set NAME SOURCE -- add, or replace the entry for the same container path
-    local name=$1 src=$2 e out="" target IFS=';'
-    target=$(fb_mount_name_path "$name")
-    for e in ${CFG[FILEBOT_MOUNTS]:-}; do
-        e=$(trim "$e"); [[ -n "$e" ]] || continue
-        [[ "$(fb_mount_name_path "$(trim "${e%%=*}")")" == "$target" ]] && continue
-        out+="${out:+;}$e"
-    done
-    CFG[FILEBOT_MOUNTS]="${out:+$out;}$name=$src"
+netboot_htpasswd_line() {   # "user:$apr1$..." for nginx basic auth (password from the vault)
+    printf '%s:%s\n' "${CFG[NETBOOT_WEB_USER]:-admin}" "$(openssl passwd -apr1 -stdin <<<"${SECRETS[NETBOOT_WEB_PASSWORD]:-}")"
 }
-fb_mount_del() {   # fb_mount_del INDEX (1-based)
-    local i=0 e out="" IFS=';'
-    for e in ${CFG[FILEBOT_MOUNTS]:-}; do
-        e=$(trim "$e"); [[ -n "$e" ]] || continue
-        i=$((i + 1)); (( i == $1 )) && continue
-        out+="${out:+;}$e"
-    done
-    CFG[FILEBOT_MOUNTS]=$out
+netboot_htpasswd_write() {   # only rewritten when user or password change (the hash has a random salt)
+    local f="$DEPLOY_DIR/nginx/$NETBOOT_HTPASSWD" fp
+    if ! { app_on netboot && [[ "$(netboot_access)" == proxy-auth ]]; }; then [[ -f "$f" ]] && run rm -f "$f"; return 0; fi
+    secret_is_set NETBOOT_WEB_PASSWORD || return 0
+    fp=$(printf '%s\n%s' "${CFG[NETBOOT_WEB_USER]}" "${SECRETS[NETBOOT_WEB_PASSWORD]}" | sha256sum | cut -c1-16)
+    [[ -s "$f" && "$(state_get netboot_htpasswd)" == "$fp" ]] && return 0
+    netboot_htpasswd_line | write_file "$f" 644 root:root
+    (( DRY_RUN )) || state_set netboot_htpasswd "$fp"
 }
-fb_next_free() {   # first unused of volume1, /volume2, /volume3 ... (volume1 still on the default ./media counts as free)
-    local used n=2; used=$(filebot_mounts 2>/dev/null | cut -f1)
-    grep -qx /volume1 <<<"$used" || { echo volume1; return; }
-    filebot_mounts 2>/dev/null | grep -qx $'/volume1\tbind\t./media\t' && { echo volume1; return; }
-    while grep -qx "/volume$n" <<<"$used"; do n=$((n + 1)); done
-    echo "/volume$n"
-}
-fb_mounts_show() {
-    local i=0 cpath kind src vol
-    printf '\n  %sFileBot folders%s  (inside FileBot -> source)\n' "$B" "$NC"
-    while IFS=$'\t' read -r cpath kind src vol; do
-        [[ -n "$cpath" ]] || continue
-        i=$((i + 1))
-        printf '   %d) %-14s <- %s%s\n' "$i" "$cpath" "$src" "$( [[ "$kind" == smb ]] && echo "   (SMB)" || echo "   (folder on this host)")"
-    done < <(filebot_mounts 2>/dev/null)
-    (( i )) || printf '   none\n'
-    if filebot_has_smb; then
-        printf '   SMB login: %s%s, version %s%s\n' "${CFG[FILEBOT_SMB_USER]:-guest}" \
-            "${CFG[FILEBOT_SMB_DOMAIN]:+ (domain ${CFG[FILEBOT_SMB_DOMAIN]})}" "${CFG[FILEBOT_SMB_VERS]:-auto}" \
-            "$( [[ -n "${CFG[FILEBOT_SMB_USER]}" ]] && { secret_is_set FILEBOT_SMB_PASSWORD && echo ", password stored" || echo ", ${Y}no password stored${NC}"; })"
-    fi
-}
-fb_smb_login() {   # ask for the SMB account (shared by all shares)
-    local pw=""
-    ask_valid FILEBOT_SMB_USER "SMB user (- for guest access)" v_smbuser
-    if [[ -n "${CFG[FILEBOT_SMB_USER]}" ]]; then
-        ask_valid FILEBOT_SMB_DOMAIN "Domain / workgroup (- for none)" v_smbuser
-        load_secrets
-        if ! secret_is_set FILEBOT_SMB_PASSWORD || confirm "Change the stored SMB password?" n; then
-            read -rsp "  SMB password for ${CFG[FILEBOT_SMB_USER]}: " pw || true; echo
-            if [[ -n "$pw" ]]; then SECRETS[FILEBOT_SMB_PASSWORD]=$pw; save_secrets
-            else log_warn "No password entered; set it later: sudo docker-dashboard --set-secret FILEBOT_SMB_PASSWORD"; fi
-        fi
-    fi
-    ask_valid FILEBOT_SMB_VERS "SMB protocol version (3.1.1, 3.0, 2.1; - for automatic)" v_smbvers
-    ask_valid FILEBOT_SMB_OPTS "Extra mount options, comma-separated, e.g. noserverino (- for none)" v_smbopts
-}
-fb_add_smb() {
-    local srv share sub as src ip
-    read -rp "  SMB server (name or IP, e.g. 192.168.0.20 or nas.lan): " srv || return 0
-    srv=$(trim "${srv#//}"); srv=${srv%%/*}
-    valid_ipv4 "$srv" || valid_hostname "$srv" || { log_warn "Not a host name or IP: $srv"; return 0; }
-    ip=$(resolve_ipv4 "$srv")
-    if [[ -z "$ip" ]]; then log_warn "This host can't resolve '$srv' (use its IP, or add it to DNS)."
-    elif timeout 4 bash -c "exec 3<>/dev/tcp/$ip/445" 2>/dev/null; then log_ok "$srv ($ip) answers on SMB port 445"
-    else log_warn "$srv ($ip) does not answer on port 445 (firewall, or SMB off?)."; fi
-    read -rp "  Share name (e.g. media): " share || return 0
-    share=$(trim "$share"); share=${share#/}; share=${share%/}
-    [[ "$share" =~ ^[^/\\,\;\"\']+$ ]] || { log_warn "Invalid share name (no / \\ , ; or quotes)"; return 0; }
-    read -rp "  Sub-folder inside the share (blank for the whole share): " sub || return 0
-    sub=$(trim "$sub"); sub=${sub#/}; sub=${sub%/}
-    [[ -z "$sub" || "$sub" =~ ^[^\\,\;\"\']+$ ]] || { log_warn "Invalid sub-folder (no \\ , ; or quotes)"; return 0; }
-    src="//$srv/$share${sub:+/$sub}"
-    as=$(fb_next_free)
-    log_info "Where FileBot sees it: volume1 is the official images' media folder; or e.g. /volume2, /media/tv."
-    ask as "Mount inside FileBot as" "$as"
-    [[ "$as" == volume1 || "$as" == storage || "$as" == watch || "$as" == output || "$as" =~ ^/[A-Za-z0-9._/-]+$ ]] \
-        || { log_warn "Use volume1, storage, watch, output or an absolute path"; return 0; }
-    local saved=${CFG[FILEBOT_MOUNTS]}
-    fb_mount_set "$as" "$src"
-    v_fbmounts "${CFG[FILEBOT_MOUNTS]}" || { CFG[FILEBOT_MOUNTS]=$saved; log_warn "That share can't be used: $src"; return 0; }
-    log_ok "Added $src -> $(fb_mount_name_path "$as")"
-    if [[ -z "${CFG[FILEBOT_SMB_USER]}" ]]; then
-        log_info "Now the SMB login (one login for all of FileBot's shares; L changes it later):"
-        fb_smb_login
-    fi
-    if confirm "Test-mount it now (read-only)?" y; then
-        filebot_smb_check "$(fb_mount_name_path "$as")" || log_warn "Fix the login (L) or the share, then test again (T)."
-    fi
-}
-fb_add_local() {
-    local path as
-    read -rp "  Folder on this host (absolute path, or ./name inside $(app_dir filebot)): " path || return 0
-    path=$(trim "$path")
-    [[ "$path" == /* || "$path" == ./* ]] || { log_warn "Use /absolute/path or ./name"; return 0; }
-    [[ "$path" == ./* || -d "$path" ]] || log_warn "$path does not exist yet; it is created on apply."
-    as=$(fb_next_free); ask as "Mount inside FileBot as" "$as"
-    local saved=${CFG[FILEBOT_MOUNTS]}
-    fb_mount_set "$as" "$path"
-    v_fbmounts "${CFG[FILEBOT_MOUNTS]}" || { CFG[FILEBOT_MOUNTS]=$saved; log_warn "Not valid: $as=$path"; return 0; }
-    log_ok "Added $path -> $(fb_mount_name_path "$as")"
-}
-filebot_shares_menu() {   # edits CFG[] (the caller saves); returns when done
-    local ch i
-    while :; do
-        fb_mounts_show
-        printf '\n   S) Add an SMB share   H) Add a folder on this host   R) Remove one   L) SMB login\n'
-        printf '   T) Test the SMB shares   E) Edit as text   0) Done\n'
-        read -rp "  Choice: " ch || return 0
-        case "${ch,,}" in
-            s) fb_add_smb ;;
-            h) fb_add_local ;;
-            r) read -rp "  Number: " i || continue
-               [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 )) || { log_warn "No such entry"; continue; }
-               fb_mount_del "$i" ;;
-            l) fb_smb_login ;;
-            t) filebot_has_smb && { filebot_smb_check && log_ok "All SMB shares mount"; } || log_info "No SMB shares yet." ;;
-            e) log_info "NAME=SOURCE;...  NAME: volume1, storage, watch, output or /path; SOURCE: //server/share[/sub], /host/path or ./folder"
-               ask_valid FILEBOT_MOUNTS "Folders" v_fbmounts ;;
-            0|q|"") return 0 ;;
-            *) printf '  %sInvalid choice%s\n' "$R" "$NC" ;;
-        esac
-    done
-}
-filebot_shares_cli() {   # --filebot-shares: the same menu, saved at the end, then optionally applied
-    require_config; is_tty || die "--filebot-shares needs a terminal (or use --filebot-add-share)."
-    load_secrets
-    filebot_shares_menu
-    save_config
-    app_on filebot || { log_warn "FileBot is off: turn it on in Apps (T) to use these folders."; return 0; }
-    confirm "Apply now (restarts FileBot with these folders)?" y && stack_apply
-    return 0
-}
-filebot_add_share_cli() {   # --filebot-add-share 'AS=//server/share[/sub]'
-    require_config
-    local as=${1%%=*} src=${1#*=}
-    [[ "$1" == *=//* ]] || die "Usage: --filebot-add-share 'volume1=//server/share[/sub]'  (login: Apps -> F -> L, or --set-secret FILEBOT_SMB_PASSWORD)"
-    fb_mount_set "$as" "$src"
-    v_fbmounts "${CFG[FILEBOT_MOUNTS]}" || die "Not a valid share: $1"
-    save_config
-    log_ok "FileBot share $src -> $(fb_mount_name_path "$as") saved. Apply to use it (--apply)."
-}
-
-# Docker doesn't retry a container whose volume failed to mount (e.g. the NAS was still booting). The health run
-# starts FileBot again in exactly that case -- never after a deliberate stop (no mount error recorded then).
-filebot_recover() {
-    app_on filebot || return 0
-    local st err
-    st=$(docker inspect -f '{{.State.Status}}' filebot 2>/dev/null) || return 0
-    [[ "$st" == running || "$st" == restarting ]] && return 0
-    err=$(docker inspect -f '{{.State.Error}}' filebot 2>/dev/null)
-    [[ "${err,,}" == *mount* || "${err,,}" == *cifs* ]] || return 0
-    if docker start filebot >/dev/null 2>&1; then _log_file INFO "health: started filebot after an earlier mount failure"
-    else _log_file WARN "health: filebot still can't mount its shares: $err"; fi
+netboot_dhcp_help() {
+    local ip; ip=$(eff_host)
+    log_info "netboot.xyz: point your DHCP server's network boot at this host:"
+    log_info "  next-server / TFTP server: $ip   boot file: BIOS netboot.xyz.kpxe, UEFI netboot.xyz.efi (ARM64: netboot.xyz-arm64.efi)"
+    log_info "  OPNsense: Services -> ISC DHCPv4 -> [LAN] -> Network booting (or Kea / Dnsmasq: the same two values)."
+    [[ -n "${CFG[NETBOOT_ASSETS_PORT]}" ]] && log_info "  Local assets: in the web UI, set live_endpoint to http://$ip:${CFG[NETBOOT_ASSETS_PORT]} (Menus -> boot.cfg)."
 }
 
 # GVM uses Greenbone's own compose.yaml; this override only re-wires its nginx
@@ -1419,7 +1608,7 @@ compose_app() {
         local k
         for k in "${SECRET_KEYS[@]}"; do export "$k=${SECRETS[$k]:-}"; done
         # cifs mount options are comma-separated; a comma inside the password is written as ",,"
-        export FILEBOT_SMB_PASSWORD="${FILEBOT_SMB_PASSWORD//,/,,}"
+        export FILEBOT_SMB_PASSWORD="${FILEBOT_SMB_PASSWORD//,/,,}" NETBOOT_SMB_PASSWORD="${NETBOOT_SMB_PASSWORD//,/,,}"
         if [[ "$app" == gvm ]]; then
             dcompose -p "$(app_project gvm)" -f compose.yaml -f compose.override.yaml "$@"
         else
@@ -1503,7 +1692,8 @@ app_prepare() {   # app_prepare APP -- folders, ownership, first-run config
     run mkdir -p "$d"
     case "$app" in
         pihole)
-            run mkdir -p "$d/etc-pihole" ;;
+            run mkdir -p "$d/etc-pihole"
+            pihole_cert_sync ;;
         portainer)
             run mkdir -p "$d/data" ;;
         monitoring)
@@ -1558,22 +1748,28 @@ JSON
                 log_ok "MeshCentral config.json written (agents connect to $host:${CFG[MESHCENTRAL_PORT]:-443}). Create your admin account first, then set NewAccounts to false."
             fi ;;
         filebot)
-            filebot_mounts >/dev/null || die "FILEBOT_MOUNTS is not valid: ${CFG[FILEBOT_MOUNTS]} (Apps -> FileBot)"
+            share_mounts filebot >/dev/null || die "FILEBOT_MOUNTS is not valid: ${CFG[FILEBOT_MOUNTS]} (Apps -> FileBot)"
             local dd; dd=$(filebot_datadir)
             run mkdir -p "$d/$dd"
-            local cpath kind src vol
-            while IFS=$'\t' read -r cpath kind src vol; do
-                [[ "$kind" == bind && "$src" == ./* ]] || continue
-                run mkdir -p "$d/${src#./}"
-                (( DRY_RUN )) || chown "${CFG[FILEBOT_UID]}:${CFG[FILEBOT_GID]}" "$d/${src#./}" 2>/dev/null || true
-            done < <(filebot_mounts)
+            share_prepare_local filebot
             (( DRY_RUN )) || chown -R "${CFG[FILEBOT_UID]}:${CFG[FILEBOT_GID]}" "$d/$dd" 2>/dev/null || true
-            filebot_smb_check || return 1
+            share_smb_check filebot || return 1
             if [[ "$dd" == config ]]; then
                 ls "$d"/config/*.psm >/dev/null 2>&1 || log_info "FileBot license: put your .psm file in $d/config/, then restart FileBot."
             elif [[ ! -s "$d/data/filebot/license.txt" ]]; then
                 log_info "FileBot license: copy your .psm to $d/data/filebot/license.txt (owner ${CFG[FILEBOT_UID]}), or use the GUI's license button."
             fi ;;
+        netboot)
+            share_mounts netboot >/dev/null || die "NETBOOT_MOUNTS is not valid: ${CFG[NETBOOT_MOUNTS]} (Apps -> netboot.xyz)"
+            run mkdir -p "$d/config"
+            (( DRY_RUN )) || chown "${CFG[NETBOOT_UID]}:${CFG[NETBOOT_GID]}" "$d/config" 2>/dev/null || true
+            share_prepare_local netboot
+            share_smb_check netboot || return 1
+            [[ "${CFG[NETBOOT_TFTP_PORT]:-69}" == 69 ]] || log_warn "netboot.xyz: TFTP on port ${CFG[NETBOOT_TFTP_PORT]}; PXE clients only ask port 69."
+            if [[ "$(netboot_access)" == proxy-auth && -n "${CFG[NETBOOT_WEB_PORT]}" ]]; then
+                log_warn "netboot.xyz: the direct web port ${CFG[NETBOOT_WEB_PORT]} has no login; only the proxy name is protected."
+            fi
+            [[ -f "$d/config/menus/boot.cfg" ]] || netboot_dhcp_help ;;
         gvm)
             if [[ ! -f "$d/compose.yaml" ]]; then
                 if (( DRY_RUN )); then run curl -fsSL "${CFG[GVM_COMPOSE_URL]}"
@@ -1706,7 +1902,7 @@ write_pihole_dns() {
     app_on pihole && [[ "${CFG[PIHOLE_LOCAL_DNS]}" == yes && -n "${CFG[DOMAIN]}" ]] || return 0
     local f; f="$(app_dir pihole)/etc-pihole/hosts/docker-dashboard.list"
     run mkdir -p "$(dirname "$f")"
-    { printf '# Managed by %s -- names served by the dashboard proxy\n' "$SCRIPT_NAME"; render_dns_hosts; } | write_file "$f" 644 root:root
+    { printf '# Managed by %s -- names served by the dashboard proxy\n' "$SCRIPT_NAME"; proxy_on && render_dns_hosts; } | write_file "$f" 644 root:root
     return 0
 }
 
@@ -1990,6 +2186,7 @@ custom_up() {   # custom_up NAME [pull]
     custom_load "$n"
     if ca_is_site; then
         log_step "${CA[TITLE]} (external site: ${CA[UPSTREAM_URL]})"
+        proxy_on || { log_warn "Skipped: external sites go through the proxy, which is off (DASH_MODE=none)."; return 0; }
         custom_validate "$n" || { log_error "Fix $(custom_dir "$n")/app.conf, then apply again."; return 1; }
         log_ok "${CA[TITLE]} is proxied as $(fqdn "${CA[SUBDOMAIN]}")"
         return 0
@@ -2433,6 +2630,7 @@ render_proxy_location() {
     printf '        proxy_set_header X-Forwarded-Proto https;\n'
     printf '        proxy_set_header X-Forwarded-Host $host;\n'
     [[ "$flags" == *,admin,* ]] && printf '        proxy_set_header Sec-Fetch-Site $dd_fetch_site;\n'
+    [[ "$flags" == *,auth,* ]] && printf '        auth_basic "netboot.xyz";\n        auth_basic_user_file /etc/nginx/conf.d/%s;\n' "$NETBOOT_HTPASSWD"
     if [[ "$flags" == *,ws,* ]]; then
         printf '        proxy_set_header Upgrade $http_upgrade;\n'
         printf '        proxy_set_header Connection $connection_upgrade;\n'
@@ -2469,6 +2667,13 @@ render_nginx() {
         render_files_locations
     fi
     printf '    location / { return 301 %s$request_uri; }\n}\n\n' "$redirect"
+    if ! page_on; then   # proxy only: unknown names and the bare IP get nothing (file share kept if set)
+        printf 'server {\n    listen 443 ssl default_server;\n    server_name _;\n'
+        render_tls_common
+        printf '    location ~ /\\. { return 404; }\n'
+        [[ -n "${CFG[FILES_DIR]}" ]] && render_files_locations
+        printf '    location / { return 404; }\n}\n'
+    else
     # landing page: dashboard name, bare IP and anything unmatched
     printf 'server {\n    listen 443 ssl default_server;\n    server_name _;\n'
     render_tls_common
@@ -2481,6 +2686,7 @@ render_nginx() {
         printf '    location /files-index/ {\n        alias %s/;\n        autoindex on;\n        autoindex_format json;\n        add_header Cache-Control "no-store" always;\n    }\n' "$FILES_MOUNT"
     fi
     printf '    location / { try_files $uri $uri/ =404; }\n}\n'
+    fi
     # one server per app endpoint
     while IFS='|' read -r key title sub up flags fb desc; do
         host=$(fqdn "$sub"); [[ -n "$host" ]] || continue
@@ -2541,8 +2747,9 @@ render_services_json() {
 health_targets() {
     local key title sub up flags fb desc url h i
     while IFS='|' read -r key title sub up flags fb desc; do
-        url=$(endpoint_url "$sub" "$fb"); [[ -n "$url" ]] || continue
-        h=$(fqdn "$sub")
+        if proxy_on; then url=$(endpoint_url "$sub" "$fb"); h=$(fqdn "$sub")
+        else url=$fb; h=""; fi       # no proxy: the apps' direct links
+        [[ -n "$url" ]] || continue
         printf '%s\t%s\n' "$url" "$h"
     done < <(all_endpoints)
     for i in "${!SVC_URL[@]}"; do printf '%s\t\n' "${SVC_URL[$i]}"; done
@@ -2967,6 +3174,13 @@ check_port() {
 }
 
 PORTS_CHECKED=0
+ports_wanted() {   # every host port this configuration publishes: "port/proto<TAB>label"
+    local a
+    proxy_on && printf '%s/tcp\tdashboard HTTP\n%s/tcp\tdashboard HTTPS\n' "${CFG[HTTP_PORT]}" "${CFG[HTTPS_PORT]}"
+    for a in $(enabled_apps); do app_host_ports "$a"; done
+    custom_host_ports
+}
+
 check_ports() {
     (( PORTS_CHECKED )) && return 0
     log_step "Port check"
@@ -2974,18 +3188,14 @@ check_ports() {
     if app_on pihole && [[ "${CFG[PIHOLE_DNS_PORT]}" == 53 ]] && resolved_stub_active; then
         free_resolved_stub || true
     fi
-    [[ "${CFG[HTTP_PORT]}" != "${CFG[HTTPS_PORT]}" ]] || die "HTTP and HTTPS ports must differ."
+    ! proxy_on || [[ "${CFG[HTTP_PORT]}" != "${CFG[HTTPS_PORT]}" ]] || die "HTTP and HTTPS ports must differ."
     local -A seen=()
     while IFS=$'\t' read -r pp label; do
         [[ -n "$pp" ]] || continue
         if [[ -n "${seen[$pp]:-}" ]]; then log_error "Port $pp is assigned twice (${seen[$pp]} and $label)"; rc=1; continue; fi
         seen[$pp]=$label
         check_port "${pp%/*}" "${pp#*/}" "$label" || rc=1
-    done < <(
-        printf '%s/tcp\tdashboard HTTP\n%s/tcp\tdashboard HTTPS\n' "${CFG[HTTP_PORT]}" "${CFG[HTTPS_PORT]}"
-        for a in $(enabled_apps); do app_host_ports "$a"; done
-        custom_host_ports
-    )
+    done < <(ports_wanted)
     (( rc == 0 )) || die "Free the port(s) above, or change them in Settings / Apps, then run this again."
     PORTS_CHECKED=1
 }
@@ -3116,17 +3326,19 @@ cert_receive() {
     before=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
     ensure_cert >&2
     after=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
+    pihole_cert_reload >&2
     if [[ "$before" != "$after" ]] || cert_not_live; then
         dashboard_reload >&2; state=changed
     fi
     # nginx reloads asynchronously: wait until the proxy really serves it, so the caller's TLS check passes
-    local fp live=no i
+    local fp live=no i=1
     fp=$(cert_fp "$DEPLOY_DIR/certs/dashboard.crt")
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    proxy_on || { i=99; live=n/a; }    # no nginx on this host: nothing to wait for
+    for (( ; i <= 10; i++ )); do
         [[ "$(live_cert_fp)" == "$fp" ]] && { live=yes; break; }
         sleep 1
     done
-    [[ "$live" == yes ]] || log_warn "nginx is not serving the new certificate yet (is $CONTAINER_NAME running?)" >&2
+    [[ "$live" != no ]] || log_warn "nginx is not serving the new certificate yet (is $CONTAINER_NAME running?)" >&2
     printf 'DD-CERT-RECEIVE OK %s sha256=%s notafter=%s live=%s\n' "$state" "$fp" \
         "$(openssl x509 -in "$DEPLOY_DIR/certs/dashboard.crt" -noout -enddate 2>/dev/null | sed 's/^notAfter=//; s/ /_/g')" "$live"
     _log_file INFO "cert-receive: $state $(cert_fp "$DEPLOY_DIR/certs/dashboard.crt")"
@@ -3247,6 +3459,7 @@ cert_refresh() {
     before=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
     ensure_cert
     after=$(sha256sum "$DEPLOY_DIR/certs/dashboard.crt" 2>/dev/null | cut -c1-16)
+    pihole_cert_reload
     if [[ "$before" != "$after" ]] || cert_not_live; then dashboard_reload; log_ok "New certificate is live"
     else log_info "Certificate unchanged"; fi
     (( CERT_FETCH_FAILED == 0 ))   # non-zero for the timer's journal when the fetch itself failed
@@ -3315,8 +3528,12 @@ app_up() {   # app_up APP [pull] -- runs as "( app_up ) || ..." (errexit is off 
     compose_app "$app" config --quiet || { log_error "docker compose config failed for $(app_dir "$app")"; return 1; }
     if [[ "$mode" == pull ]]; then run_logged compose_app "$app" pull --ignore-pull-failures || true; fi
     if [[ "$app" == guacamole ]]; then guac_db_prepare || return 1; fi
-    [[ "$app" == filebot ]] && filebot_refresh_volumes
+    [[ "$app" == filebot || "$app" == netboot ]] && share_refresh_volumes "$app"
     run_logged compose_app "$app" up -d --remove-orphans || { log_error "${APP_TITLE[$app]} did not start (see above)."; return 1; }
+    if [[ "$app" == pihole && -n "${CFG[PIHOLE_HTTPS_PORT]}" ]]; then
+        local i; for i in 1 2 3 4 5 6 7 8 9 10; do [[ -f "$(app_dir pihole)/etc-pihole/pihole.toml" ]] && break; sleep 1; done
+        pihole_cert_reload    # first start: the PEM gets FTL's owner now, and Pi-hole restarts once to read it
+    fi
     log_ok "${APP_TITLE[$app]} is up"
 }
 
@@ -3329,8 +3546,17 @@ app_down() {   # app_down APP [REASON] -- stop and remove containers; data kept
 }
 
 dashboard_up() {
-    log_step "Dashboard ($DEPLOY_DIR)"
+    if ! proxy_on; then
+        log_step "Proxy and dashboard: off (DASH_MODE=none; apps on their direct ports)"
+        if (( ! DRY_RUN )) && docker ps -aq --filter "name=^${CONTAINER_NAME}$" 2>/dev/null | grep -q .; then
+            run_logged compose_dd down --remove-orphans || docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+            log_ok "Stopped the proxy ($CONTAINER_NAME); ports ${CFG[HTTP_PORT]}/${CFG[HTTPS_PORT]} are free"
+        fi
+        return 0
+    fi
+    log_step "$(page_on && echo Dashboard || echo "Proxy (no landing page)") ($DEPLOY_DIR)"
     run mkdir -p "$DEPLOY_DIR/html" "$DEPLOY_DIR/nginx" "$DEPLOY_DIR/certs"
+    netboot_htpasswd_write
     local conf_changed=0 id_before id_after
     id_before=$(docker ps -q --no-trunc --filter "name=^${CONTAINER_NAME}$" 2>/dev/null || true)
     write_file "$DEPLOY_DIR/docker-compose.yml" 644 root:root < <(render_compose)
@@ -3371,6 +3597,12 @@ stack_apply() {   # stack_apply [pull] -- converge everything: apps, proxy, page
     ensure_cert
     for a in "${APPS[@]}"; do app_on "$a" || app_down "$a"; done
     write_pihole_dns
+    if ! proxy_on; then
+        local key title sub up flags fb desc
+        while IFS='|' read -r key title sub up flags fb desc; do
+            [[ -n "$fb" ]] || log_warn "$title has no direct port, so without the proxy it can't be reached. Set one in Apps -> Edit."
+        done < <(all_endpoints)
+    fi
     local -a failed=()
     for a in $(enabled_apps); do ( app_up "$a" "$mode" ) || { log_error "${APP_TITLE[$a]} was not started; the other apps carry on."; failed+=("${APP_TITLE[$a]}"); }; done
     for a in $(custom_names); do custom_on "$a" || custom_down "$a"; done
@@ -3453,7 +3685,7 @@ health_check() {   # health_check [quiet]
     local -a urls=() vias=()
     health_dns_setup
     # custom apps recreated outside this script lose their proxy network: re-attach before probing
-    if (( ! DRY_RUN )) && docker_up; then for n in $(enabled_customs); do custom_attach "$n"; done; filebot_recover; fi
+    if (( ! DRY_RUN )) && docker_up; then for n in $(enabled_customs); do custom_attach "$n"; done; share_recover filebot filebot; share_recover netboot netbootxyz; fi
     while IFS=$'\t' read -r url via; do
         [[ -n "$url" ]] || continue
         in_list "$url" ${urls[@]+"${urls[@]}"} && continue
@@ -3475,7 +3707,7 @@ health_check() {   # health_check [quiet]
             else log_warn "$(printf '%-48s not responding' "$url")"; fi
         done <<<"$results"
     fi
-    if [[ -d "$DEPLOY_DIR/html" ]] && (( ! DRY_RUN )); then
+    if page_on && [[ -d "$DEPLOY_DIR/html" ]] && (( ! DRY_RUN )); then
         render_status_json <<<"$results" | write_file "$DEPLOY_DIR/html/status.json" 644 root:root
     fi
     host_health "$quiet"
@@ -3486,7 +3718,7 @@ host_health() {   # host_health [quiet] -- page panel + (optionally) terminal re
     [[ "${CFG[HOST_PANEL]}" == yes ]] || { [[ -n "${1:-}" ]] || { host_collect; host_report; }; return 0; }
     host_collect
     [[ -n "${1:-}" ]] || host_report
-    if [[ -d "$DEPLOY_DIR/html" ]] && (( ! DRY_RUN )); then
+    if page_on && [[ -d "$DEPLOY_DIR/html" ]] && (( ! DRY_RUN )); then
         render_host_json | write_file "$DEPLOY_DIR/html/host.json" 644 root:root
     fi
     return 0
@@ -3996,6 +4228,7 @@ export_pihole() {
     ex_set APP_PIHOLE yes
     ex_set PIHOLE_IMAGE "$(c_image "$c")"
     ex_set PIHOLE_WEB_PORT "$(c_hostport "$c" 80/tcp)"
+    v=$(c_hostport "$c" 443/tcp); [[ -n "$v" ]] && ex_set PIHOLE_HTTPS_PORT "$v"
     v=$(c_hostport "$c" 53/udp); [[ -n "$v" ]] || v=$(c_hostport "$c" 53/tcp)
     ex_set PIHOLE_DNS_PORT "${v:-53}"
     pw=$(c_env "$c" FTLCONF_webserver_api_password); [[ -n "$pw" ]] || pw=$(c_env "$c" WEBPASSWORD)
@@ -4468,19 +4701,22 @@ v_fname()     { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 v_url()       { valid_url "$1"; }
 v_dnsmasq()   { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9][A-Za-z0-9=,./:#_-]*(\;[A-Za-z0-9][A-Za-z0-9=,./:#_-]*)*$ ]]; }
 v_healthdns() { [[ "$1" =~ ^(pihole|host)$ ]]; }
+v_dashmode()  { [[ "$1" =~ ^(full|proxy|none)$ ]]; }
+v_nbaccess()  { [[ "$1" =~ ^(proxy-auth|proxy|direct)$ ]]; }
 v_fbvariant() { [[ "$1" =~ ^(xpra|node|jlesage)$ ]]; }
 v_image_opt() { [[ -z "$1" ]] || v_image "$1"; }
 v_num()       { [[ "$1" =~ ^[0-9]{1,6}$ ]]; }
 v_smbuser()   { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9._@\ -]+$ && "$1" != *,* ]]; }
 v_smbvers()   { [[ -z "$1" || "$1" =~ ^(1\.0|2\.0|2\.1|3|3\.0|3\.02|3\.1\.1|default)$ ]]; }
 v_smbopts()   { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9_]+(=[A-Za-z0-9._/:-]+)?(,[A-Za-z0-9_]+(=[A-Za-z0-9._/:-]+)?)*$ ]] && [[ ! "$1" =~ (^|,)(pass|password|username|user)= ]]; }
-v_fbmounts_ok() { v_fbmounts "$1"; }
 v_pct()       { [[ "$1" =~ ^[0-9]{1,3}$ ]] && (( $1 >= 1 && $1 <= 100 )); }
 v_load()      { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 section() { printf '\n  %s%s%s\n' "$B" "$1" "$NC"; }
 
 cfg_page() {
     section "Page, domain and host"
+    log_info "full = HTTPS proxy with app names + landing page | proxy = app names, no landing page | none = no nginx, apps on direct ports"
+    ask_valid DASH_MODE "Dashboard mode (full/proxy/none)" v_dashmode
     ask_valid DASH_TITLE "Page title" v_title
     [[ -z "${CFG[DOMAIN]}" ]] && CFG[DOMAIN]=$(detect_domain)
     ask_valid DOMAIN "Domain for app names, e.g. example.net -> grafana.example.net (- for none: links use ports)" v_domain_opt
@@ -4572,7 +4808,8 @@ cfg_app() {   # per-app settings
             ask_valid PIHOLE_IMAGE "Image" v_image
             ask_valid PIHOLE_SUBDOMAIN "Name (-> $(fqdn "${CFG[PIHOLE_SUBDOMAIN]}"))" v_sub
             ask_valid PIHOLE_DNS_PORT "DNS port on the host" v_port
-            ask_valid PIHOLE_WEB_PORT "Direct web port on the host (- for proxy only)" v_port_opt
+            ask_valid PIHOLE_WEB_PORT "Direct HTTP web port on the host (- for none)" v_port_opt
+            ask_valid PIHOLE_HTTPS_PORT "Direct HTTPS web port, with this host's certificate (- for none)" v_port_opt
             ask_valid PIHOLE_LOCAL_DNS "Answer the dashboard's names itself (yes/no)" v_yesno
             ask_valid PIHOLE_NO_PASSWORD "Web login WITHOUT a password (yes/no)" v_yesno
             ask_valid PIHOLE_DNSMASQ_LINES "Extra dnsmasq lines, a;b (- for none)" v_dnsmasq
@@ -4600,7 +4837,8 @@ cfg_app() {   # per-app settings
             ask_valid GUACD_IMAGE "guacd image" v_image
             ask_valid GUAC_POSTGRES_IMAGE "PostgreSQL image (keep the major version once data exists)" v_image
             ask_valid GUACAMOLE_SUBDOMAIN "Name (-> $(fqdn "${CFG[GUACAMOLE_SUBDOMAIN]}"))" v_sub
-            ask_valid GUACAMOLE_TLS_PORT "Extra HTTPS port served by the dashboard (- for none)" v_port_opt ;;
+            ask_valid GUACAMOLE_TLS_PORT "Extra HTTPS port served by the dashboard (- for none)" v_port_opt
+            ask_valid GUACAMOLE_HTTP_PORT "Direct HTTP port from the container, e.g. without the proxy (- for none)" v_port_opt ;;
         meshcentral)
             ask_valid MESHCENTRAL_IMAGE "Image" v_image
             ask_valid MESHCENTRAL_SUBDOMAIN "Name (-> $(fqdn "${CFG[MESHCENTRAL_SUBDOMAIN]}"))" v_sub
@@ -4611,7 +4849,7 @@ cfg_app() {   # per-app settings
             log_info "Image: $(filebot_image) (enter one only to pin a tag; - for the variant's default)"
             ask_valid FILEBOT_IMAGE "Image" v_image_opt
             ask_valid FILEBOT_SUBDOMAIN "Name (-> $(fqdn "${CFG[FILEBOT_SUBDOMAIN]}"))" v_sub
-            ask_valid FILEBOT_WEB_PORT "Direct HTTPS port on the host (- for proxy only)" v_port_opt
+            ask_valid FILEBOT_WEB_PORT "Direct port on the host (- for proxy only)" v_port_opt
             [[ "$(filebot_variant)" == xpra ]] && log_info "Login: password only (vault FILEBOT_WEB_PASSWORD)." \
                 || ask_valid FILEBOT_WEB_USER "Web login user" v_user
             ask_valid FILEBOT_UID "Run as user ID (file owner on local folders and SMB mounts)" v_num
@@ -4621,7 +4859,27 @@ cfg_app() {   # per-app settings
                 load_secrets
                 log_info "Media folders: SMB shares (e.g. on your NAS) or folders on this host. Keep input and output under one"
                 log_info "mount: FileBot can only MOVE/HARDLINK within it."
-                filebot_shares_menu
+                shares_menu filebot
+            fi ;;
+        netboot)
+            log_info "netboot.xyz (official image): PXE boot menus over TFTP, plus a web UI to manage menus and local ISOs."
+            ask_valid NETBOOT_IMAGE "Image" v_image
+            log_info "Web UI: proxy-auth = https://$(fqdn "${CFG[NETBOOT_SUBDOMAIN]}" || true) with a login | proxy = same, no login | direct = http://$(eff_host):<port> only"
+            ask_valid NETBOOT_ACCESS "Web UI access (proxy-auth/proxy/direct)" v_nbaccess
+            [[ "${CFG[NETBOOT_ACCESS]}" != direct ]] && ask_valid NETBOOT_SUBDOMAIN "Name (-> $(fqdn "${CFG[NETBOOT_SUBDOMAIN]}"))" v_sub
+            [[ "${CFG[NETBOOT_ACCESS]}" == direct ]] && log_info "Direct access without a port set uses $(netboot_web_port)."
+            [[ "${CFG[NETBOOT_ACCESS]}" == proxy-auth ]] && ask_valid NETBOOT_WEB_USER "Web login user (password: vault NETBOOT_WEB_PASSWORD)" v_user
+            ask_valid NETBOOT_WEB_PORT "Direct web UI port, no login (- for none; direct access picks 3000/3001 if empty)" v_port_opt
+            ask_valid NETBOOT_ASSETS_PORT "Assets web server port, for local ISOs (- for none)" v_port_opt
+            ask_valid NETBOOT_TFTP_PORT "TFTP port (PXE needs 69)" v_port
+            ask_valid NETBOOT_MENU_VERSION "Menu version (- for the latest)" v_words
+            ask_valid NETBOOT_UID "Run as user ID (file owner on local folders and SMB mounts)" v_num
+            ask_valid NETBOOT_GID "Run as group ID" v_num
+            ask_valid NETBOOT_EXTRA_ENV "Extra settings, K=V;K=V (- to clear)" v_kv
+            if is_tty && (( ! ASSUME_YES )); then
+                load_secrets
+                log_info "Assets (ISOs, boot images): a folder here or an SMB share on another server. Menus stay in $(app_dir netboot)/config."
+                shares_menu netboot
             fi ;;
         gvm)
             log_info "Greenbone needs ~8 GB RAM and a long first feed sync. It uses Greenbone's own compose file."
@@ -4663,8 +4921,9 @@ config_wizard() {
     cfg_page; cfg_apps_toggle
     if is_tty && (( ! ASSUME_YES )) && confirm "Review per-app settings (images, names, ports)?" n; then
         local a; for a in $(enabled_apps); do cfg_app "$a"; done
-    elif app_on filebot && is_tty && (( ! ASSUME_YES )); then
-        cfg_app filebot   # its media folders / SMB shares need answers either way
+    elif is_tty && (( ! ASSUME_YES )); then
+        app_on filebot && cfg_app filebot   # their folders / SMB shares need answers either way
+        app_on netboot && cfg_app netboot
     fi
     cfg_ports; cfg_cert; cfg_files; cfg_health; cfg_updates; cfg_paths
     config_summary
@@ -4703,19 +4962,23 @@ menu_apps() {
         done
         printf '   C) Custom apps (%s)\n' "$(custom_names | wc -l)"
         app_on filebot && printf '   F) FileBot folders and SMB shares (%s)\n' "$(filebot_mounts 2>/dev/null | wc -l)"
+        app_on netboot && printf '   N) netboot.xyz assets and SMB shares (%s)\n' "$(share_mounts netboot 2>/dev/null | wc -l)"
         printf '\n   T) Toggle on/off   E) Edit settings   S) Save   A) Save + apply   0) Back (unsaved changes are discarded)\n'
         read -rp "  Choice: " ch || return 0
         case "${ch,,}" in
             c) menu_custom ;;
             f) app_on filebot || { log_warn "Turn FileBot on first (T)."; continue; }
-               load_secrets; filebot_shares_menu; log_info "Save (S) or Save + apply (A) to use them." ;;
+               load_secrets; shares_menu filebot; log_info "Save (S) or Save + apply (A) to use them." ;;
+            n) app_on netboot || { log_warn "Turn netboot.xyz on first (T)."; continue; }
+               load_secrets; shares_menu netboot; log_info "Save (S) or Save + apply (A) to use them." ;;
             t|e) read -rp "  App number: " i || continue
                  [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#APPS[@]} )) || { log_warn "No such app"; continue; }
                  a=${APPS[$((i - 1))]}
                  if [[ "${ch,,}" == t ]]; then
                      if app_on "$a"; then CFG[APP_${a^^}]=no; log_info "${APP_TITLE[$a]}: off (containers stop on apply; data is kept)"
                      else CFG[APP_${a^^}]=yes; log_info "${APP_TITLE[$a]}: on"
-                          [[ "$a" == filebot ]] && confirm "Set up FileBot now (variant, login, SMB shares)?" y && cfg_app filebot; fi
+                          [[ "$a" == filebot ]] && confirm "Set up FileBot now (variant, login, SMB shares)?" y && cfg_app filebot
+                          [[ "$a" == netboot ]] && confirm "Set up netboot.xyz now (access, ports, assets / SMB shares)?" y && cfg_app netboot; fi
                  else cfg_app "$a"; fi ;;
             s) save_config ;;
             a) save_config; menu_action stack_apply ;;
@@ -4744,7 +5007,7 @@ secret_change() {
         return 0
     fi
     [[ "$v" == - ]] && die "'-' (no password) is only allowed for PIHOLE_PASSWORD."
-    [[ "$k" == FILEBOT_SMB_PASSWORD && -z "$v" ]] && die "Enter the SMB share's password (it can't be generated)."
+    [[ "$k" == *_SMB_PASSWORD && -z "$v" ]] && die "Enter the SMB share's password (it can't be generated)."
     [[ "$k" == FILEBOT_WEB_PASSWORD && "$v" == *[,\$\"]* ]] && die "FILEBOT_WEB_PASSWORD may not contain , \$ or \" (xpra's login option syntax)."
     v=${v:-$(gen_password)}
     if [[ "$k" == GUAC_DB_PASSWORD ]] && docker ps -q --filter name='^guacamole-postgres$' | grep -q .; then
@@ -4758,7 +5021,7 @@ secret_change() {
         PIHOLE_PASSWORD|GUAC_DB_PASSWORD) log_info "Takes effect on the next apply (menu 5, or --apply)." ;;
         GRAFANA_ADMIN_PASSWORD) log_info "Grafana only reads this on its first start; change an existing login in the Grafana UI." ;;
         GVM_ADMIN_PASSWORD) log_info "Run --gvm-password to set it in Greenbone." ;;
-        FILEBOT_WEB_PASSWORD|FILEBOT_SMB_PASSWORD) log_info "Takes effect on the next apply (menu 5, or --apply)." ;;
+        FILEBOT_WEB_PASSWORD|FILEBOT_SMB_PASSWORD|NETBOOT_WEB_PASSWORD|NETBOOT_SMB_PASSWORD) log_info "Takes effect on the next apply (menu 5, or --apply)." ;;
     esac
 }
 
@@ -4793,7 +5056,7 @@ menu_secrets() {
                read -rsp "  New value (empty = generate): " v || true; echo
                menu_action secret_change "$k" "$v"
                load_config; SECRETS_LOADED=0; load_secrets     # it ran in a subshell: pick up what it saved
-               if [[ "$k" =~ ^(PIHOLE_PASSWORD|GUAC_DB_PASSWORD|FILEBOT_WEB_PASSWORD|FILEBOT_SMB_PASSWORD)$ ]] && confirm "Apply now so it takes effect?" y; then
+               if [[ "$k" =~ ^(PIHOLE_PASSWORD|GUAC_DB_PASSWORD|FILEBOT_WEB_PASSWORD|FILEBOT_SMB_PASSWORD|NETBOOT_WEB_PASSWORD|NETBOOT_SMB_PASSWORD)$ ]] && confirm "Apply now so it takes effect?" y; then
                    menu_action stack_apply
                fi ;;
             0|q) return 0 ;;
@@ -4834,11 +5097,21 @@ full_install() {
 
 print_summary() {
     log_step "Done"
-    log_info "Dashboard:        $(dashboard_url)"
+    case "$(dash_mode)" in
+        full)  log_info "Dashboard:        $(dashboard_url)" ;;
+        proxy) log_info "Proxy:            app names under ${CFG[DOMAIN]:-(no domain)}, no landing page" ;;
+        none)  log_info "No proxy:         apps on their direct ports" ;;
+    esac
+    local key title sub up flags fb desc
+    while IFS='|' read -r key title sub up flags fb desc; do
+        if proxy_on && [[ -n "$(fqdn "$sub")" ]]; then log_info "$(printf '  %-16s %s%s' "$title" "$(endpoint_url "$sub" "")" "${fb:+   (direct: $fb)}")"
+        elif [[ -n "$fb" ]]; then log_info "$(printf '  %-16s %s' "$title" "$fb")"; fi
+    done < <(all_endpoints)
+    app_on netboot && netboot_dhcp_help
     log_info "Manage:           sudo docker-dashboard        (menu)"
     log_info "Update all:       sudo docker-dashboard --update-all"
     [[ "${CFG[CERT_MODE]}" == selfsigned ]] && log_info "Browsers will warn once about the self-signed certificate."
-    dns_records
+    proxy_on && dns_records
     app_on gvm && log_info "Greenbone: the first feed sync takes a long time. Then set its admin password: sudo docker-dashboard --gvm-password"
     return 0
 }
@@ -4923,7 +5196,7 @@ self_test() {
     (( have_py )) && python3 -c "import yaml" 2>/dev/null && have_yaml=1
     # a fully populated config for the renderers
     allcfg() { set_default_config; CFG[DOMAIN]=example.net; CFG[HOST_ADDR]=192.168.0.190; DET_IP=10.9.9.9
-               local a; for a in "${APPS[@]}"; do CFG[APP_${a^^}]=yes; done; CFG[APP_GVM]=no; CFG[APP_FILEBOT]=no; SVC_GROUP=(); SVC_NAME=(); SVC_URL=(); SVC_DESC=()
+               local a; for a in "${APPS[@]}"; do CFG[APP_${a^^}]=yes; done; CFG[APP_GVM]=no; CFG[APP_FILEBOT]=no; CFG[APP_NETBOOT]=no; SVC_GROUP=(); SVC_NAME=(); SVC_URL=(); SVC_DESC=()
                SECRETS=([PIHOLE_PASSWORD]=x [GRAFANA_ADMIN_PASSWORD]=y [GUAC_DB_PASSWORD]=z); }
 
     st "bash syntax"                        'bash -n "$SCRIPT_PATH"'
@@ -4971,9 +5244,19 @@ self_test() {
     st "filebot: default ./media gives way" '( set_default_config; [[ $(fb_next_free) == volume1 ]] && fb_mount_set volume1 //nas/m && [[ "${CFG[FILEBOT_MOUNTS]}" == "volume1=//nas/m" && $(fb_next_free) == /volume2 ]] )'
     st "filebot: share list editing"        '( set_default_config; fb_mount_set volume1 //nas/media; [[ "${CFG[FILEBOT_MOUNTS]}" == "volume1=//nas/media" ]] && [[ $(fb_next_free) == /volume2 ]] && fb_mount_set /volume2 /srv/x && fb_mount_set volume1 //nas/tv && [[ "${CFG[FILEBOT_MOUNTS]}" == "/volume2=/srv/x;volume1=//nas/tv" ]] && fb_mount_del 1 && [[ "${CFG[FILEBOT_MOUNTS]}" == "volume1=//nas/tv" ]] )'
     st "filebot: add-share CLI"             '( set_default_config; CONF_FILE="$t/fbconf"; DRY_RUN=0; save_config() { :; }; require_config() { :; }; filebot_add_share_cli "volume1=//10.0.0.5/media/tv" >/dev/null && [[ "${CFG[FILEBOT_MOUNTS]}" == "volume1=//10.0.0.5/media/tv" ]] && ! ( filebot_add_share_cli "volume1=nas/x" ) 2>/dev/null )'
-    st "filebot: smb comma escaping"        '( SECRETS=([FILEBOT_SMB_PASSWORD]="a,b,,c"); app_dir() { echo "$t"; }; docker() { printf "%s" "$FILEBOT_SMB_PASSWORD"; }; [[ "$(compose_app filebot x)" == "a,,b,,,,c" ]] )'
+    st "filebot: smb comma escaping"        '( SECRETS=([FILEBOT_SMB_PASSWORD]="a,b,,c" [NETBOOT_SMB_PASSWORD]="x,y"); app_dir() { echo "$t"; }; docker() { printf "%s" "$FILEBOT_SMB_PASSWORD"; }; [[ "$(compose_app filebot x)" == "a,,b,,,,c" ]] )'
     st "filebot: smb validators"            'v_smbvers 3.1.1 && v_smbvers "" && ! v_smbvers 4 && v_smbopts "noserverino,cache=none" && ! v_smbopts "password=x" && ! v_smbopts "a b" && v_smbuser "DOMAIN user" && ! v_smbuser "a,b"'
     st "compose progress flag"              '( docker() { printf "%s " "$@"; }; DC_PROGRESS=""; [[ "$(dcompose pull)" == "compose pull " ]] && DC_PROGRESS=plain && [[ "$(dcompose pull)" == "compose --progress plain pull " ]] )'
+    st "pihole: direct HTTPS"               '( allcfg; c=$(render_app_pihole); [[ "$c" == *"\"8444:443/tcp\""* && "$c" == *"FTLCONF_webserver_tls_cert: \"/etc/pihole/dd-tls.pem\""* && "$c" == *"FTLCONF_webserver_port: \"80o,443os"* ]] && [[ "$(app_endpoints pihole | cut -d"|" -f6)" == https://192.168.0.190:8444/admin/ ]] && CFG[PIHOLE_HTTPS_PORT]="" && [[ "$(render_app_pihole)" != *tls_cert* ]] )'
+    st "pihole: TLS PEM = key + chain"      '( allcfg; DEPLOY_DIR="$t/dep"; STACKS_DIR="$t/stk"; DRY_RUN=0; mkdir -p "$DEPLOY_DIR/certs" "$STACKS_DIR/pihole/etc-pihole"; echo KEY >"$DEPLOY_DIR/certs/dashboard.key"; echo CRT >"$DEPLOY_DIR/certs/dashboard.crt"; pihole_cert_sync; [[ "$(cat "$STACKS_DIR/pihole/etc-pihole/dd-tls.pem")" == $'"'"'KEY\nCRT'"'"' && $WROTE == 1 ]] && pihole_cert_sync && [[ $WROTE == 0 ]] )'
+    st "mode proxy: no landing page"        '( allcfg; CFG[DASH_MODE]=proxy; c=$(render_nginx); d=$(sed -n "/listen 443 ssl default_server/,/^}/p" <<<"$c"); [[ "$d" == *"return 404"* && "$d" != *"index index.html"* && "$c" == *"server_name grafana.example.net;"* ]] )'
+    st "mode none: direct links, no ports"  '( allcfg; CFG[DASH_MODE]=none; [[ "$(health_targets | head -1)" == "https://192.168.0.190:8444/admin/	" ]] && STACKS_DIR="$t/none"; [[ "$(ports_wanted)" != *"dashboard HTTP"* ]] && CFG[DASH_MODE]=full && [[ "$(ports_wanted)" == *"dashboard HTTPS"* ]] )'
+    st "netboot: compose"                   '( allcfg; CFG[APP_NETBOOT]=yes; CFG[NETBOOT_SMB_USER]=matt; CFG[NETBOOT_MOUNTS]="assets=//10.0.0.5/isos"; c=$(render_app_netboot); [[ "$c" == *"image: \"ghcr.io/netbootxyz/netbootxyz:latest\""* && "$c" == *"\"69:69/udp\""* && "$c" == *"\"8080:80\""* && "$c" != *":3000\""* && "$c" == *"TFTPD_OPTS: \"--tftp-single-port\""* && "$c" == *"- \"smb_assets:/assets\""* && "$c" == *"password=\${NETBOOT_SMB_PASSWORD},"* && "$c" == *"- \"./config:/config\""* ]] )'
+    st "netboot: proxy login"               '( allcfg; CFG[APP_NETBOOT]=yes; n=$(render_nginx | sed -n "/server_name netboot.example.net/,/^}/p"); [[ "$n" == *"auth_basic_user_file /etc/nginx/conf.d/netboot.htpasswd;"* && "$n" == *"set \$upstream http://netboot:3000;"* ]] && CFG[NETBOOT_ACCESS]=proxy && [[ "$(render_nginx | sed -n "/server_name netboot.example.net/,/^}/p")" != *auth_basic* ]] )'
+    st "netboot: direct access"             '( allcfg; CFG[APP_NETBOOT]=yes; CFG[NETBOOT_ACCESS]=direct; [[ "$(render_app_netboot)" == *"\"3001:3000\""* && "$(render_nginx)" != *netboot.example.net* && "$(app_endpoints netboot | cut -d"|" -f6)" == http://192.168.0.190:3001/ ]] && CFG[NETBOOT_ACCESS]=proxy-auth && CFG[DASH_MODE]=none && [[ $(netboot_access) == direct ]] )'
+    st "netboot: direct port avoids MeshCentral" '( allcfg; CFG[APP_NETBOOT]=yes; CFG[NETBOOT_ACCESS]=direct; [[ $(netboot_web_port) == 3001 ]] && CFG[APP_MESHCENTRAL]=no && [[ $(netboot_web_port) == 3000 ]] )'
+    st "netboot: htpasswd line"             '( allcfg; SECRETS[NETBOOT_WEB_PASSWORD]=s3cret; l=$(netboot_htpasswd_line); [[ "$l" == "admin:\$apr1\$"* ]] )'
+    st "netboot: shares like FileBot"       '( set_default_config; [[ $(share_next_free netboot) == assets ]] && share_mount_set netboot assets "//nas/ISO Store" && [[ "${CFG[NETBOOT_MOUNTS]}" == "assets=//nas/ISO Store" && $(share_next_free netboot) == /assets/share2 ]] && v_nbmounts "assets=//nas/isos;/assets/win=//nas2/w" && ! v_nbmounts "volume1=//nas/x" )'
     st "nginx: pihole card clicks pass"     '( allcfg; c=$(render_nginx); p=$(sed -n "/server_name pihole/,/^}/p" <<<"$c"); g=$(sed -n "/server_name grafana/,/^}/p" <<<"$c"); [[ "$c" == *"map \"\$request_method:\$http_sec_fetch_site\" \$dd_fetch_site"* && "$p" == *"Sec-Fetch-Site \$dd_fetch_site"* && "$g" != *Sec-Fetch-Site* ]] )'
     st "nginx: pihole / -> /admin/"         '( allcfg; c=$(render_nginx | sed -n "/server_name pihole/,/^}/p"); [[ "$c" == *"location = / { return 302 /admin/; }"* ]] )'
     st "nginx: tls upstream + websockets"   '( allcfg; c=$(render_nginx | sed -n "/server_name portainer/,/^}/p"); [[ "$c" == *"proxy_ssl_verify off"* && "$c" == *"Connection \$connection_upgrade"* && "$c" == *"client_max_body_size 0"* ]] )'
@@ -4999,7 +5282,7 @@ self_test() {
     st "meshcentral: agents port -> 443"    '( allcfg; [[ "$(render_app_meshcentral)" == *"\"3000:443\""* ]] )'
     st "gvm override drops host ports"      '( allcfg; c=$(render_app_gvm_override); [[ "$c" == *"ports: !reset []"* && "$c" == *gvm-web* ]] )'
     if (( have_yaml )); then
-        st "all app compose files are YAML" '( allcfg; CFG[APP_FILEBOT]=yes; CFG[FILEBOT_SMB_USER]=u; CFG[FILEBOT_MOUNTS]="volume1=//10.0.0.5/m;output=./o"; for a in pihole portainer monitoring guacamole meshcentral filebot; do "render_app_$a" | python3 -c "import yaml,sys; d=yaml.safe_load(sys.stdin); assert d[\"networks\"][\"dd-proxy\"][\"external\"]" || exit 1; done; render_compose | python3 -c "import yaml,sys; yaml.safe_load(sys.stdin)" )'
+        st "all app compose files are YAML" '( allcfg; CFG[APP_FILEBOT]=yes; CFG[FILEBOT_SMB_USER]=u; CFG[FILEBOT_MOUNTS]="volume1=//10.0.0.5/m;output=./o"; CFG[APP_NETBOOT]=yes; CFG[NETBOOT_SMB_USER]=u; CFG[NETBOOT_MOUNTS]="assets=//10.0.0.5/isos"; for a in pihole portainer monitoring guacamole meshcentral filebot netboot; do "render_app_$a" | python3 -c "import yaml,sys; d=yaml.safe_load(sys.stdin); assert d[\"networks\"][\"dd-proxy\"][\"external\"]" || exit 1; done; render_compose | python3 -c "import yaml,sys; yaml.safe_load(sys.stdin)" )'
     fi
     if (( have_py )); then
         st "services.json valid, apps first" '( allcfg; SVC_GROUP=(Links); SVC_NAME=("A\"b"); SVC_URL=(http://x/); SVC_DESC=(d); render_services_json | python3 -c "import json,sys; d=json.load(sys.stdin); g=d[\"groups\"]; assert g[0][\"name\"]==\"Apps\" and len(g[0][\"items\"])==6 and g[0][\"items\"][2][\"alt\"]==\"http://192.168.0.190:3030/\" and g[1][\"items\"][0][\"name\"]==\"A\\\"b\"" )'
@@ -5008,7 +5291,7 @@ self_test() {
     fi
     st "health targets go via local proxy"  '( allcfg; [[ "$(health_targets | head -1)" == "https://pihole.example.net/	pihole.example.net" ]] )'
     st "dns hosts list"                     '( allcfg; l=$(render_dns_hosts); [[ $(wc -l <<<"$l") == 7 && "$l" == "192.168.0.190 dashboard.example.net"* ]] )'
-    st "host ports per app"                 '( allcfg; [[ "$(app_host_ports pihole | cut -f1 | xargs)" == "53/tcp 53/udp 8081/tcp" && "$(app_host_ports guacamole | cut -f1)" == 8443/tcp ]] )'
+    st "host ports per app"                 '( allcfg; [[ "$(app_host_ports pihole | cut -f1 | xargs)" == "53/tcp 53/udp 8081/tcp 8444/tcp" && "$(app_host_ports guacamole | cut -f1)" == 8443/tcp ]] )'
     st "port parser skips own projects"     '[[ "$(printf "pihole\t0.0.0.0:53->53/udp, 0.0.0.0:80->80/tcp\tpi-hole\npihole2\t0.0.0.0:53->53/udp\tdd-pihole\ndocker-dashboard\t0.0.0.0:80->80/tcp\tdocker-dashboard\n" | docker_ps_port_users 53 udp | xargs)" == pihole ]]'
     st "port parser respects protocol"      '[[ -z "$(printf "x\t0.0.0.0:53->53/udp\tp\n" | docker_ps_port_users 53 tcp)" ]]'
     if command -v openssl >/dev/null 2>&1; then
@@ -5099,7 +5382,8 @@ show_banner() {
     local cfg_state dash="docker not running" mode n=0
     [[ -f "$CONF_FILE" ]] && cfg_state="${G}configured${NC}" || cfg_state="${Y}not configured${NC}"
     if docker_up; then
-        if docker ps -q --filter "name=^${CONTAINER_NAME}$" | grep -q .; then dash="${G}running${NC}"; else dash="${Y}not running${NC}"; fi
+        if ! proxy_on; then dash="${D}off (no proxy)${NC}"
+        elif docker ps -q --filter "name=^${CONTAINER_NAME}$" | grep -q .; then dash="${G}running${NC}$(page_on || echo ' (proxy only)')"; else dash="${Y}not running${NC}"; fi
         n=$(docker ps -q | wc -l)
     fi
     (( DRY_RUN )) && mode="${Y}DRY-RUN${NC}" || mode="${G}LIVE${NC}"
@@ -5186,6 +5470,8 @@ Actions (default: interactive menu)
   --cert-fetch-key           Create (or show) the SSH key used by certificate fetch mode
   --filebot-shares           FileBot: add/remove SMB shares and host folders, set the SMB login, test-mount
   --filebot-add-share 'AS=//server/share[/sub]'   Add one SMB share without the menu (AS: volume1, /volume2, ...)
+  --netboot-shares           netboot.xyz: assets folders and SMB shares, SMB login, test-mount
+  --netboot-add-share 'assets=//server/share[/sub]'   Add one netboot.xyz SMB share without the menu
   --add-site 'N|URL|T|D'     Put a web UI on another machine behind the proxy: name | https://host[:port]/ | title | description
   --change-ip NEW_IP         Point every name, link and Pi-hole record at a new host address, then apply
   --show-secret NAME         Print one stored password (e.g. PIHOLE_PASSWORD)
@@ -5254,6 +5540,8 @@ main() {
             --add-site)        action=addsite; arg=${2:-}; shift ;;
             --filebot-shares)  action=fbshares ;;
             --filebot-add-share) action=fbaddshare; arg=${2:-}; shift ;;
+            --netboot-shares)  action=nbshares ;;
+            --netboot-add-share) action=nbaddshare; arg=${2:-}; shift ;;
             --show-secret)     action=showsecret; arg=${2:-}; shift ;;
             --set-secret)      action=setsecret; arg=${2:-}; shift ;;
             --cert-push-setup) action=certpush; [[ -n "${2:-}" && "${2:-}" != --* ]] && { arg=$2; shift; } ;;
@@ -5323,8 +5611,10 @@ main() {
         certreceive) cert_receive ;;
         changeip)    change_host_ip "$arg" ;;
         addsite)     site_add_cli "$arg" ;;
-        fbshares)    filebot_shares_cli ;;
+        fbshares)    shares_cli filebot ;;
         fbaddshare)  filebot_add_share_cli "$arg" ;;
+        nbshares)    shares_cli netboot ;;
+        nbaddshare)  add_share_cli netboot "$arg" ;;
         showsecret)  ensure_config; show_secret "$arg" ;;
         setsecret)
             ensure_config
