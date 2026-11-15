@@ -7,6 +7,12 @@ All notable changes, newest first. Two components are versioned separately:
 
 Versions follow `MAJOR.MINOR.PATCH`.
 
+## installer v1.0.0 / app v1.0.1 — 2026-11-15 — scan --json fix
+
+### App 1.0.1
+- Fix: `scan --json` printed the "Cloning ..." progress line on stdout ahead of the JSON, so the output
+  wasn't valid JSON. Progress now goes to stderr in JSON mode.
+
 ## installer v1.0.0 / app v1.0.0 — 2026-11-15 — first release
 
 ### Installer 1.0.0
