@@ -7,6 +7,17 @@ All notable changes, newest first. Two components are versioned separately:
 
 Versions follow `MAJOR.MINOR.PATCH`.
 
+## installer v1.0.0 / app v1.0.1 — 2026-11-15 — block exports Gmail would reject
+
+### App 1.0.1
+- **Fix:** export no longer writes filters that Gmail's *Import filters* rejects: no action, no criteria, or criteria
+  over 1,500 characters. One such filter made Gmail refuse the whole file. Export now stops and lists them by row
+  number, and you can export without them (`skip_invalid`), or cancel and go to the "With warnings" view.
+  The response reports exported/skipped counts.
+- The warning now reads "No action — Gmail will reject this".
+- Properties the app doesn't know are counted as actions, so they are never wrongly flagged.
+- 11 unit tests (was 9).
+
 ## installer v1.0.0 / app v1.0.0 — 2026-11-15 — first release
 
 ### Installer 1.0.0
