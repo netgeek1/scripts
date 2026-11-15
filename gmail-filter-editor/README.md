@@ -7,9 +7,7 @@ OAuth or a Google Cloud project; it only reads and writes the XML file.
 It runs as a hardened Docker container, installed and managed by one self-contained, menu-driven installer
 (`gmail-filter-editor-installer.sh`), built on the same pattern as `docker-base-install.sh` and switch-dashboard.
 
-Authors: netgeek1 & Claude (Anthropic)
-
-![Filter list](docs/filters.png)
+Author: netgeek1 & Claude (Anthropic)
 
 - **Import.** Upload `mailFilters.xml` and either **replace** what is loaded or **merge** it in (exact duplicates are
   skipped). A snapshot is taken first.
