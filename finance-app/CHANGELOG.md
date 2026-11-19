@@ -4,6 +4,21 @@ All notable changes to Personal Finance AI and its installer. Format: [Keep a Ch
 
 Author: netgeek1 & Claude (Anthropic)
 
+## [1.2.0] - 2026-11-18
+
+### Changed
+- **Simplifi categories are kept exactly as they are in Simplifi**, including Parent:Child levels: `Kids:Allowance` becomes *Kids › Allowance*. They are no longer translated into built-in categories. Behind the scenes each category still knows which built-in group it behaves like (for example *Bills › Mobile Phone* acts like Phone & Internet), so bill detection and the emergency fund keep working. Allowance is explicitly not a bill.
+- Category names show their full path everywhere (pickers, reports, budgets, assistant tables, CSV export). Pickers list your categories as a tree first, then the built-in ones.
+- Account names are shown on their own. The "· Simplifi: <category>" suffix after the account in the transaction list and "Multiple (Simplifi)" in import history are gone.
+
+### Added
+- **Category management** (Settings → Categories): rename, move under another parent, merge into another category (transactions, rules, budgets and sub-categories move with it), delete unused categories, and add categories under a parent. Renaming a built-in category gives you your own copy with that name; built-in rules use it from then on.
+- Insights → Categories: **Group by parent category** toggle.
+
+### Fixed
+- **Duplicate categories.** One import built a separate category lookup per account type, so a Simplifi category first seen on checking and again on a credit card was created twice. Lookups now go to the database, so a category is created once.
+- A one-time repair on upgrade: duplicate categories are merged (keeping the one in use), imported transactions you haven't categorized by hand go back to their Simplifi category with its hierarchy, and flat categories left unused by the old mapping are removed. Categories you chose yourself are never changed.
+
 ## [1.1.2] - 2026-11-18
 
 ### Fixed
