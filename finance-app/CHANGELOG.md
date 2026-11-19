@@ -4,6 +4,20 @@ All notable changes to Personal Finance AI and its installer. Format: [Keep a Ch
 
 Author: netgeek1 & Claude (Anthropic)
 
+## [1.1.2] - 2026-11-18
+
+### Fixed
+- **Assistant answers were one long run-on sentence.** List-type answers (subscriptions and bills, unusual activity, top merchants/categories, summary, income by source, month comparison, budgets) now show a one-line summary followed by proper tables with totals. Numbers in the tables are covered by the AI grounding check.
+- **Transfers to your own accounts showed up as bills** (e.g. "Transfer To Certificate -0701"). Payees like "Transfer to/from …" and Simplifi categories such as Savings, Investments, Certificates/CDs, Retirement, IRA and 401k are now treated as transfers and left out of spending, bills and subscriptions.
+- **Fuel, pharmacy and grocery purchases were listed as bills** (Wawa, Speedway, CVS). Only housing, utilities, phone/internet, insurance, loans, childcare, taxes and education count as bills. Frequent purchases with varying amounts are treated as habits and not listed.
+- **Bills were split by amount** ("T-mobile ($213.76)"). A merchant is first assessed as a whole, so variable bills stay one line. Splitting is only used for several fixed-price subscription plans from one merchant, and same-price plans billed on different days are split by billing day ("Spotify (billed ~15th)", "Spotify (billed ~22nd)").
+- **Simplifi "Auto Insurance"** was mapped to Transportation; insurance now takes priority.
+- **Raw payee text** such as "Brightspeed 833-692-7773 Nc Brightspeed Xxx-xxx-7773 Nc" is cleaned to "Brightspeed". Payees Simplifi already cleaned are kept exactly as they are.
+- The "Possible subscriptions" list only shows subscription-like candidates, not everyday purchases.
+
+### Changed
+- A one-time data fix runs on upgrade: it tidies raw payee names on imported Simplifi transactions (updating any category rules that referenced them) and re-categorizes imported transactions you haven't set by hand. Categories you chose yourself are never changed.
+
 ## [1.1.1] - 2026-11-18
 
 ### Fixed
