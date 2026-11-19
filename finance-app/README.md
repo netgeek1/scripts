@@ -1,6 +1,6 @@
 # Personal Finance AI
 
-**Author:** netgeek1 & Claude (Anthropic) · **Version:** 1.1.1 · **License:** MIT
+**Author:** netgeek1 & Claude (Anthropic) · **Version:** 1.1.2 · **License:** MIT
 
 A private, self-hosted personal-finance intelligence app. Import read-only bank and credit-card
 statements (PDF, CSV, Excel) for any number of accounts and months; get categorized transactions,
@@ -189,7 +189,7 @@ notice and a toggle).
 cd backend
 pip install -r requirements-dev.txt
 export PFAI_MASTER_KEY=$(python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())") PFAI_ALLOW_HTTP=1
-python -m pytest -q                  # 82 tests: auth, isolation, crypto, parsers, dedupe, analytics, assistant
+python -m pytest -q                  # 84 tests: auth, isolation, crypto, parsers, dedupe, analytics, assistant
 uvicorn app.main:create_app --factory --port 8080
 python ../scripts/e2e_smoke.py http://127.0.0.1:8080 /tmp/shots   # Playwright browser smoke test
 ```
