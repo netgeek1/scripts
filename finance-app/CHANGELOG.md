@@ -4,6 +4,21 @@ All notable changes to Personal Finance AI and its installer. Format: [Keep a Ch
 
 Author: netgeek1 & Claude (Anthropic)
 
+## [1.1.0] - 2026-11-18
+
+### Added (app 1.1.0)
+- **Quicken Simplifi import.** A Simplifi CSV export (`Date,Account,Reviewed,Payee,Category,Exclusion,Amount`) is detected automatically and imported as one file covering every account:
+  - Each row goes to the account named in its `Account` column. Accounts that don't exist yet are listed in an **Accounts in this file** step, where you create each one (name, type guessed from the name, optional last 4), map it to an existing account, or skip it. Commit stays blocked until every account has a decision.
+  - Decisions are remembered: later exports map the same Simplifi account names automatically, and only new accounts are asked about.
+  - `Payee` becomes the merchant name as-is. Simplifi categories are kept: known ones map to the built-in categories (e.g. Restaurants → Dining & Coffee, Paycheck → Salary, Credit Card Payment/Transfer → transfers), and unknown ones become your own custom categories. Your category corrections still take priority on future imports.
+  - `Reviewed` rows are marked **Reviewed (Simplifi)** and `Exclusion` rows are imported but left out of dashboards, budgets and assistant totals. Each can be switched off per import.
+  - De-duplication is per destination account, so overlapping exports only add new rows.
+- Transactions can be excluded/included individually, filtered by exclusion, and show the source app's original category. The CSV export has an `excluded` column.
+- An automatic schema migration upgrades existing 1.0.x databases in place. The SQLite table rebuild runs with foreign keys off outside a transaction, so no transactions are cascade-deleted, and it checks foreign keys afterwards.
+
+### Fixed
+- A stray "null" appeared on some pages (DOM `append()` rendering empty values). Views now use a null-safe helper.
+
 ## [1.0.1] - 2026-11-18
 
 ### Fixed (installer)
