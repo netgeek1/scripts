@@ -1,6 +1,6 @@
 # Personal Finance AI
 
-**Author:** netgeek1 & Claude (Anthropic) · **Version:** 1.0.0 · **License:** MIT
+**Author:** netgeek1 & Claude (Anthropic) · **Version:** 1.0.1 (installer) · 1.0.0 (app) · **License:** MIT
 
 A private, self-hosted personal-finance intelligence app. Import read-only bank and credit-card
 statements (PDF, CSV, Excel) for any number of accounts and months; get categorized transactions,
@@ -41,9 +41,14 @@ The wizard asks for a **TLS mode**:
 
 | Mode | Use when | What happens |
 |------|----------|--------------|
-| `proxy` *(default)* | You already run a reverse proxy (Caddy, Nginx, HAProxy on OPNsense) with your wildcard cert | App listens on `BIND_ADDRESS:HOST_PORT` over HTTP; the proxy serves `https://finance.<your-domain>`. Session cookies are `Secure`, so the app works **only via HTTPS through the proxy**. Set `TRUSTED_PROXIES` to the proxy's IP. |
-| `direct` | No proxy; you have a cert + key on the host | The app serves HTTPS itself; cert and key are mounted read-only. |
+| `proxy` *(default)* | You already run a reverse proxy (Caddy, Nginx, HAProxy on OPNsense) with your wildcard cert | App listens on `BIND_ADDRESS:HOST_PORT` over HTTP; the proxy serves `https://finance.<your-domain>`. Session cookies are `Secure`, so sign-in only works **via HTTPS through the proxy**. Set `TRUSTED_PROXIES` to the proxy's IP. |
+| `direct` | No proxy | The app serves HTTPS itself. Leave `TLS_CERT_FILE`/`TLS_KEY_FILE` empty to get a self-signed cert generated for you (browser warning), or point them at your wildcard cert. Browse with **https://**: plain `http://` to this port gets no reply. |
 | `insecure-http` | LAN testing only | Plain HTTP with non-Secure cookies. Not for real data. |
+
+`BIND_ADDRESS` defaults to `0.0.0.0` (reachable from your LAN). Use `127.0.0.1` only when the reverse proxy runs on the same host.
+
+**Troubleshooting “it doesn't respond”:** `sudo personal-finance-ai --status` prints the exact URL and warns about the usual causes:
+a `127.0.0.1` bind accessed from another machine, `http://` sent to a direct-TLS port, or proxy mode opened without HTTPS.
 
 Then:
 
