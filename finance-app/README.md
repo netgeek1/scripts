@@ -1,6 +1,6 @@
 # Personal Finance AI
 
-**Author:** netgeek1 & Claude (Anthropic) · **Version:** 1.1.0 · **License:** MIT
+**Author:** netgeek1 & Claude (Anthropic) · **Version:** 1.1.1 · **License:** MIT
 
 A private, self-hosted personal-finance intelligence app. Import read-only bank and credit-card
 statements (PDF, CSV, Excel) for any number of accounts and months; get categorized transactions,
@@ -82,7 +82,7 @@ upload → type sniffing & size limits → original encrypted at rest → parse 
 |------|----------|
 | Dashboard | Income, spending, net cash flow, savings rate with prior-month deltas; 12-month income vs spending; category breakdown; budgets; unusual activity; top merchants; recurring payments |
 | Transactions | Full-text search, filters (account, category, type, review state, categorized-by, date and amount ranges), inline category correction, review marking, CSV export |
-| Insights | Net cash-flow trend, year-over-year, month comparison, category & merchant analysis, recurring/subscription detection with price-change flags, unusual activity, downloadable reports |
+| Insights | Net cash-flow trend, year-over-year, month comparison, category & merchant analysis, recurring/subscription detection (per-plan, price-change flags, “likely” and “possible” lists with reasons), unusual activity, downloadable reports |
 | Planning | Monthly budgets with projections, savings goals with required monthly saving, emergency fund (months of essential expenses covered), debt avalanche vs snowball with an extra-payment slider |
 | Assistant | Natural-language questions with calculation steps, data scope and data-quality caveats. It refuses to answer for periods with no data rather than guessing. |
 | Privacy | Export everything (JSON); delete account and all data (crypto-shredded) |
@@ -189,7 +189,7 @@ notice and a toggle).
 cd backend
 pip install -r requirements-dev.txt
 export PFAI_MASTER_KEY=$(python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())") PFAI_ALLOW_HTTP=1
-python -m pytest -q                  # 79 tests: auth, isolation, crypto, parsers, dedupe, analytics, assistant
+python -m pytest -q                  # 82 tests: auth, isolation, crypto, parsers, dedupe, analytics, assistant
 uvicorn app.main:create_app --factory --port 8080
 python ../scripts/e2e_smoke.py http://127.0.0.1:8080 /tmp/shots   # Playwright browser smoke test
 ```
