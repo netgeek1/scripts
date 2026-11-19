@@ -4,6 +4,17 @@ All notable changes to Personal Finance AI and its installer. Format: [Keep a Ch
 
 Author: netgeek1 & Claude (Anthropic)
 
+## [1.0.1] - 2026-11-18
+
+### Fixed (installer)
+- `TLS_MODE=direct` with no certificate configured rendered an empty volume mount (`":/run/tls/cert.pem:ro"`), so the container never started. Direct mode now generates a self-signed certificate (ECDSA P-256, 825 days, SANs for the hostname, FQDN, LAN IP, localhost and 127.0.0.1) in `/etc/personal-finance-ai/tls/`, readable only by root and the service group. The compose file never contains an empty mount.
+- The default `BIND_ADDRESS` was `127.0.0.1`, so the app was unreachable from other machines in every mode. It is now `0.0.0.0`. Choosing `direct` or `insecure-http` in the wizard moves a loopback bind to `0.0.0.0`.
+
+### Added (installer)
+- Status/start output explains the common "no response" causes: a loopback bind, `http://` sent to a direct-TLS port (it gets no reply), and proxy mode opened without HTTPS (sign-in won't stick).
+- Direct mode with your own certificate checks that the service account can read the key and prints the exact `chgrp`/`chmod` fix if it can't.
+- Self-test: no empty TLS mount, LAN-reachable default bind, self-signed generation with SANs (31 checks + 2 payload checks).
+
 ## [1.0.0] - 2026-11-18
 
 ### Added (app)
