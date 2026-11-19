@@ -1,6 +1,6 @@
 # Personal Finance AI
 
-**Author:** netgeek1 & Claude (Anthropic) · **Version:** 1.1.2 · **License:** MIT
+**Author:** netgeek1 & Claude (Anthropic) · **Version:** 1.2.0 · **License:** MIT
 
 A private, self-hosted personal-finance intelligence app. Import read-only bank and credit-card
 statements (PDF, CSV, Excel) for any number of accounts and months; get categorized transactions,
@@ -81,6 +81,7 @@ upload → type sniffing & size limits → original encrypted at rest → parse 
 | Area | Features |
 |------|----------|
 | Dashboard | Income, spending, net cash flow, savings rate with prior-month deltas; 12-month income vs spending; category breakdown; budgets; unusual activity; top merchants; recurring payments |
+| Categories | Your category tree (Simplifi's, mirrored exactly) plus built-ins; rename, move, merge, delete; group reports by parent |
 | Transactions | Full-text search, filters (account, category, type, review state, categorized-by, date and amount ranges), inline category correction, review marking, CSV export |
 | Insights | Net cash-flow trend, year-over-year, month comparison, category & merchant analysis, recurring/subscription detection (per-plan, price-change flags, “likely” and “possible” lists with reasons), unusual activity, downloadable reports |
 | Planning | Monthly budgets with projections, savings goals with required monthly saving, emergency fund (months of essential expenses covered), debt avalanche vs snowball with an extra-payment slider |
@@ -175,7 +176,7 @@ AI is **off by default** and is never needed. Rules handle categorization, and c
 
 | Format | Notes |
 |--------|-------|
-| **Quicken Simplifi CSV export** | `Date,Account,Reviewed,Payee,Category,Exclusion,Amount`. Auto-detected; one file, all accounts. Leave **Import into** on *Simplifi / multi-account export*. Unknown accounts are listed for you to create, map or skip (remembered next time). Simplifi categories, Reviewed and Exclusion flags are kept. There are no statement balances, so these imports show *No balances to reconcile*. |
+| **Quicken Simplifi CSV export** | `Date,Account,Reviewed,Payee,Category,Exclusion,Amount`. Auto-detected; one file, all accounts. Leave **Import into** on *Simplifi / multi-account export*. Unknown accounts are listed for you to create, map or skip (remembered next time). Simplifi categories are kept exactly, including Parent:Child levels (*Kids › Allowance*); Reviewed and Exclusion flags are kept. There are no statement balances, so these imports show *No balances to reconcile*. |
 | CSV / TSV / TXT | Delimiter + header detection; single amount, debit/credit or type (DR/CR) columns; running balance; US/EU number formats; 20 date formats with ambiguity warnings |
 | Excel `.xlsx` | First data-bearing sheet, real date/number cells; `.xlsm`, `.xls` and macro workbooks rejected |
 | PDF (text-based) | Statement period and year inference (incl. Dec→Jan rollover), opening/closing balances, deposit/withdrawal sections, card sign conventions, multi-line descriptions; per-row confidence. Scanned/image PDFs are rejected, not guessed. |
@@ -189,7 +190,7 @@ notice and a toggle).
 cd backend
 pip install -r requirements-dev.txt
 export PFAI_MASTER_KEY=$(python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())") PFAI_ALLOW_HTTP=1
-python -m pytest -q                  # 84 tests: auth, isolation, crypto, parsers, dedupe, analytics, assistant
+python -m pytest -q                  # 91 tests: auth, isolation, crypto, parsers, dedupe, analytics, assistant
 uvicorn app.main:create_app --factory --port 8080
 python ../scripts/e2e_smoke.py http://127.0.0.1:8080 /tmp/shots   # Playwright browser smoke test
 ```
