@@ -1,6 +1,6 @@
 # Personal Finance AI
 
-**Author:** netgeek1 & Claude (Anthropic) · **Version:** 1.0.1 (installer) · 1.0.0 (app) · **License:** MIT
+**Author:** netgeek1 & Claude (Anthropic) · **Version:** 1.1.0 · **License:** MIT
 
 A private, self-hosted personal-finance intelligence app. Import read-only bank and credit-card
 statements (PDF, CSV, Excel) for any number of accounts and months; get categorized transactions,
@@ -56,7 +56,7 @@ Then:
 2. **Close registration:** `sudo personal-finance-ai --registration close` (or menu **A**).
 3. **Back up the vault now:** `sudo personal-finance-ai --backup --portable`. The vault holds the data
    master key; without it, stored statements can't be decrypted.
-4. In the app, go to **Settings → Accounts**, add your accounts (nickname, type, optional last 4 digits), then **Imports → upload**.
+4. **Imports → upload** your Simplifi CSV export. The app asks you to create any accounts it hasn't seen. For individual bank statements, add the account under **Settings → Accounts** first, then pick it under **Import into**.
 
 ## How it works
 
@@ -175,6 +175,7 @@ AI is **off by default** and is never needed. Rules handle categorization, and c
 
 | Format | Notes |
 |--------|-------|
+| **Quicken Simplifi CSV export** | `Date,Account,Reviewed,Payee,Category,Exclusion,Amount`. Auto-detected; one file, all accounts. Leave **Import into** on *Simplifi / multi-account export*. Unknown accounts are listed for you to create, map or skip (remembered next time). Simplifi categories, Reviewed and Exclusion flags are kept. There are no statement balances, so these imports show *No balances to reconcile*. |
 | CSV / TSV / TXT | Delimiter + header detection; single amount, debit/credit or type (DR/CR) columns; running balance; US/EU number formats; 20 date formats with ambiguity warnings |
 | Excel `.xlsx` | First data-bearing sheet, real date/number cells; `.xlsm`, `.xls` and macro workbooks rejected |
 | PDF (text-based) | Statement period and year inference (incl. Dec→Jan rollover), opening/closing balances, deposit/withdrawal sections, card sign conventions, multi-line descriptions; per-row confidence. Scanned/image PDFs are rejected, not guessed. |
@@ -188,7 +189,7 @@ notice and a toggle).
 cd backend
 pip install -r requirements-dev.txt
 export PFAI_MASTER_KEY=$(python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())") PFAI_ALLOW_HTTP=1
-python -m pytest -q                  # 68 tests: auth, isolation, crypto, parsers, dedupe, analytics, assistant
+python -m pytest -q                  # 79 tests: auth, isolation, crypto, parsers, dedupe, analytics, assistant
 uvicorn app.main:create_app --factory --port 8080
 python ../scripts/e2e_smoke.py http://127.0.0.1:8080 /tmp/shots   # Playwright browser smoke test
 ```
