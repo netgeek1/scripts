@@ -4,6 +4,20 @@ All notable changes to Personal Finance AI and its installer. Format: [Keep a Ch
 
 Author: netgeek1 & Claude (Anthropic)
 
+## [1.1.1] - 2026-11-18
+
+### Fixed
+- **Subscriptions were under-detected.** The old rules needed 3+ charges with an identical amount across the whole history, one charge per merchant per cycle, and a category on a short whitelist, so real exports reported only one or two subscriptions. Detection now:
+  - splits a merchant's charges into amount streams, so Apple iCloud $2.99 and Apple Music $10.99 (or several PayPal/Google/Amazon plans) are detected separately;
+  - judges "fixed price" on the last 3 charges, so a price increase (Netflix $15.49 → $17.99) no longer disqualifies it;
+  - recognises subscription-like categories from Simplifi (Streaming, Software, Online Services, Memberships, Music, …) even when they became custom categories;
+  - accepts two identical, correctly spaced charges as a **likely** subscription (labelled as such), useful for short exports;
+  - widens the monthly window to ±5 days (February, billing-date drift) and accepts 60% regular gaps.
+- Variable bills (phone, utilities) no longer show a misleading "price changed" flag; that note is for subscriptions only.
+
+### Added
+- **Possible subscriptions** list (Insights → Recurring) with the reason each one isn't counted yet (e.g. "only one charge in the imported data", "irregular timing") and the imported date range. The assistant reports these too.
+
 ## [1.1.0] - 2026-11-18
 
 ### Added (app 1.1.0)
