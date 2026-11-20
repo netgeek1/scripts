@@ -7,11 +7,19 @@ It also adds optional services that upstream doesn't ship, such as [Audiobookshe
 It **detects** sensible defaults and asks for the rest. From there it:
 
 - installs Docker and creates a dedicated service account
+- lets you pick a **service preset** (Core, Full or Custom) and choose **LAN-only or Internet-facing** access
+- serves HTTPS with a **Let's Encrypt, self-signed or your own (manual)** certificate
 - mounts your media (and optionally app data) from **local disk, SMB/CIFS (Windows/NTFS, Samba, NAS) or NFS**
 - deploys a **pinned** upstream release and keeps secrets **encrypted at rest**
 - brings the stack up and runs the post-install database steps
 
-After installation it handles day-2 operations: settings, apply/update, stop, status, secrets, logs and uninstall.
+After installation it handles day-2 operations:
+
+- settings (menu or `--set`), apply/update, restart and stop
+- status and logs
+- secrets, including re-keying the vault
+- backup/restore (host-bound or portable)
+- uninstall
 
 > Version: see `SCRIPT_VERSION` in the script. History: [CHANGELOG.md](CHANGELOG.md).
 > This is an independent helper, not part of the upstream MediaStack project.
@@ -25,12 +33,16 @@ After installation it handles day-2 operations: settings, apply/update, stop, st
 - [What it detects](#what-it-detects)
 - [Menu and CLI](#menu-and-cli)
 - [Settings reference](#settings-reference)
+- [Access mode and certificates](#access-mode-and-certificates)
+- [Service presets](#service-presets)
 - [Storage: local, SMB, NFS, external](#storage-local-smb-nfs-external)
 - [Services: on / disabled / removed](#services-on--disabled--removed)
-- [Add-on services (Audiobookshelf)](#add-on-services-audiobookshelf)
+- [Add-ons and patched services](#add-ons-and-patched-services)
 - [Secrets](#secrets)
+- [Backup and restore](#backup-and-restore)
 - [Service account](#service-account)
 - [Upstream pinning and upgrades](#upstream-pinning-and-upgrades)
+- [Upgrading from v1.x](#upgrading-from-v1x)
 - [Post-install helpers](#post-install-helpers)
 - [Uninstall](#uninstall)
 - [Files and paths](#files-and-paths)
@@ -45,6 +57,7 @@ After installation it handles day-2 operations: settings, apply/update, stop, st
 |---|---|
 | OS | Ubuntu or Debian (amd64 / arm64) with systemd |
 | Access | root. The script re-runs itself through `sudo` |
+| Docker | Installed from Docker's apt repository when missing. Compose **v2.24.4+** is required (for the `!override` tag) |
 | Network | `download.docker.com`, `github.com`, and the image registries (ghcr.io, lscr.io, docker.io) |
 | Disk | ≥ 20 GiB free for images and app data, plus your media |
 | Optional | TPM2 + systemd ≥ 250 for hardware-bound secret encryption |
@@ -53,15 +66,25 @@ After installation it handles day-2 operations: settings, apply/update, stop, st
 ## Quick start
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/<you>/<repo>/main/mediastack-installer.sh
+curl -fsSLO https://raw.githubusercontent.com/netgeek1/scripts/main/mediastack/mediastack-installer.sh
 chmod +x mediastack-installer.sh
 sudo ./mediastack-installer.sh          # menu -> 1) Full install
 ```
 
-The first run detects what it can, then walks through each settings section: paths, domain/network, media storage,
-app-data storage, service account, services, VPN/email, and upstream/secrets. Each prompt shows the detected or
-current value, so you can press Enter to accept it. It then asks for secrets (VPN, Cloudflare, Tailscale). You can
-skip any of these and set them later in the **Secrets** menu.
+The first run detects what it can, then walks through each settings section:
+
+1. paths
+2. access mode and certificate
+3. domain/network
+4. media storage and app-data storage
+5. service account
+6. service preset, player and Tailscale control server
+7. VPN/email
+8. upstream, secrets and backups
+
+Each prompt shows the detected or current value, so you can press Enter to accept it. The installer then asks only
+for the secrets your selection actually uses. For example, there is no Cloudflare token prompt unless Traefik runs
+with Let's Encrypt. You can skip any of them and set them later in the **Secrets** menu.
 
 Afterwards the installer is also available as `sudo mediastack-installer`.
 
@@ -95,22 +118,24 @@ You can re-run detection any time with **Settings → D**.
 ```
  Setup        1) Full install / reconfigure   2) Settings   3) Secrets
  Operate      4) Apply + pull updates          5) Apply without pulling
-              6) Stop stack                    7) Status
-              8) Post-install helpers          9) Logs
- Maintenance  U) Uninstall...   T) Toggle dry-run   S) Self-test   0) Quit
+              6) Stop stack                    R) Restart containers
+              7) Status                        8) Post-install helpers   9) Logs
+ Maintenance  B) Backup / restore   C) Show settings   U) Uninstall...
+              T) Toggle dry-run     S) Self-test       0) Quit
 ```
 
 **Settings** edits one section at a time. Each line shows the current value:
 
 ```
-   1) Paths             media=/mediastack/media data=/mediastack/appdata
-   2) Domain / network  media.example.org  ip=auto subnet=auto
-   3) Media storage     smb //fileserver/Media
-   4) App-data storage  local
-   5) Service account   mediastack
-   6) Services          disabled: whisparr | removed: readarr
-   7) VPN / email       openvpn / mullvad
-   8) Upstream/secrets  8e908ae60bf4 full-download-vpn mode=vault
+   1) Paths              media=/mediastack/media data=/mediastack/appdata
+   2) Access / certs     internet, certificate=letsencrypt
+   3) Domain / network   media.example.org  ip=auto subnet=auto
+   4) Media storage      smb //fileserver/Media
+   5) App-data storage   local
+   6) Service account    mediastack
+   7) Services           preset=core player=jellyfin tailscale=tailscale
+   8) VPN / email        openvpn / mullvad
+   9) Upstream / secrets / backups  8e908ae60bf4 full-download-vpn mode=vault
    D) Re-run detection   T) Test share mount   V) View all
    W) Save   A) Save + apply   0) Back
 ```
@@ -121,7 +146,15 @@ You can re-run detection any time with **Settings → D**.
 | `--settings` | Settings menu |
 | `--apply` / `--start` | Converge and start, with / without pulling images |
 | `--stop` | `docker compose down` (data kept) |
-| `--status` | Configuration, storage mounts, containers, PostgreSQL readiness |
+| `--restart` | Restart the containers (no converge) |
+| `--status` | Configuration, access/certificate and expiry, storage mounts, dependency problems, containers, PostgreSQL readiness |
+| `--logs [N] [SERVICE]` | Last N container log lines (default 100), all services or one |
+| `--show-config` | Print every setting with its meaning |
+| `--set KEY VALUE` | Change one setting, validated. Presets are re-applied when needed. Follow with `--apply` |
+| `--backup [--portable]` | Back up settings, vault, compose folder and app data (see [Backup and restore](#backup-and-restore)) |
+| `--restore FILE` | Restore a backup (keyword `RESTORE`) |
+| `--passphrase-file FILE` | Portable-backup passphrase (first line). `MS_BACKUP_PASSPHRASE` also works |
+| `--rekey` | Re-encrypt the vault with the configured `SECRETS_BACKEND` |
 | `--test-storage MEDIA\|DATA` | Trial-mount the share; test write and hardlinks as the service account |
 | `--helper NAME` | `authentik-db`, `guacamole`, `akadmin` or `apikeys` |
 | `--secrets` | Secrets menu |
@@ -147,8 +180,11 @@ or by hand followed by **Apply**.
 | `FOLDER_FOR_MEDIA` | `/mediastack/media` | Library + downloads. This is the share mountpoint when remote |
 | `FOLDER_FOR_DATA` | `/mediastack/appdata` | App configs + databases |
 | `FOLDER_FOR_YAML` | `/mediastack/compose` | Compose file, `.env`, templates (always local) |
-| `DOMAIN` | *detected / required* | `auth.<domain>`, `headscale.<domain>`, … |
-| `CLOUDFLARE_DNS_ZONE` / `CLOUDFLARE_EMAIL` | `= DOMAIN` / blank | Traefik DNS-01 |
+| `ACCESS_MODE` | asked | `internet` or `lan` (see [Access mode](#access-mode-and-certificates)) |
+| `CERT_MODE` | `letsencrypt` (internet) / `selfsigned` (lan) | `letsencrypt`, `selfsigned` or `manual` |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | blank | Manual mode: PEM full chain + unencrypted key, re-copied on every apply |
+| `DOMAIN` | *detected / required* (`mediastack.lan` in LAN mode) | `auth.<domain>`, `sonarr.<domain>`, … |
+| `CLOUDFLARE_DNS_ZONE` / `CLOUDFLARE_EMAIL` | `= DOMAIN` / blank | Traefik DNS-01 (Let's Encrypt only) |
 | `LOCAL_DOCKER_IP` / `LOCAL_SUBNET` | `auto` | Or a fixed IPv4 / CIDR |
 | `TIMEZONE` | detected | |
 | `MEDIA_STORAGE` | `local` | `local`, `smb`, `nfs` or `external` |
@@ -161,17 +197,92 @@ or by hand followed by **Apply**.
 | `DATA_REMOTE` / `DATA_NFS_VERSION` / `DATA_MOUNT_OPTS` / `DATA_MOUNT_REQUIRED` | | As above |
 | `SERVICE_USER` / `SERVICE_UID` / `SERVICE_GID` | `mediastack` / auto / auto | Becomes `PUID`/`PGID` |
 | `ADMIN_DOCKER_GROUP` | `no` | `yes` adds your sudo user to `docker` (root-equivalent) |
-| `DISABLED_SERVICES` | `whisparr` | Never started; folders kept |
-| `REMOVED_SERVICES` | `readarr` | Never started; no app-data folder (also applies to add-ons such as `audiobookshelf`) |
+| `SERVICE_PRESET` | `core` | `core`, `full` or `custom` (see [Service presets](#service-presets)) |
+| `PLAYER` | `jellyfin` | `jellyfin`, `plex` or `both` (Core preset) |
+| `TAILSCALE_CONTROL` | `tailscale` | `tailscale` (official service) or `headscale` (self-hosted, upstream's setup) |
+| `DISABLED_SERVICES` | from preset | Never started; folders kept. Editing it switches the preset to `custom` |
+| `REMOVED_SERVICES` | `readarr` | Never started; no app-data folder (also applies to add-ons) |
 | `VPN_TYPE` / `VPN_SERVICE_PROVIDER` / `SERVER_REGIONS` | `openvpn` / `custom` / blank | Gluetun provider names |
 | `EMAIL_SERVER_HOST` / `_PORT` / `EMAIL_ADDRESS` / `EMAIL_SENDER` | blank / `587` | Authentik email |
 | `UPSTREAM_REPO` / `UPSTREAM_REF` / `UPSTREAM_VARIANT` | `geekau/mediastack` / pinned SHA / `full-download-vpn` | |
 | `SECRETS_MODE` / `SECRETS_BACKEND` | `vault` / `auto` | See [Secrets](#secrets) |
 | `CHOWN_MEDIA_RECURSIVE` | `no` | Re-own the whole library on every apply |
 | `EXTRA_PACKAGES` | blank | apt packages to add |
+| `BACKUP_DIR` / `BACKUP_KEEP` | `/var/backups/mediastack` / `5` | Where backups go, and how many are kept |
+| `BACKUP_FORMAT` | `host` | `host` or `portable` (default for `--backup`) |
+| `BACKUP_PASSPHRASE_FILE` | blank | File whose first line is the portable-backup passphrase (for scheduled backups) |
+| `BACKUP_STOP_STACK` | `yes` | Stop containers while archiving so databases are consistent |
+
+`--show-config` prints every key with its current value and meaning. `--set KEY VALUE` changes one key with the same
+validation the menu uses.
 
 Other `.env` values (ports, Docker subnet, Authentik version, …) are upstream's. Edit `.env` directly. The installer
 rewrites only the keys it manages, and it appends keys that newer upstream releases introduce.
+
+---
+
+## Access mode and certificates
+
+| | `internet` | `lan` |
+|---|---|---|
+| Reached as | `https://<app>.<domain>` through Traefik, plus each app's own port | `http://<host-ip>:<port>` for each app |
+| Core preset adds | Traefik, Authentik + worker, CrowdSec, PostgreSQL, Valkey, traefik-certs-dumper | none of these (enable any of them in Custom) |
+| Needs | DNS for `*.<domain>` pointing at you, port 443 forwarded | nothing outside your LAN |
+| Default certificate | `letsencrypt` | `selfsigned` |
+
+The certificate source applies whenever Traefik runs, in either mode:
+
+- **`letsencrypt`** is upstream's behaviour: a wildcard for `<domain>` and `*.<domain>` via Cloudflare DNS-01. It
+  needs `CLOUDFLARE_DNS_API_TOKEN`. DNS-01 also works for a LAN-only host if the domain is on Cloudflare.
+- **`selfsigned`**: the installer creates a local CA in `/etc/mediastack/tls/` (EC P-384, 10 years) and issues a
+  leaf for `<domain>`, `*.<domain>` and the host IP (EC P-256, 397 days).
+  - The leaf is renewed automatically 30 days before expiry, or when the domain or IP changes.
+  - **Import `ca.crt` once on each device** and every app hostname is trusted.
+  - Point `*.<domain>` at the host in your local DNS (for example Pi-hole or your router).
+- **`manual`**: give the paths of your own full-chain certificate and unencrypted key, for example files that
+  acme.sh renews.
+  - Each apply checks that the key matches, the certificate hasn't expired (warns inside 14 days) and it covers
+    `*.<domain>`, then copies it into Traefik.
+  - When your renewal job replaces the files, run **Apply** (or `--start`).
+
+In `selfsigned` and `manual` modes the installer rewires Traefik's config:
+
+- It removes the ACME resolver and points the TLS store, which upstream keeps `sniStrict`, at
+  `/etc/traefik/certs/cert.pem`.
+- It parks `traefik-certs-dumper` automatically. That container only reads Let's Encrypt's `acme.json`, and it shows
+  as `auto-off` in the services list.
+
+---
+
+## Service presets
+
+| Preset | Services on |
+|---|---|
+| **core** (default) | Gluetun, qBittorrent, SABnzbd, Prowlarr, FlareSolverr, Unpackerr, Sonarr, Radarr, Lidarr, Bazarr, Seerr, Homepage, **Tailscale**, Audiobookshelf + your **player** (Jellyfin, Plex or both). In `internet` mode, also Traefik, Authentik, CrowdSec, PostgreSQL, Valkey and traefik-certs-dumper. With `TAILSCALE_CONTROL=headscale`, also Headscale and Headplane |
+| **full** | Every upstream service except Whisparr (disabled), plus add-ons |
+| **custom** | Whatever you choose in the numbered list (a new install starts from Core) |
+
+Readarr is always removed: the project was retired upstream. Everything that is off stays one keypress away in
+**Settings → Services**.
+
+Before anything starts, the installer checks the dependencies of every enabled service:
+
+- upstream's `depends_on` and `network_mode: service:…` links
+- Traefik's need for CrowdSec and Authentik (its middlewares)
+- Tailscale's need for Headscale when it is the control server
+
+If something is missing it names the pair (for example `qbittorrent needs gluetun`) instead of letting Compose fail
+later.
+
+**Tailscale control server.** Upstream's Tailscale container logs in to *your own* Headscale at
+`https://headscale.<domain>`, which needs Traefik and a public domain.
+
+- **`TAILSCALE_CONTROL=tailscale`** (default for new installs) uses the official service instead, so it also works
+  LAN-only.
+  - Create a reusable auth key in the Tailscale admin console.
+  - Approve the advertised subnet routes and exit node there.
+- **`headscale`** keeps upstream's setup and enables Headscale and Headplane. Create the key with
+  `docker exec headscale headscale preauthkeys create --user <user> --reusable` once Headscale runs.
 
 ---
 
@@ -239,7 +350,7 @@ is unreliable. NFS works. Local disk is best.
 
 ## Services: on / disabled / removed
 
-**Settings → 6** lists every service in the selected compose variant. You cycle a service through three states by
+**Settings → 7** (Custom preset) lists every service in the selected compose variant. You cycle a service through three states by
 entering its number:
 
 | State | Effect |
@@ -258,16 +369,39 @@ already keep your own override file, the installer leaves it alone and tells you
 
 Add-ons are marked `+` in the list and use the same three states.
 
-Disabling core services (gluetun, postgresql, valkey, traefik, authentik) is allowed but warned about. Other
-services depend on them. Unpackerr and some dashboards still reference removed apps and will log harmless
-connection errors.
+The dependency check warns as you toggle, and **refuses to apply** while an enabled service needs a disabled one.
+Unpackerr and some dashboards still reference removed apps and will log harmless connection errors.
 
 ---
 
-## Add-on services (Audiobookshelf)
+## Add-ons and patched services
 
-Add-ons are services this installer adds on top of upstream. They are defined in the managed
-`docker-compose.override.yaml`, so the upstream compose file stays untouched. **Audiobookshelf** is on by default:
+Everything the installer adds or changes lives in the managed `docker-compose.override.yaml`. The upstream compose
+file stays untouched.
+
+### Homarr 1.x (homarr-labs)
+
+Upstream still ships the legacy `ghcr.io/ajnart/homarr` (0.x) image. The installer replaces it with
+**`ghcr.io/homarr-labs/homarr:latest`**:
+
+- **Image and port:** the homarr-labs image, on the same `WEBUI_PORT_HOMARR` → 7575.
+- **Mounts:** only `/appdata` (`<FOLDER_FOR_DATA>/homarr/appdata`) and a **read-only** Docker socket. `volumes: !override`
+  drops the old 0.x mounts.
+- **Encryption key:** a `SECRET_ENCRYPTION_KEY` (64 hex characters) is generated once into the vault and injected at
+  runtime.
+- **Not migrated:** existing 0.x boards in `homarr/configs` are left untouched. Recreate them in 1.x, or follow
+  Homarr's migration guide.
+
+Homarr is off in the Core preset and on in Full.
+
+### Tailscale
+
+With `TAILSCALE_CONTROL=tailscale`, only `TS_EXTRA_ARGS` is overridden: the same exit node and routes, without
+`--login-server`.
+
+### Audiobookshelf (add-on)
+
+**Audiobookshelf** is on in Core and Full:
 
 | | |
 |---|---|
@@ -294,7 +428,10 @@ Secrets live encrypted in `/etc/mediastack/secrets.enc`. They are never logged a
 - **Prompted:** VPN credentials, Cloudflare token, Tailscale key, SMTP password, Plex claim, and the WireGuard keys
   when `VPN_TYPE=wireguard`.
 - **Collected from Settings:** SMB username and password for the media share.
-- **Generated once and reused:** the PostgreSQL password, Authentik secret key and headplane cookie secret.
+- **Generated once and reused:** the PostgreSQL password, Authentik secret key, headplane cookie secret and Homarr's
+  `SECRET_ENCRYPTION_KEY`.
+- **Asked for only when used:** for example, the Cloudflare token only when Traefik runs with Let's Encrypt, and
+  `PLEX_CLAIM` only when Plex is on.
 - **Collected by a helper:** *ARR API tokens.
 
 | Backend | When | Protection |
@@ -307,11 +444,47 @@ Secrets live encrypted in `/etc/mediastack/secrets.enc`. They are never logged a
 | `vault` (default) | Secrets stay out of `.env` and are injected into the `docker compose` process at runtime. Plain `docker compose` in the folder fails validation, so use the wrappers or `--compose` |
 | `env` | Secrets are written to `.env` (0600 root) for compatibility with plain `docker compose` and the upstream scripts |
 
-> **Back up your secrets** with **Secrets → Export**. A TPM-bound vault cannot be read after an OS reinstall.
-> **Secrets → Import** restores them.
+> **Back up your secrets.** A TPM-bound vault cannot be read after an OS reinstall. A **portable backup**
+> (`--backup --portable`) carries them safely. **Secrets → Export / Import** still works for plaintext key=value
+> backups. After changing `SECRETS_BACKEND`, run `--rekey`.
 
 The vault protects secrets at rest and in stray copies. It does not protect against root on a running host, since
 `docker inspect` shows container environments.
+
+---
+
+## Backup and restore
+
+| | `host` (default) | `portable` |
+|---|---|---|
+| Command | `--backup` | `--backup --portable` (or `BACKUP_FORMAT=portable`) |
+| File | `mediastack-YYYYMMDD-HHMMSS.tar.gz` (0600) | `mediastack-YYYYMMDD-HHMMSS.msbak` (0600) |
+| Contains | `/etc/mediastack` (settings, vault **and its key**, TLS CA, SMB credentials), compose folder, app data | settings, **decrypted** secrets, TLS CA, compose folder and app data, all inside one archive encrypted with your passphrase (AES-256-CBC, PBKDF2-SHA256 × 600,000) |
+| Restores on | this host (a `systemd-creds`/TPM vault cannot leave it) | **any** host |
+
+- **Media is never included.** Plex and Jellyfin caches and transcodes are skipped.
+- With `BACKUP_STOP_STACK=yes`, containers are stopped while archiving, so PostgreSQL and the SQLite databases are
+  consistent. They start again afterwards, even on failure.
+- The newest `BACKUP_KEEP` backups are kept.
+
+**Restore** with `--restore FILE` (or **Backup / restore → 4**, keyword `RESTORE`). `FILE` may be a path, a name in
+`BACKUP_DIR`, or a file next to the installer. Restore:
+
+1. stops the stack
+2. moves the current folders aside as `*.pre-restore-<timestamp>` (mountpoints are restored over in place)
+3. extracts the archive
+4. re-creates the service account if needed, and applies
+
+A **portable** restore onto a **fresh host** adopts the backup's settings and resets the host-specific ones:
+
+- the UID/GID become auto, `SECRETS_BACKEND` becomes auto, and a foreign fixed IP becomes auto
+- the vault is re-encrypted with this host's backend
+- Docker is installed if missing
+
+A wrong passphrase or a damaged file is detected before anything changes. Archives that contain `..` paths, or paths
+outside the MediaStack folders, are refused.
+
+For scheduled portable backups, use `BACKUP_PASSPHRASE_FILE` (0600) or `--passphrase-file`.
 
 ---
 
@@ -339,12 +512,26 @@ PostgreSQL's folder is excluded from the `2775` pass. Seerr's folder is owned by
 
 - `UPSTREAM_REF` defaults to a tested commit SHA. Each SHA is downloaded once and cached. If the tarball download
   is blocked, the installer falls back to `git clone`.
-- **To upgrade,** set a new SHA (Settings → 8, or `--ref <sha>`), then run **Apply + pull**:
+- **To upgrade,** set a new SHA (Settings → 9, or `--ref <sha>`), then run **Apply + pull**:
   - Upstream working files are refreshed.
   - Previous versions are saved in `<compose>/.backup/<timestamp>/`. Re-apply any hand edits from there.
   - `.env` is preserved, and new upstream keys are appended.
 - A branch or tag name works too, but it is re-downloaded on every run and you get a warning.
 - If upstream's folder layout changes, you get a warning that the installer needs updating.
+
+## Upgrading from v1.x
+
+Run v2.0.0 once with **Apply** (or `--install`, answering *no* to "review every section"). An existing
+`/etc/mediastack/mediastack.conf` keeps its behaviour, because settings it doesn't contain get their old values:
+
+- `ACCESS_MODE=internet` and `CERT_MODE=letsencrypt`
+- `SERVICE_PRESET=custom`, so your disabled/removed lists are untouched
+- `TAILSCALE_CONTROL=headscale` (upstream's login server) and `PLAYER=both`
+
+**What does change: Homarr moves to homarr-labs (1.x)** if you run it. Its new data lives in `homarr/appdata`, and
+0.x boards are not migrated. To keep the legacy image instead, set Homarr to `removed` and run your own override.
+
+Make a backup first: `--backup`.
 
 ## Post-install helpers
 
@@ -377,6 +564,9 @@ password**.
 /etc/mediastack/secrets.enc              encrypted vault
 /etc/mediastack/.secrets.key             openssl backend key (0400)
 /etc/mediastack/media.smbcred            SMB credentials for mount.cifs (0600, regenerated from vault)
+/etc/mediastack/tls/ca.{crt,key}         local CA for CERT_MODE=selfsigned (import ca.crt on devices)
+<FOLDER_FOR_DATA>/traefik/certs/         certificate Traefik serves in selfsigned/manual mode
+/var/backups/mediastack/                 backups (BACKUP_DIR)
 /etc/fstab                               '# mediastack-installer:MEDIA|DATA' entries
 /etc/systemd/system/docker.service.d/mediastack-mounts.conf
 /var/lib/mediastack-installer/           upstream cache, deployed ref/domain/IP state
@@ -392,11 +582,15 @@ password**.
   all volumes, networks and images. The installer's apply is scoped to the `mediastack` project.
 - `VPN_SERVICE_PROVIDER=custom` also needs `OPENVPN_CUSTOM_CONFIG` in `.env` (see the Gluetun docs).
 - A `PLEX_CLAIM` token expires about 4 minutes after you request it, and Plex only uses it on first start.
+- Upstream's `.env` defines `WEBUI_PORT_HUNTARR`, but upstream has no Huntarr service. It is harmless.
+- Upstream hard-codes the CrowdSec bouncer key (`crowdsecLapiKey`) in `traefik-dynamic.yaml`. If you expose Traefik
+  to the Internet, replace it with a key from `docker exec crowdsec cscli bouncers add traefik` and register the same
+  key in CrowdSec.
 
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 34 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 53 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
@@ -406,8 +600,22 @@ The self-test covers:
 - folder layout drift, override rendering (including add-ons in each state) and the service-state cycle
 - SMB/NFS remote validation and normalisation
 - fstab line rendering and fstab edit/remove
-- config migration and an encrypted vault round-trip
+- config migration (v1.0 names and v1.x → v2 defaults) and an encrypted vault round-trip
+- presets for both access modes and both Tailscale control servers, the dependency check, and the Homarr/Tailscale
+  patches
+- automatic parking of traefik-certs-dumper
+- Traefik ACME removal and the file certificate
+- the local CA and leaf (SANs, chain, renewal triggers) and the manual cert/key match check
+- portable-backup encryption and `--set` validation
 
-Development testing also ran full install, re-apply, dry-run, upgrade, migration, storage transitions
-(local ↔ SMB ↔ NFS ↔ external), failure paths and uninstall against the real upstream compose file. Mounts and
-containers were simulated, so test a real share with **Settings → T** before the first apply.
+Development testing ran these scenarios against the real upstream compose file, validated with `docker compose config`:
+
+- LAN Core, Internet Core and Full installs, all with no dependency errors
+- the resolved Homarr (`!override`) and Tailscale (env merge) services
+- self-signed, manual and Let's Encrypt certificates
+- re-apply idempotency and `--set` / `--restart` / `--logs`
+- host backup/restore, and portable backup/restore onto a fresh host
+- the v1.2.0 → v2.0.0 config upgrade and the interactive wizard
+- storage transitions (local ↔ SMB ↔ NFS ↔ external)
+
+Mounts and containers were simulated, so test a real share with **Settings → T** before the first apply.
