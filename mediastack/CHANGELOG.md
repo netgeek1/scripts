@@ -3,6 +3,15 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.0.1 — 2026-11-19 — Preflight fix
+
+### Fixed
+- On a host without Docker yet, the preflight Compose version check called the missing `docker` command. This
+  printed two `[FAIL] rc=127 ... sed 's/^v//'` lines and a warning with an empty version. The check now reports
+  "Docker is not installed yet; it is installed after the settings" and only compares versions when Docker exists.
+  The install itself was not affected.
+- Self-test: 54 checks (version check with no Docker on PATH).
+
 ## v2.0.0 — 2026-11-19 — Presets, access modes, certificates, Homarr 1.x, standard CLI
 
 ### Breaking
