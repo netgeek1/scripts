@@ -6,22 +6,26 @@
 #  Version   : SCRIPT_VERSION below is the authoritative version string
 #  Changelog : CHANGELOG.md (per-version history)
 #  Docs      : README.md
-#  Author    : netgeek1 (Claude.ai)
+#  Author    : netgeek1 & Claude (Anthropic)
 #
 #  Usage     : sudo ./mediastack-installer.sh              interactive menu
 #              sudo ./mediastack-installer.sh --install    full install / reconfigure
 #              sudo ./mediastack-installer.sh --help       all CLI flags
 #
-#  Requires  : bash 4.4+, Ubuntu or Debian (amd64/arm64), root (re-execs via sudo)
-#  License   : see LICENSE in the repository
+#  Requires  : bash 4.4+, Ubuntu or Debian (amd64/arm64), root (re-execs via sudo),
+#              Docker Compose v2.24.4+ (installed/updated from Docker's repository when missing)
+#              MediaStack itself is upstream's compose project; nothing else is embedded here.
+#  License   : MIT
 # =============================================================================
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+readonly SCRIPT_DIR
 
 # -----------------------------------------------------------------------------
 # PATHS (overridable via environment for testing; normal use leaves these alone)
@@ -59,6 +63,9 @@ MEDIA_SUBDIRS=( media/{anime,audio,books,comics,movies,music,photos,tv,xxx}
                 torrents/{anime,audio,books,comics,complete,console,incomplete,movies,music,prowlarr,software,tv,xxx}
                 watch filebot/{input,output} )
 
+# Folders for installer-patched upstream services (not in upstream restart.sh)
+EXTRA_DATA_SUBDIRS=( homarr/appdata )
+
 # App config files upstream restart.sh copies from the YAML folder into app data
 # (source in FOLDER_FOR_YAML : destination relative to FOLDER_FOR_DATA).
 APP_CONFIG_MAP=( "headplane-config.yaml:headplane/config.yaml"
@@ -89,7 +96,12 @@ CONF_KEYS=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA FOLDER_FOR_YAML DOMAIN CLOUDFLARE_D
             EMAIL_SENDER DISABLED_SERVICES REMOVED_SERVICES UPSTREAM_REPO UPSTREAM_REF UPSTREAM_VARIANT
             EXTRA_PACKAGES CHOWN_MEDIA_RECURSIVE SECRETS_MODE SECRETS_BACKEND
             MEDIA_STORAGE MEDIA_REMOTE MEDIA_SMB_DOMAIN MEDIA_SMB_VERSION MEDIA_NFS_VERSION MEDIA_MOUNT_OPTS
-            MEDIA_MOUNT_REQUIRED DATA_STORAGE DATA_REMOTE DATA_NFS_VERSION DATA_MOUNT_OPTS DATA_MOUNT_REQUIRED )
+            MEDIA_MOUNT_REQUIRED DATA_STORAGE DATA_REMOTE DATA_NFS_VERSION DATA_MOUNT_OPTS DATA_MOUNT_REQUIRED
+            ACCESS_MODE CERT_MODE TLS_CERT_FILE TLS_KEY_FILE SERVICE_PRESET PLAYER TAILSCALE_CONTROL
+            BACKUP_DIR BACKUP_KEEP BACKUP_FORMAT BACKUP_PASSPHRASE_FILE BACKUP_STOP_STACK )
+# Settings that did not exist before v2.0.0: an existing config without them keeps its old behaviour
+declare -A CONF_LEGACY=( [ACCESS_MODE]=internet [CERT_MODE]=letsencrypt [SERVICE_PRESET]=custom
+                         [TAILSCALE_CONTROL]=headscale [PLAYER]=both )
 declare -A CFG=()
 
 # .env keys driven from CFG on every apply
@@ -103,13 +115,13 @@ ENV_MANAGED=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA TIMEZONE LOCAL_SUBNET LOCAL_DOCKE
 SECRET_KEYS=( VPN_USERNAME VPN_PASSWORD PLEX_CLAIM CLOUDFLARE_DNS_API_TOKEN EMAIL_PASSWORD TAILSCALE_AUTHKEY
               WIREGUARD_PRIVATE_KEY WIREGUARD_PRESHARED_KEY POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY
               HEADPLANE_COOKIE_SECRET SONARR_API_TOKEN RADARR_API_TOKEN LIDARR_API_TOKEN READARR_API_TOKEN
-              WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD )
+              WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD SECRET_ENCRYPTION_KEY )
 # Vault entries that are not .env variables
 SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD )
 SECRET_PROMPTED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY EMAIL_PASSWORD PLEX_CLAIM )
 SECRET_WIREGUARD=( WIREGUARD_PRIVATE_KEY WIREGUARD_PRESHARED_KEY )
 SECRET_REQUIRED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY )   # compose :?err
-SECRET_GENERATED=( POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY HEADPLANE_COOKIE_SECRET )
+SECRET_GENERATED=( POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY HEADPLANE_COOKIE_SECRET SECRET_ENCRYPTION_KEY )
 readonly SECRET_UNSET="not-set"
 declare -A SECRETS=()
 SECRETS_LOADED=0
@@ -364,6 +376,18 @@ set_default_config() {
         [DATA_NFS_VERSION]="auto"
         [DATA_MOUNT_OPTS]=""
         [DATA_MOUNT_REQUIRED]="yes"
+        [ACCESS_MODE]="internet"
+        [CERT_MODE]="letsencrypt"
+        [TLS_CERT_FILE]=""
+        [TLS_KEY_FILE]=""
+        [SERVICE_PRESET]="core"
+        [PLAYER]="jellyfin"
+        [TAILSCALE_CONTROL]="tailscale"
+        [BACKUP_DIR]="/var/backups/mediastack"
+        [BACKUP_KEEP]="5"
+        [BACKUP_FORMAT]="host"
+        [BACKUP_PASSPHRASE_FILE]=""
+        [BACKUP_STOP_STACK]="yes"
     )
 }
 
@@ -371,9 +395,11 @@ load_config() {
     set_default_config
     if [[ -f "$CONF_FILE" ]]; then
         local line k v legacy_excl="" have_disabled=0
+        local -A seen=()
         while IFS= read -r line || [[ -n "$line" ]]; do
             [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
             k=${BASH_REMATCH[1]}; v=${BASH_REMATCH[2]}
+            seen[$k]=1
             [[ "$k" == EXCLUDE_SERVICES ]] && legacy_excl=$(conf_unquote "$v")   # v1.0.0 name
             [[ "$k" == DISABLED_SERVICES ]] && have_disabled=1
             in_list "$k" "${CONF_KEYS[@]}" || continue
@@ -382,6 +408,7 @@ load_config() {
         if (( ! have_disabled )) && [[ -n "$legacy_excl" ]]; then
             CFG[DISABLED_SERVICES]=$( { list_words "$legacy_excl" | grep -vxF -f <(list_words "${CFG[REMOVED_SERVICES]}") || true; } | xargs)
         fi
+        for k in "${!CONF_LEGACY[@]}"; do [[ -n "${seen[$k]:-}" ]] || CFG[$k]=${CONF_LEGACY[$k]}; done
     fi
     [[ -n "$REF_OVERRIDE" ]] && CFG[UPSTREAM_REF]=$REF_OVERRIDE
     [[ -z "${CFG[CLOUDFLARE_DNS_ZONE]}" ]] && CFG[CLOUDFLARE_DNS_ZONE]=${CFG[DOMAIN]}
@@ -510,6 +537,19 @@ save_secrets() {
 
 secret_is_set() { local v=${SECRETS[$1]:-}; [[ -n "$v" && "$v" != "$SECRET_UNSET" ]]; }
 
+# secret_needed KEY -- does the current selection of services actually use this secret?
+secret_needed() {
+    case "$1" in
+        VPN_USERNAME|VPN_PASSWORD) svc_enabled gluetun ;;
+        WIREGUARD_PRIVATE_KEY|WIREGUARD_PRESHARED_KEY) svc_enabled gluetun && [[ "${CFG[VPN_TYPE]}" == wireguard ]] ;;
+        CLOUDFLARE_DNS_API_TOKEN) svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == letsencrypt ]] ;;
+        TAILSCALE_AUTHKEY) svc_enabled tailscale ;;
+        PLEX_CLAIM) svc_enabled plex ;;
+        EMAIL_PASSWORD) svc_enabled authentik && [[ -n "${CFG[EMAIL_SERVER_HOST]}" ]] ;;
+        *) return 0 ;;
+    esac
+}
+
 # looks_placeholder KEY VALUE  -- true for upstream sample values
 looks_placeholder() {
     local k=$1 v=$2 up=""
@@ -563,6 +603,7 @@ secrets_init() {
                 POSTGRESQL_PASSWORD)     SECRETS[$k]=$(gen_hex 24) ;;
                 AUTHENTIK_SECRET_KEY)    SECRETS[$k]=$(gen_hex 48) ;;
                 HEADPLANE_COOKIE_SECRET) SECRETS[$k]=$(gen_hex 16) ;;
+                SECRET_ENCRYPTION_KEY)   SECRETS[$k]=$(gen_hex 32) ;;   # Homarr 1.x: 64 hex chars
             esac
             log_ok "Generated $k (stored once; reused on every run)"; changed=1
         fi
@@ -571,7 +612,15 @@ secrets_init() {
     [[ "${CFG[VPN_TYPE]}" == wireguard ]] && prompt_keys+=("${SECRET_WIREGUARD[@]}")
     for k in "${prompt_keys[@]}"; do
         secret_is_set "$k" && continue
+        secret_needed "$k" || continue
         [[ "$k" == PLEX_CLAIM ]] && log_info "PLEX_CLAIM: get one at https://plex.tv/claim (valid ~4 minutes, first Plex start only)."
+        if [[ "$k" == TAILSCALE_AUTHKEY ]]; then
+            if [[ "${CFG[TAILSCALE_CONTROL]}" == headscale ]]; then
+                log_info "TAILSCALE_AUTHKEY: after Headscale runs, create one with: docker exec headscale headscale preauthkeys create --user <user> --reusable"
+            else
+                log_info "TAILSCALE_AUTHKEY: create a reusable key at https://login.tailscale.com/admin/settings/keys"
+            fi
+        fi
         ask_secret v "$k (Enter to skip)"
         if [[ -n "$v" ]]; then SECRETS[$k]=$v; changed=1; fi
     done
@@ -579,7 +628,9 @@ secrets_init() {
         if ! secret_is_set "$k"; then
             [[ "${SECRETS[$k]:-}" == "$SECRET_UNSET" ]] || changed=1
             SECRETS[$k]=$SECRET_UNSET
-            log_warn "$k is not set (placeholder '$SECRET_UNSET' used so compose validates). Set it via the Secrets menu."
+            if secret_needed "$k"; then
+                log_warn "$k is not set (placeholder '$SECRET_UNSET' used so compose validates). Set it via the Secrets menu."
+            fi
         fi
     done
     (( changed )) && save_secrets
@@ -741,6 +792,14 @@ preflight() {
     avail=$(df -Pk "$parent" | awk 'NR==2 {print int($4/1024/1024)}')
     (( avail >= 20 )) || log_warn "Only ${avail} GiB free under $parent; images alone need ~15 GiB."
     log_ok "Free space under $parent: ${avail} GiB"
+    compose_version_ok || log_warn "Docker Compose $(compose_version) is older than v2.24.4 (needed for '!override'); it is updated with Docker below."
+}
+
+compose_version() { docker compose version --short 2>/dev/null | sed 's/^v//'; }
+compose_version_ok() {   # true when Compose understands the !override YAML tag (v2.24.4+)
+    local v; v=$(compose_version)
+    [[ -n "$v" ]] || return 1
+    [[ "$(printf '%s\n%s\n' 2.24.4 "$v" | sort -V | head -n1)" == 2.24.4 ]]
 }
 
 install_docker() {
@@ -778,6 +837,11 @@ install_docker() {
         log_ok "Extra packages present: ${extra[*]}"
     fi
     (( DRY_RUN )) || docker_up || die "Docker daemon is not running (systemctl status docker)."
+    if ! (( DRY_RUN )) && ! compose_version_ok; then
+        log_warn "Docker Compose $(compose_version) is too old for this installer; updating docker-compose-plugin"
+        run_logged apt-get install -y --only-upgrade docker-compose-plugin || true
+        compose_version_ok || die "Docker Compose v2.24.4+ is required (have $(compose_version)). Install it from Docker's repository."
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -797,11 +861,11 @@ ensure_service_account() {
         run useradd "${uargs[@]}" --gid "$u" "$u"
         log_ok "Created system account '$u' (nologin, no home, not in docker group)"
     fi
-    if id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    if has_line docker "$(id -nG "$u" 2>/dev/null | tr " " "\n")"; then
         log_warn "'$u' is in the docker group (root-equivalent). It does not need to be; consider: gpasswd -d $u docker"
     fi
     if [[ "${CFG[ADMIN_DOCKER_GROUP]}" == yes && "$REAL_USER" != root ]]; then
-        if id -nG "$REAL_USER" | tr ' ' '\n' | grep -qx docker; then
+        if has_line docker "$(id -nG "$REAL_USER" 2>/dev/null | tr " " "\n")"; then
             log_ok "Admin '$REAL_USER' already in docker group"
         else
             run usermod -aG docker "$REAL_USER"
@@ -1027,12 +1091,13 @@ readonly OVERRIDE_MARKER="# managed-by: mediastack-installer"
 list_words() { local -a a; read -ra a <<<"${1//,/ }"; (( ${#a[@]} )) && printf '%s\n' "${a[@]}"; return 0; }
 disabled_services() { list_words "${CFG[DISABLED_SERVICES]:-}"; }
 removed_services()  { list_words "${CFG[REMOVED_SERVICES]:-}"; }
-excluded_services() { { disabled_services; removed_services; } | awk 'NF && !seen[$0]++'; }
-is_removed()  { removed_services | grep -qx -- "$1"; }
+# NB: "producer | grep -q" can die of SIGPIPE under pipefail; match against captured output instead
+has_line() { grep -qx -- "$1" <<<"$2"; }
+is_removed()  { has_line "$1" "$(removed_services)"; }
 
-svc_state() {
-    if removed_services | grep -qx -- "$1"; then echo removed
-    elif disabled_services | grep -qx -- "$1"; then echo disabled
+svc_state() {   # stored state: on | disabled | removed
+    if has_line "$1" "$(removed_services)"; then echo removed
+    elif has_line "$1" "$(disabled_services)"; then echo disabled
     else echo on; fi
 }
 
@@ -1051,11 +1116,117 @@ compose_services_list() {   # FILE -> service names under services:
          s && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ {sub(/^  /, ""); sub(/:.*/, ""); print}' "$1"
 }
 
-render_addon() {   # render_addon NAME -> compose service YAML (2-space indented)
+# forced_off -- services parked automatically because of other settings (never stored)
+forced_off() {
+    [[ "${CFG[CERT_MODE]:-letsencrypt}" != letsencrypt ]] && printf '%s\n' traefik-certs-dumper   # only reads acme.json
+    return 0
+}
+excluded_services() { { disabled_services; removed_services; forced_off; } | awk 'NF && !seen[$0]++'; }
+eff_state() {   # effective state after forced exclusions
+    local st; st=$(svc_state "$1")
+    if [[ "$st" == on ]] && has_line "$1" "$(forced_off)"; then echo disabled; else echo "$st"; fi
+}
+all_services() {   # upstream services of the selected variant + add-ons
+    local f; f=$(compose_for_listing)
+    [[ -n "$f" ]] && compose_services_list "$f"
+    printf '%s\n' "${ADDON_SERVICES[@]}"
+}
+svc_exists()  { has_line "$1" "$(all_services)"; }
+svc_enabled() { svc_exists "$1" && [[ "$(eff_state "$1")" == on ]]; }
+
+# -----------------------------------------------------------------------------
+# SERVICE PRESETS (chosen in the wizard; 'custom' keeps the lists as they are)
+# -----------------------------------------------------------------------------
+readonly PRESET_CORE_COMMON="gluetun qbittorrent sabnzbd prowlarr flaresolverr unpackerr sonarr radarr lidarr bazarr seerr homepage tailscale audiobookshelf"
+readonly PRESET_CORE_INTERNET="traefik traefik-certs-dumper crowdsec authentik authentic-worker postgresql valkey"
+readonly PRESET_ALWAYS_REMOVED="readarr"       # retired upstream
+readonly PRESET_FULL_DISABLED="whisparr"
+
+preset_core_on() {   # services ON in the Core preset for the current settings
+    local -a on extra
+    read -ra on <<<"$PRESET_CORE_COMMON"
+    if [[ "${CFG[ACCESS_MODE]}" == internet ]]; then read -ra extra <<<"$PRESET_CORE_INTERNET"; on+=("${extra[@]}"); fi
+    case "${CFG[PLAYER]}" in jellyfin) on+=(jellyfin) ;; plex) on+=(plex) ;; *) on+=(jellyfin plex) ;; esac
+    [[ "${CFG[TAILSCALE_CONTROL]}" == headscale ]] && on+=(headscale headplane)
+    printf '%s\n' "${on[@]}"
+}
+
+# apply_preset -- rewrite DISABLED_SERVICES / REMOVED_SERVICES from SERVICE_PRESET
+apply_preset() {
+    local p=${CFG[SERVICE_PRESET]:-custom} s d="" r=""
+    [[ "$p" == custom ]] && return 0
+    local -a all on=()
+    mapfile -t all < <(all_services)
+    (( ${#all[@]} > ${#ADDON_SERVICES[@]} )) || die "Service list unavailable (upstream not downloaded); cannot apply preset '$p'."
+    r=$PRESET_ALWAYS_REMOVED
+    case "$p" in
+        full) d=$PRESET_FULL_DISABLED ;;
+        core)
+            mapfile -t on < <(preset_core_on)
+            for s in "${all[@]}"; do
+                in_list "$s" "${on[@]}" && continue
+                in_list "$s" $PRESET_ALWAYS_REMOVED && continue
+                d+=" $s"
+            done ;;
+    esac
+    CFG[DISABLED_SERVICES]=$(xargs <<<"$d")
+    CFG[REMOVED_SERVICES]=$(xargs <<<"$r")
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# DEPENDENCIES (compose depends_on + network_mode, plus links compose cannot see)
+# -----------------------------------------------------------------------------
+compose_deps() {   # FILE -> "service dependency" pairs
+    awk '
+        /^services:/ {s = 1; next}
+        /^[^[:space:]#]/ {s = 0; next}
+        !s {next}
+        /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ {svc = $1; sub(/:$/, "", svc); dep = 0; next}
+        /^    [A-Za-z_]+:/ {dep = ($1 == "depends_on:")}
+        /^    network_mode:/ {if (match($0, /service:[A-Za-z0-9_.-]+/)) print svc, substr($0, RSTART + 8, RLENGTH - 8); next}
+        dep && /^      [A-Za-z0-9_.-]+:[[:space:]]*$/ {d = $1; sub(/:$/, "", d); print svc, d; next}
+        dep && /^      - [A-Za-z0-9_.-]+/ {print svc, $2; next}
+    ' "$1"
+}
+
+soft_deps() {
+    printf '%s\n' "traefik crowdsec" "traefik authentik"   # traefik-bouncer + authentik-forwardauth middlewares
+    [[ "${CFG[TAILSCALE_CONTROL]}" == headscale ]] && printf '%s\n' "tailscale headscale"
+    return 0
+}
+
+# check_dependencies -> "A needs B" for each enabled service whose dependency is not enabled
+check_dependencies() {
+    local f s a b
+    local -A en=() ex=()
+    f=$(compose_for_listing)
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        ex[$s]=1
+        [[ "$(eff_state "$s")" == on ]] && en[$s]=1
+    done < <(all_services)
+    { [[ -n "$f" ]] && compose_deps "$f"; soft_deps; } | while read -r a b; do
+        if [[ -n "${en[$a]:-}" && -n "${ex[$b]:-}" && -z "${en[$b]:-}" ]]; then printf '%s needs %s\n' "$a" "$b"; fi
+    done | sort -u
+    return 0
+}
+
+report_dependencies() {   # report_dependencies warn|die
+    local deps l; deps=$(check_dependencies)
+    [[ -z "$deps" ]] && return 0
+    while IFS= read -r l; do log_warn "Dependency: $l"; done <<<"$deps"
+    [[ "$1" == die ]] && die "Enable the missing services (Settings -> Services) or disable the ones that need them."
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# OVERRIDE FILE: add-ons, patches to upstream services, exclusions
+# -----------------------------------------------------------------------------
+render_addon() {   # render_addon NAME -> service body (4-space indented, no key line)
     case "$1" in
         audiobookshelf)
             cat <<'EOF'
-  audiobookshelf:
     image: ghcr.io/advplyr/audiobookshelf:latest
     container_name: audiobookshelf
     restart: unless-stopped
@@ -1087,49 +1258,92 @@ EOF
     esac
 }
 
+render_patch() {   # render_patch NAME -> body that changes an upstream service
+    case "$1" in
+        homarr)
+            cat <<'EOF'
+    # Homarr 1.x (homarr-labs) replaces the legacy ghcr.io/ajnart/homarr image used upstream
+    image: ghcr.io/homarr-labs/homarr:latest
+    volumes: !override
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${FOLDER_FOR_DATA:?err}/homarr/appdata:/appdata
+    environment: !override
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - SECRET_ENCRYPTION_KEY=${SECRET_ENCRYPTION_KEY:?err}
+EOF
+            ;;
+        tailscale)
+            cat <<'EOF'
+    # TAILSCALE_CONTROL=tailscale: official control server (upstream logs in to self-hosted Headscale)
+    environment:
+      - TS_EXTRA_ARGS=--hostname=exit-node --advertise-exit-node --advertise-routes=${LOCAL_SUBNET:?err},${DOCKER_SUBNET:?err}
+EOF
+            ;;
+    esac
+}
+
 is_addon() { in_list "$1" "${ADDON_SERVICES[@]}"; }
 active_addons() {   # add-ons not 'removed'
     local a; for a in "${ADDON_SERVICES[@]}"; do is_removed "$a" || printf '%s\n' "$a"; done
     return 0
 }
+active_patches() {   # upstream services this installer modifies
+    local compose=$1
+    [[ -f "$compose" ]] || return 0
+    if grep -qE '^  homarr:[[:space:]]*$' "$compose" && ! is_removed homarr; then echo homarr; fi
+    if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale \
+        && [[ "${CFG[TAILSCALE_CONTROL]}" == tailscale ]]; then echo tailscale; fi
+    return 0
+}
 
 render_override() {   # render_override COMPOSEFILE -> stdout
-    local compose=$1 s n=0 body=""
+    local compose=$1 s
+    local -a order=()
+    local -A blk=()
     printf '%s\n' "$OVERRIDE_MARKER"
     printf '# Regenerated on every install/apply -- do not edit (a file without the marker line is left alone).\n'
-    printf "# - add-on services defined by the installer (not part of upstream MediaStack)\n"
-    printf "# - services in DISABLED_SERVICES / REMOVED_SERVICES parked in the 'disabled' profile\n"
+    printf '# - add-on services defined by the installer (not part of upstream MediaStack)\n'
+    printf '# - patches to upstream services (Homarr 1.x image, Tailscale control server)\n'
+    printf "# - disabled / removed services parked in the 'disabled' profile\n"
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
-        body+="$(render_addon "$s")"$'\n'
-        [[ "$(svc_state "$s")" == disabled ]] && body+="    profiles: [\"disabled\"]"$'\n'
-        n=$((n + 1))
+        order+=("$s"); blk[$s]="$(render_addon "$s")"$'\n'
     done < <(active_addons)
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
-        is_addon "$s" && continue
-        if [[ -f "$compose" ]] && ! grep -qE "^  ${s}:[[:space:]]*$" "$compose"; then
+        order+=("$s"); blk[$s]="$(render_patch "$s")"$'\n'
+    done < <(active_patches "$compose")
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        if is_addon "$s"; then is_removed "$s" && continue
+        elif [[ -f "$compose" ]] && ! grep -qE "^  ${s}:[[:space:]]*$" "$compose"; then
             printf '# %s: not found in docker-compose.yaml, ignored\n' "$s"; continue
         fi
-        body+="  ${s}:"$'\n'"    profiles: [\"disabled\"]"$'\n'; n=$((n + 1))
+        [[ -n "${blk[$s]+x}" ]] || order+=("$s")
+        blk[$s]+="    profiles: [\"disabled\"]"$'\n'
     done < <(excluded_services)
-    if (( n )); then printf 'services:\n%s' "$body"; else printf 'services: {}\n'; fi
+    if (( ${#order[@]} == 0 )); then printf 'services: {}\n'; return 0; fi
+    printf 'services:\n'
+    for s in "${order[@]}"; do printf '  %s:\n%s' "$s" "${blk[$s]}"; done
     return 0
 }
 
 write_override() {
-    local f="$FOLDER_FOR_YAML/docker-compose.override.yaml" compose="$FOLDER_FOR_YAML/docker-compose.yaml"
+    local f="$FOLDER_FOR_YAML/docker-compose.override.yaml" compose="$FOLDER_FOR_YAML/docker-compose.yaml" body
     if [[ -f "$f" ]] && ! grep -qF "$OVERRIDE_MARKER" "$f"; then
-        log_warn "$f exists and is not managed by this installer; leaving it alone (add-ons and service exclusions NOT applied)."
+        log_warn "$f exists and is not managed by this installer; leaving it alone (add-ons, patches and exclusions NOT applied)."
         return 0
     fi
-    if [[ -z "$(excluded_services)" && -z "$(active_addons)" ]]; then
+    body=$(render_override "$compose")
+    if [[ "$body" == *$'\nservices: {}' ]]; then
         [[ -f "$f" ]] && run rm -f "$f"
-        log_ok "All upstream services enabled; no add-ons"
+        log_ok "All upstream services enabled; no add-ons or patches"
         return 0
     fi
-    render_override "$compose" | write_file "$f" 640 root:root
-    log_ok "Add-ons: $(active_addons | xargs) | disabled: ${CFG[DISABLED_SERVICES]:-none} | removed: ${CFG[REMOVED_SERVICES]:-none}"
+    printf '%s\n' "$body" | write_file "$f" 640 root:root
+    log_ok "Add-ons: $(active_addons | xargs) | patches: $(active_patches "$compose" | xargs) | disabled: $( { disabled_services; forced_off; } | awk 'NF && !seen[$0]++' | xargs) | removed: ${CFG[REMOVED_SERVICES]:-none}"
     local s
     while IFS= read -r s; do
         [[ -n "$s" && -d "$FOLDER_FOR_DATA/$s" ]] && log_info "Removed service '$s' still has data in $FOLDER_FOR_DATA/$s (left in place; delete it if unwanted)"
@@ -1244,7 +1458,7 @@ write_smb_creds() {
 
 stack_down_if_running() {
     docker_up || return 0
-    if docker ps -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | grep -q .; then
+    if [[ -n "$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT_NAME")" ]]; then
         log_info "Stopping the stack so the mount can change"
         run_logged compose_run down --remove-orphans
     fi
@@ -1438,6 +1652,11 @@ ensure_folders() {
         (( ${#rem[@]} )) && in_list "$top" "${rem[@]}" && continue
         ddirs+=("$FOLDER_FOR_DATA/$d")
     done
+    for d in "${EXTRA_DATA_SUBDIRS[@]}"; do
+        top=${d%%/*}
+        (( ${#rem[@]} )) && in_list "$top" "${rem[@]}" && continue
+        ddirs+=("$FOLDER_FOR_DATA/$d")
+    done
     for d in "${MEDIA_SUBDIRS[@]}"; do mdirs+=("$FOLDER_FOR_MEDIA/$d"); done
     local a
     while IFS= read -r a; do
@@ -1492,7 +1711,7 @@ ensure_folders() {
             fi
             run chmod 2775 "$FOLDER_FOR_MEDIA" "${mdirs[@]}" "${mtop[@]}" 2>/dev/null || true ;;
     esac
-    if [[ "$dty" != local ]] && active_addons | grep -qx audiobookshelf; then
+    if [[ "$dty" != local ]] && has_line audiobookshelf "$(active_addons)"; then
         log_warn "Audiobookshelf keeps a SQLite DB in $FOLDER_FOR_DATA/audiobookshelf/config; its docs warn against network storage."
     fi
     log_ok "Data: $FOLDER_FOR_DATA ($dty)  Media: $FOLDER_FOR_MEDIA ($mty)  owner $PUID:$PGID"
@@ -1523,6 +1742,163 @@ copy_app_configs() {
         run chmod 600 "$acme" 2>/dev/null || { (( DRY_RUN )) || svc_run chmod 600 "$acme"; }
     fi
     log_ok "App config files placed (traefik, headscale, headplane, crowdsec); acme.json 600"
+}
+
+# -----------------------------------------------------------------------------
+# TLS CERTIFICATES FOR TRAEFIK
+#   letsencrypt : upstream behaviour (ACME DNS-01 via Cloudflare)
+#   selfsigned  : local CA in $MS_CONF_DIR/tls signs a wildcard leaf (renewed automatically)
+#   manual      : your cert + key files, validated and re-copied on every apply
+# -----------------------------------------------------------------------------
+tls_dir()          { printf '%s/tls' "$MS_CONF_DIR"; }
+traefik_cert_dir() { printf '%s/traefik/certs' "$FOLDER_FOR_DATA"; }
+tls_zone()         { printf '%s' "${CFG[CLOUDFLARE_DNS_ZONE]:-${CFG[DOMAIN]}}"; }
+
+tls_sans() {   # SAN list for the self-signed leaf
+    local z ip; z=$(tls_zone); ip=$(eff_local_ip)
+    printf 'DNS:%s,DNS:*.%s' "$z" "$z"
+    valid_ipv4 "$ip" && printf ',IP:%s' "$ip"
+    return 0
+}
+
+ensure_local_ca() {
+    local d; d=$(tls_dir)
+    [[ -s "$d/ca.key" && -s "$d/ca.crt" ]] && return 0
+    if (( DRY_RUN )); then log_info "[dry-run] would create a local CA in $d"; return 0; fi
+    mkdir -p "$d"; chmod 700 "$d"
+    ( umask 077
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-384 -nodes -sha384 -days 3650 \
+          -keyout "$d/ca.key" -out "$d/ca.crt" \
+          -subj "/CN=MediaStack Local CA ($(hostname -s 2>/dev/null || echo host))/O=mediastack-installer" \
+          -addext "basicConstraints=critical,CA:TRUE,pathlen:0" -addext "keyUsage=critical,keyCertSign,cRLSign" ) >/dev/null 2>&1 \
+        || die "Creating the local CA failed (openssl)."
+    chmod 600 "$d/ca.key"; chmod 644 "$d/ca.crt"
+    log_ok "Local CA created: $d/ca.crt -- import it on your devices to trust the self-signed certificates"
+}
+
+issue_leaf() {   # issue_leaf OUTDIR -> OUTDIR/cert.pem (leaf + CA) and key.pem
+    local out=$1 d tmp; d=$(tls_dir)
+    tmp=$(mktemp -d)
+    if ! ( umask 077
+           openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$tmp/key.pem" \
+               -out "$tmp/req.csr" -subj "/CN=$(tls_zone)" &&
+           printf 'subjectAltName=%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n' \
+               "$(tls_sans)" >"$tmp/ext" &&
+           openssl x509 -req -in "$tmp/req.csr" -CA "$d/ca.crt" -CAkey "$d/ca.key" -set_serial "0x$(openssl rand -hex 15)" \
+               -days 397 -sha256 -extfile "$tmp/ext" -out "$tmp/leaf.pem" ) >/dev/null 2>&1; then
+        rm -rf "$tmp"; die "Issuing the self-signed certificate failed (openssl)."
+    fi
+    cat "$tmp/leaf.pem" "$d/ca.crt" >"$out/cert.pem"; chmod 644 "$out/cert.pem"
+    install -m 600 "$tmp/key.pem" "$out/key.pem"
+    rm -rf "$tmp"
+}
+
+leaf_needs_reissue() {   # leaf_needs_reissue CERT -> 0 when missing, expiring, re-scoped or not from our CA
+    local c=$1
+    [[ -s "$c" && -s "$(dirname "$c")/key.pem" ]] || return 0
+    openssl x509 -in "$c" -noout -checkend 2592000 >/dev/null 2>&1 || return 0
+    [[ "$(state_get tls_sans)" == "$(tls_sans)" ]] || return 0
+    openssl verify -CAfile "$(tls_dir)/ca.crt" "$c" >/dev/null 2>&1 || return 0
+    return 1
+}
+
+tls_validate_pair() {   # tls_validate_pair CERT KEY -> 0 if usable (warnings for minor issues)
+    local c=$1 k=$2 a b z san
+    [[ -r "$c" && -r "$k" ]] || { log_error "Cannot read $c / $k"; return 1; }
+    a=$(openssl x509 -in "$c" -noout -pubkey 2>/dev/null) || a=""
+    [[ -n "$a" ]] || { log_error "$c is not a PEM certificate"; return 1; }
+    b=$(openssl pkey -in "$k" -pubout 2>/dev/null) || b=""
+    [[ -n "$b" ]] || { log_error "$k is not a readable unencrypted PEM private key"; return 1; }
+    [[ "$a" == "$b" ]] || { log_error "The private key does not match the certificate"; return 1; }
+    openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1 || { log_error "The certificate has expired"; return 1; }
+    openssl x509 -in "$c" -noout -checkend 1209600 >/dev/null 2>&1 || log_warn "The certificate expires within 14 days"
+    z=$(tls_zone)
+    san=$(openssl x509 -in "$c" -noout -ext subjectAltName 2>/dev/null || true)
+    if [[ -n "$z" && "$san" != *"DNS:*.$z"* ]]; then
+        log_warn "The certificate has no DNS:*.$z entry; app hostnames such as sonarr.$z will not match it."
+    fi
+    return 0
+}
+
+# traefik_static_no_acme FILE -- drop the ACME resolver and the entrypoint's certResolver/domains
+traefik_static_no_acme() {
+    yaml_edit "$1" '
+        function ind(s) { match(s, /[^ ]/); return RSTART - 1 }
+        skip >= 0 { if ($0 ~ /^[[:space:]]*(#.*)?$/) next; if (ind($0) > skip) next; skip = -1 }
+        /^[[:space:]]*certResolver:[[:space:]]*letsencrypt/ {next}
+        /^[[:space:]]*domains:[[:space:]]*$/ {skip = ind($0); next}
+        /^certificatesResolvers:/ {skip = 0; next}
+        {print}'
+}
+
+# traefik_dynamic_file_cert FILE -- serve /etc/traefik/certs/{cert,key}.pem (works with sniStrict)
+traefik_dynamic_file_cert() {
+    yaml_edit "$1" '
+        function ind(s) { match(s, /[^ ]/); return RSTART - 1 }
+        skip >= 0 { if ($0 ~ /^[[:space:]]*(#.*)?$/) next; if (ind($0) > skip) next; skip = -1 }
+        /^tls:[[:space:]]*$/ {
+            print
+            print "  certificates:"
+            print "    - certFile: /etc/traefik/certs/cert.pem"
+            print "      keyFile: /etc/traefik/certs/key.pem"
+            next
+        }
+        /^[[:space:]]*defaultGeneratedCert:[[:space:]]*$/ {
+            i = ind($0); p = sprintf("%" i "s", "")
+            print p "defaultCertificate:"
+            print p "  certFile: /etc/traefik/certs/cert.pem"
+            print p "  keyFile: /etc/traefik/certs/key.pem"
+            skip = i; next
+        }
+        {print}'
+}
+
+yaml_edit() {   # yaml_edit FILE AWKPROGRAM  (in place, keeps mode/owner)
+    local f=$1 tmp
+    tmp=$(mktemp "$f.XXXXXX")
+    awk -v skip=-1 "$2" "$f" >"$tmp" || { rm -f "$tmp"; die "Editing $f failed"; }
+    chmod --reference="$f" "$tmp"; chown --reference="$f" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$f"
+}
+
+# ensure_tls -- run after copy_app_configs (which re-copies the upstream Traefik templates)
+ensure_tls() {
+    svc_enabled traefik || return 0
+    local mode=${CFG[CERT_MODE]:-letsencrypt} out
+    out=$(traefik_cert_dir)
+    log_step "TLS certificate ($mode)"
+    case "$mode" in
+        letsencrypt)
+            log_ok "Let's Encrypt wildcard for $(tls_zone) via Cloudflare DNS-01 (issued by Traefik)"
+            return 0 ;;
+        selfsigned)
+            ensure_local_ca
+            if (( DRY_RUN )); then log_info "[dry-run] would issue/refresh the self-signed certificate in $out"; return 0; fi
+            install -d -m 2775 "$out"
+            if leaf_needs_reissue "$out/cert.pem"; then
+                issue_leaf "$out"; state_set tls_sans "$(tls_sans)"
+                log_ok "Self-signed certificate issued for $(tls_sans) (397 days; renewed automatically 30 days before expiry)"
+            else
+                log_ok "Self-signed certificate current ($(openssl x509 -in "$out/cert.pem" -noout -enddate | cut -d= -f2))"
+            fi ;;
+        manual)
+            [[ -n "${CFG[TLS_CERT_FILE]}" && -n "${CFG[TLS_KEY_FILE]}" ]] \
+                || die "CERT_MODE=manual needs TLS_CERT_FILE and TLS_KEY_FILE (Settings -> Access and certificates)."
+            tls_validate_pair "${CFG[TLS_CERT_FILE]}" "${CFG[TLS_KEY_FILE]}" || die "The manual certificate failed validation."
+            if (( DRY_RUN )); then log_info "[dry-run] would copy the manual certificate into $out"; return 0; fi
+            install -d -m 2775 "$out"
+            install -m 644 "${CFG[TLS_CERT_FILE]}" "$out/cert.pem"
+            install -m 600 "${CFG[TLS_KEY_FILE]}" "$out/key.pem"
+            log_ok "Manual certificate installed (expires $(openssl x509 -in "$out/cert.pem" -noout -enddate | cut -d= -f2))" ;;
+    esac
+    local st="$FOLDER_FOR_DATA/traefik/traefik.yaml" dy="$FOLDER_FOR_DATA/traefik/dynamic.yaml"
+    if [[ -f "$st" && -f "$dy" ]]; then
+        traefik_static_no_acme "$st"
+        traefik_dynamic_file_cert "$dy"
+        log_ok "Traefik serves /etc/traefik/certs/cert.pem (ACME resolver removed from its config)"
+    else
+        log_warn "Traefik config files missing in $FOLDER_FOR_DATA/traefik; certificate not wired"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1585,6 +1961,8 @@ stack_apply() {
     ensure_storage
     ensure_folders
     copy_app_configs
+    ensure_tls
+    report_dependencies die
     log_step "Starting MediaStack ($mode)"
     if (( DRY_RUN )); then
         run compose_run config --quiet
@@ -1621,7 +1999,13 @@ show_status() {
     printf '  %-22s %s\n' "Service account" "${CFG[SERVICE_USER]} ($PUID:$PGID)"
     printf '  %-22s %s\n' "Host IP / subnet" "$(eff_local_ip) / $(eff_local_subnet)  (iface ${DET_IFACE:-?})"
     printf '  %-22s %s\n' "Folders" "yaml=$FOLDER_FOR_YAML data=$FOLDER_FOR_DATA media=$FOLDER_FOR_MEDIA"
-    printf '  %-22s %s\n' "Services" "disabled: ${CFG[DISABLED_SERVICES]:-none}  removed: ${CFG[REMOVED_SERVICES]:-none}"
+    printf '  %-22s %s\n' "Access / certificate" "${CFG[ACCESS_MODE]} / ${CFG[CERT_MODE]}$( [[ "${CFG[CERT_MODE]}" == selfsigned ]] && printf ' (CA: %s/ca.crt)' "$(tls_dir)")"
+    printf '  %-22s %s\n' "Services" "preset=${CFG[SERVICE_PRESET]} player=${CFG[PLAYER]} tailscale=${CFG[TAILSCALE_CONTROL]}"
+    printf '  %-22s %s\n' "" "disabled: ${CFG[DISABLED_SERVICES]:-none}  removed: ${CFG[REMOVED_SERVICES]:-none}  auto-off: $(forced_off | xargs)"
+    if [[ "${CFG[CERT_MODE]}" != letsencrypt && -f "$(traefik_cert_dir)/cert.pem" ]]; then
+        printf '  %-22s %s\n' "Certificate expires" "$(openssl x509 -in "$(traefik_cert_dir)/cert.pem" -noout -enddate 2>/dev/null | cut -d= -f2)"
+    fi
+    report_dependencies warn
     local t p
     for t in MEDIA DATA; do
         p=$(target_path "$t")
@@ -1641,7 +2025,7 @@ show_status() {
     total=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT_NAME" | wc -l)
     echo
     printf '  Containers running: %s/%s\n' "$running" "$total"
-    if docker ps -q --filter "name=^${PG_CONTAINER}$" | grep -q .; then
+    if [[ -n "$(docker ps -q --filter "name=^${PG_CONTAINER}$")" ]]; then
         if docker exec "$PG_CONTAINER" pg_isready -q >/dev/null 2>&1; then log_ok "PostgreSQL accepting connections"
         else log_warn "PostgreSQL container up but not ready"; fi
     else
@@ -1777,9 +2161,15 @@ helper_apikeys() {
 offer_post_install() {
     is_tty || { log_info "Post-install helpers: run '$MS_INSTALL_BIN' and use menu 8."; return 0; }
     log_step "Post-install helpers"
-    confirm "Secure the Authentik database now?" y && { helper_authentik_db || log_warn "Authentik DB helper failed"; }
-    confirm "Create the Guacamole database now?" y && { helper_guacamole_db || log_warn "Guacamole DB helper failed"; }
-    confirm "Set the Authentik 'akadmin' password now?" y && { helper_akadmin || log_warn "akadmin reset failed"; }
+    if svc_enabled authentik; then
+        confirm "Secure the Authentik database now?" y && { helper_authentik_db || log_warn "Authentik DB helper failed"; }
+    fi
+    if svc_enabled guacamole; then
+        confirm "Create the Guacamole database now?" y && { helper_guacamole_db || log_warn "Guacamole DB helper failed"; }
+    fi
+    if svc_enabled authentik; then
+        confirm "Set the Authentik 'akadmin' password now?" y && { helper_akadmin || log_warn "akadmin reset failed"; }
+    fi
     return 0
 }
 
@@ -1894,6 +2284,13 @@ v_smbver()   { [[ "$1" =~ ^(auto|1\.0|2\.0|2\.1|3|3\.0|3\.02|3\.1\.1)$ ]]; }
 v_nfsver()   { [[ "$1" =~ ^(auto|3|4|4\.0|4\.1|4\.2)$ ]]; }
 v_smb_remote() { valid_remote smb "$(normalize_remote smb "$1")"; }
 v_nfs_remote() { valid_remote nfs "$(normalize_remote nfs "$1")"; }
+v_access()   { [[ "$1" =~ ^(internet|lan)$ ]]; }
+v_cert()     { [[ "$1" =~ ^(letsencrypt|selfsigned|manual)$ ]]; }
+v_preset()   { [[ "$1" =~ ^(core|full|custom)$ ]]; }
+v_player()   { [[ "$1" =~ ^(jellyfin|plex|both)$ ]]; }
+v_tscontrol(){ [[ "$1" =~ ^(tailscale|headscale)$ ]]; }
+v_bformat()  { [[ "$1" =~ ^(host|portable)$ ]]; }
+v_file()     { valid_abs_path "$1" && [[ -f "$1" ]]; }
 section() { printf '\n  %s%s%s\n' "$B" "$1" "$NC"; }
 
 cfg_paths() {
@@ -1912,14 +2309,53 @@ cfg_paths() {
     done
 }
 
+cfg_access() {
+    section "Access and certificates"
+    log_info "internet = public domain via Traefik + Authentik SSO + CrowdSec (forward port 443 to this host)"
+    log_info "lan      = LAN only: apps on their own ports; Traefik/Authentik/CrowdSec off in the Core preset"
+    local old=${CFG[ACCESS_MODE]}
+    ask_valid "CFG[ACCESS_MODE]" "Access mode (internet/lan)" "${CFG[ACCESS_MODE]}" v_access "internet or lan"
+    if [[ "${CFG[ACCESS_MODE]}" != "$old" && "${CFG[ACCESS_MODE]}" == lan && "${CFG[CERT_MODE]}" == letsencrypt ]]; then
+        CFG[CERT_MODE]=selfsigned
+    fi
+    log_info "Traefik certificate (used whenever Traefik runs):"
+    log_info "  letsencrypt = trusted wildcard via Cloudflare DNS-01 (Cloudflare-hosted domain + API token)"
+    log_info "  selfsigned  = local CA created on this host; import its ca.crt on your devices once"
+    log_info "  manual      = your own certificate + key files (e.g. from acme.sh); re-copied on every apply"
+    ask_valid "CFG[CERT_MODE]" "Certificate source (letsencrypt/selfsigned/manual)" "${CFG[CERT_MODE]}" v_cert "letsencrypt, selfsigned or manual"
+}
+
+cfg_manual_cert() {
+    [[ "${CFG[CERT_MODE]}" == manual ]] || return 0
+    section "Manual certificate"
+    log_info "Full-chain PEM certificate covering $(tls_zone) and *.$(tls_zone), plus its unencrypted PEM key."
+    log_info "Keep the files where your renewal job writes them; every apply validates and re-copies them."
+    while :; do
+        ask_valid "CFG[TLS_CERT_FILE]" "Certificate file" "${CFG[TLS_CERT_FILE]}" v_file "an existing file"
+        ask_valid "CFG[TLS_KEY_FILE]"  "Private key file" "${CFG[TLS_KEY_FILE]}" v_file "an existing file"
+        tls_validate_pair "${CFG[TLS_CERT_FILE]}" "${CFG[TLS_KEY_FILE]}" && { log_ok "Certificate and key match"; break; }
+        { (( ASSUME_YES )) || ! is_tty; } && die "The manual certificate failed validation."
+        confirm "Keep these files anyway (apply will refuse until they validate)?" n && break
+    done
+}
+
 cfg_network() {
     section "Domain and network"
     detect_network
     local old=${CFG[DOMAIN]}
-    ask_valid "CFG[DOMAIN]" "Public domain for app hostnames (auth.<domain>, ...)" "${CFG[DOMAIN]}" v_domain "a domain such as example.org"
-    [[ -z "${CFG[CLOUDFLARE_DNS_ZONE]}" || "${CFG[CLOUDFLARE_DNS_ZONE]}" == "$old" ]] && CFG[CLOUDFLARE_DNS_ZONE]=${CFG[DOMAIN]}
-    ask_valid "CFG[CLOUDFLARE_DNS_ZONE]" "Cloudflare DNS zone" "${CFG[CLOUDFLARE_DNS_ZONE]}" v_domain "a domain"
-    ask "CFG[CLOUDFLARE_EMAIL]" "Cloudflare account email" "${CFG[CLOUDFLARE_EMAIL]}"
+    if [[ "${CFG[ACCESS_MODE]}" == lan ]]; then
+        [[ -n "${CFG[DOMAIN]}" ]] || CFG[DOMAIN]=mediastack.lan
+        ask_valid "CFG[DOMAIN]" "Domain for app hostnames (local DNS, e.g. home.lan; used when Traefik runs)" "${CFG[DOMAIN]}" v_domain "a domain such as home.lan"
+    else
+        ask_valid "CFG[DOMAIN]" "Public domain for app hostnames (auth.<domain>, ...)" "${CFG[DOMAIN]}" v_domain "a domain such as example.org"
+    fi
+    if [[ "${CFG[CERT_MODE]}" == letsencrypt ]]; then
+        [[ -z "${CFG[CLOUDFLARE_DNS_ZONE]}" || "${CFG[CLOUDFLARE_DNS_ZONE]}" == "$old" ]] && CFG[CLOUDFLARE_DNS_ZONE]=${CFG[DOMAIN]}
+        ask_valid "CFG[CLOUDFLARE_DNS_ZONE]" "Cloudflare DNS zone" "${CFG[CLOUDFLARE_DNS_ZONE]}" v_domain "a domain"
+        ask "CFG[CLOUDFLARE_EMAIL]" "Cloudflare account email" "${CFG[CLOUDFLARE_EMAIL]}"
+    else
+        CFG[CLOUDFLARE_DNS_ZONE]=${CFG[DOMAIN]}   # hostname base for the Traefik labels
+    fi
     log_info "Detected: ${DET_IP:-?} on ${DET_IFACE:-?}, subnet ${DET_SUBNET:-?}  ('auto' re-detects on every apply)"
     ask_valid "CFG[LOCAL_DOCKER_IP]" "Host LAN IP (auto or IPv4)" "${CFG[LOCAL_DOCKER_IP]}" v_ip_auto "auto or a.b.c.d"
     ask_valid "CFG[LOCAL_SUBNET]" "LAN subnet (auto or CIDR)" "${CFG[LOCAL_SUBNET]}" v_cidr_auto "auto or a.b.c.d/nn"
@@ -2009,27 +2445,59 @@ compose_for_listing() {
 
 cfg_services() {
     section "Services"
-    log_info "on = runs | disabled = never started, folders kept | removed = never started, no app-data folder"
-    local f; f=$(compose_for_listing)
-    if [[ -z "$f" ]] || (( ASSUME_YES )) || ! is_tty; then
-        [[ -z "$f" ]] && log_warn "Service list unavailable (upstream not downloaded); enter names manually."
-        ask "CFG[DISABLED_SERVICES]" "Disabled services (space separated)" "${CFG[DISABLED_SERVICES]}"
-        ask "CFG[REMOVED_SERVICES]"  "Removed services (space separated)"  "${CFG[REMOVED_SERVICES]}"
-        return 0
+    log_info "core   = Gluetun VPN, qBittorrent, SABnzbd, Prowlarr, FlareSolverr, Unpackerr, Sonarr, Radarr,"
+    log_info "         Lidarr, Bazarr, Seerr, Homepage, Tailscale, Audiobookshelf + your player"
+    log_info "         (+ Traefik, Authentik, CrowdSec, PostgreSQL, Valkey when access mode is internet)"
+    log_info "full   = every upstream service (Whisparr disabled) + add-ons"
+    log_info "custom = choose service by service (starts from Core on a new install)"
+    log_info "Readarr is always removed (retired upstream)."
+    local oldp=${CFG[SERVICE_PRESET]}
+    ask_valid "CFG[SERVICE_PRESET]" "Service preset (core/full/custom)" "${CFG[SERVICE_PRESET]}" v_preset "core, full or custom"
+    ask_valid "CFG[PLAYER]" "Media player (jellyfin/plex/both)" "${CFG[PLAYER]}" v_player "jellyfin, plex or both"
+    log_info "Tailscale control server:"
+    log_info "  tailscale = official service; works LAN-only (auth key from https://login.tailscale.com/admin/settings/keys)"
+    log_info "  headscale = self-hosted Headscale at https://headscale.<domain> (also enables Headscale + Headplane)"
+    ask_valid "CFG[TAILSCALE_CONTROL]" "Tailscale control server (tailscale/headscale)" "${CFG[TAILSCALE_CONTROL]}" v_tscontrol "tailscale or headscale"
+    if [[ "${CFG[TAILSCALE_CONTROL]}" == headscale && "${CFG[ACCESS_MODE]}" == lan ]]; then
+        log_warn "Headscale must be reachable over HTTPS by your devices; in 'lan' mode that only works inside your LAN."
     fi
-    local -a svcs; mapfile -t svcs < <(compose_services_list "$f"; printf '%s\n' "${ADDON_SERVICES[@]}")
-    local in n i s st line
+    if [[ "${CFG[SERVICE_PRESET]}" == custom && "$oldp" != custom && ! -f "$CONF_FILE" ]]; then
+        CFG[SERVICE_PRESET]=core; apply_preset; CFG[SERVICE_PRESET]=custom
+        log_info "Starting from the Core selection."
+    fi
+    apply_preset
+    if [[ "${CFG[SERVICE_PRESET]}" == custom ]]; then
+        if (( ASSUME_YES )) || ! is_tty; then
+            ask "CFG[DISABLED_SERVICES]" "Disabled services (space separated)" "${CFG[DISABLED_SERVICES]}"
+            ask "CFG[REMOVED_SERVICES]"  "Removed services (space separated)"  "${CFG[REMOVED_SERVICES]}"
+        else
+            services_toggle_ui
+        fi
+    fi
+    local on s; on=$(all_services | while read -r s; do if [[ "$(eff_state "$s")" == on ]]; then echo "$s"; fi; done | xargs)
+    log_ok "Services on ($(wc -w <<<"$on")): $on"
+    report_dependencies warn
+}
+
+services_toggle_ui() {
+    log_info "on = runs | disabled = never started, folders kept | removed = never started, no app-data folder"
+    local -a svcs; mapfile -t svcs < <(all_services)
+    local in n i s line
     while :; do
         echo
         for i in "${!svcs[@]}"; do
-            st=$(svc_state "${svcs[$i]}")
-            case "$st" in on) line="${G}on${NC}      " ;; disabled) line="${Y}disabled${NC}" ;; *) line="${R}removed${NC} " ;; esac
-            if is_addon "${svcs[$i]}"; then printf '  %2d) %-20s %s' "$((i + 1))" "${svcs[$i]}+" "$line"
-            else printf '  %2d) %-20s %s' "$((i + 1))" "${svcs[$i]}" "$line"; fi
+            s=${svcs[$i]}
+            case "$(eff_state "$s")" in
+                on)       line="${G}on${NC}      " ;;
+                disabled) line="${Y}disabled${NC}"; [[ "$(svc_state "$s")" == on ]] && line="${Y}auto-off${NC}" ;;
+                *)        line="${R}removed${NC} " ;;
+            esac
+            if is_addon "$s"; then s+="+"; fi
+            printf '  %2d) %-20s %s' "$((i + 1))" "$s" "$line"
             (( (i + 1) % 3 == 0 )) && echo
         done
         echo
-        printf '  (+ = add-on provided by this installer, not upstream)\n'
+        printf '  (+ = add-on provided by this installer; auto-off = parked by another setting)\n'
         read -rp "  Numbers to cycle on -> disabled -> removed (e.g. '12 31'), Enter when done: " in || true
         [[ -z "$in" ]] && break
         for n in $in; do
@@ -2040,36 +2508,43 @@ cfg_services() {
                 disabled) set_svc_state "$s" removed ;;
                 removed)  set_svc_state "$s" on ;;
             esac
-            case "$s" in
-                gluetun|postgresql|valkey|traefik|authentik)
-                    [[ "$(svc_state "$s")" != on ]] && log_warn "'$s' is a dependency of other services; compose validation may fail without it." ;;
-            esac
         done
-    done
-    for s in $(excluded_services); do
-        in_list "$s" "${svcs[@]}" || log_info "'$s' is not in this compose variant (kept in the list, ignored)"
+        CFG[SERVICE_PRESET]=custom
+        report_dependencies warn
     done
 }
 
 cfg_vpn_email() {
     section "VPN and email"
-    ask_valid "CFG[VPN_TYPE]" "VPN type (openvpn/wireguard)" "${CFG[VPN_TYPE]}" v_vpn "openvpn or wireguard"
-    ask "CFG[VPN_SERVICE_PROVIDER]" "VPN provider (Gluetun name, e.g. mullvad, protonvpn, custom)" "${CFG[VPN_SERVICE_PROVIDER]}"
-    ask "CFG[SERVER_REGIONS]" "VPN server regions (blank = provider default)" "${CFG[SERVER_REGIONS]}"
-    ask "CFG[EMAIL_SERVER_HOST]" "SMTP host for Authentik (blank = none)" "${CFG[EMAIL_SERVER_HOST]}"
-    ask_valid "CFG[EMAIL_SERVER_PORT]" "SMTP port" "${CFG[EMAIL_SERVER_PORT]}" v_num "a port number"
-    ask "CFG[EMAIL_ADDRESS]" "SMTP username/address" "${CFG[EMAIL_ADDRESS]}"
-    ask "CFG[EMAIL_SENDER]" "Email sender address" "${CFG[EMAIL_SENDER]}"
+    if svc_exists gluetun; then
+        ask_valid "CFG[VPN_TYPE]" "VPN type (openvpn/wireguard)" "${CFG[VPN_TYPE]}" v_vpn "openvpn or wireguard"
+        ask "CFG[VPN_SERVICE_PROVIDER]" "VPN provider (Gluetun name, e.g. mullvad, protonvpn, custom)" "${CFG[VPN_SERVICE_PROVIDER]}"
+        ask "CFG[SERVER_REGIONS]" "VPN server regions (blank = provider default)" "${CFG[SERVER_REGIONS]}"
+    fi
+    if svc_enabled authentik; then
+        ask "CFG[EMAIL_SERVER_HOST]" "SMTP host for Authentik (blank = none)" "${CFG[EMAIL_SERVER_HOST]}"
+        if [[ -n "${CFG[EMAIL_SERVER_HOST]}" ]]; then
+            ask_valid "CFG[EMAIL_SERVER_PORT]" "SMTP port" "${CFG[EMAIL_SERVER_PORT]}" v_num "a port number"
+            ask "CFG[EMAIL_ADDRESS]" "SMTP username/address" "${CFG[EMAIL_ADDRESS]}"
+            ask "CFG[EMAIL_SENDER]" "Email sender address" "${CFG[EMAIL_SENDER]}"
+        fi
+    else
+        log_info "Authentik is off: SMTP settings skipped."
+    fi
 }
 
 cfg_stack() {
-    section "Upstream and secrets"
+    section "Upstream, secrets and backups"
     ask "CFG[UPSTREAM_REF]" "Upstream ref (commit SHA recommended)" "${CFG[UPSTREAM_REF]}"
     ask_valid "CFG[UPSTREAM_VARIANT]" "Compose variant (full-download-vpn/mini-download-vpn/no-download-vpn)" "${CFG[UPSTREAM_VARIANT]}" v_variant "one of the three variants"
     ask_valid "CFG[SECRETS_MODE]" "Secrets mode (vault = encrypted, injected at runtime; env = plaintext .env)" "${CFG[SECRETS_MODE]}" v_mode "vault or env"
     ask_valid "CFG[SECRETS_BACKEND]" "Secrets backend (auto/systemd-creds/openssl)" "${CFG[SECRETS_BACKEND]}" v_backend "auto, systemd-creds or openssl"
     ask_valid "CFG[CHOWN_MEDIA_RECURSIVE]" "Re-own the whole media library on every apply (yes/no)" "${CFG[CHOWN_MEDIA_RECURSIVE]}" v_yesno "yes or no"
     ask "CFG[EXTRA_PACKAGES]" "Extra apt packages to install (blank = none)" "${CFG[EXTRA_PACKAGES]}"
+    ask_valid "CFG[BACKUP_DIR]" "Backup folder" "${CFG[BACKUP_DIR]}" v_path "absolute path without spaces"
+    ask_valid "CFG[BACKUP_KEEP]" "Backups to keep" "${CFG[BACKUP_KEEP]}" v_num "a number"
+    ask_valid "CFG[BACKUP_FORMAT]" "Default backup format (host = this host only; portable = passphrase-encrypted)" "${CFG[BACKUP_FORMAT]}" v_bformat "host or portable"
+    ask_valid "CFG[BACKUP_STOP_STACK]" "Stop containers during backups for consistent databases (yes/no)" "${CFG[BACKUP_STOP_STACK]}" v_yesno "yes or no"
 }
 
 config_summary() {
@@ -2091,8 +2566,8 @@ config_wizard() {
     load_config
     [[ -f "$CONF_FILE" ]] || detect_defaults
     [[ -f "$SECRETS_FILE" ]] && load_secrets || SECRETS_LOADED=1
-    cfg_paths; cfg_network; cfg_storage MEDIA; cfg_storage DATA; cfg_account
-    cfg_services; cfg_vpn_email; cfg_stack
+    cfg_paths; cfg_access; cfg_network; cfg_manual_cert; cfg_storage MEDIA; cfg_storage DATA
+    cfg_account; cfg_services; cfg_vpn_email; cfg_stack
     config_summary
     confirm "Save this configuration?" y || die "Cancelled; nothing saved."
     settings_save
@@ -2106,26 +2581,29 @@ menu_settings() {
     [[ -f "$SECRETS_FILE" ]] && load_secrets || SECRETS_LOADED=1
     while :; do
         printf '\n  %sSettings%s %s\n' "$B" "$NC" "$( ((dirty)) && printf '%s(unsaved changes)%s' "$Y" "$NC")"
-        printf '   1) Paths             media=%s data=%s\n' "${CFG[FOLDER_FOR_MEDIA]}" "${CFG[FOLDER_FOR_DATA]}"
-        printf '   2) Domain / network  %s  ip=%s subnet=%s\n' "${CFG[DOMAIN]:-<unset>}" "${CFG[LOCAL_DOCKER_IP]}" "${CFG[LOCAL_SUBNET]}"
-        printf '   3) Media storage     %s\n' "$(storage_desc MEDIA)"
-        printf '   4) App-data storage  %s\n' "$(storage_desc DATA)"
-        printf '   5) Service account   %s\n' "${CFG[SERVICE_USER]}"
-        printf '   6) Services          disabled: %s | removed: %s\n' "${CFG[DISABLED_SERVICES]:-none}" "${CFG[REMOVED_SERVICES]:-none}"
-        printf '   7) VPN / email       %s / %s\n' "${CFG[VPN_TYPE]}" "${CFG[VPN_SERVICE_PROVIDER]}"
-        printf '   8) Upstream/secrets  %s %s mode=%s\n' "${CFG[UPSTREAM_REF]:0:12}" "${CFG[UPSTREAM_VARIANT]}" "${CFG[SECRETS_MODE]}"
+        printf '   1) Paths              media=%s data=%s\n' "${CFG[FOLDER_FOR_MEDIA]}" "${CFG[FOLDER_FOR_DATA]}"
+        printf '   2) Access / certs     %s, certificate=%s\n' "${CFG[ACCESS_MODE]}" "${CFG[CERT_MODE]}"
+        printf '   3) Domain / network   %s  ip=%s subnet=%s\n' "${CFG[DOMAIN]:-<unset>}" "${CFG[LOCAL_DOCKER_IP]}" "${CFG[LOCAL_SUBNET]}"
+        printf '   4) Media storage      %s\n' "$(storage_desc MEDIA)"
+        printf '   5) App-data storage   %s\n' "$(storage_desc DATA)"
+        printf '   6) Service account    %s\n' "${CFG[SERVICE_USER]}"
+        printf '   7) Services           preset=%s player=%s tailscale=%s\n' "${CFG[SERVICE_PRESET]}" "${CFG[PLAYER]}" "${CFG[TAILSCALE_CONTROL]}"
+        printf '   8) VPN / email        %s / %s\n' "${CFG[VPN_TYPE]}" "${CFG[VPN_SERVICE_PROVIDER]}"
+        printf '   9) Upstream / secrets / backups  %s %s mode=%s\n' "${CFG[UPSTREAM_REF]:0:12}" "${CFG[UPSTREAM_VARIANT]}" "${CFG[SECRETS_MODE]}"
         printf '   D) Re-run detection   T) Test share mount   V) View all\n'
         printf '   W) Save   A) Save + apply   0) Back\n'
         read -rp "  Choice: " ch || return 0
         case "${ch,,}" in
             1) cfg_paths; dirty=1 ;;
-            2) cfg_network; dirty=1 ;;
-            3) cfg_storage MEDIA; dirty=1 ;;
-            4) cfg_storage DATA; dirty=1 ;;
-            5) cfg_account; dirty=1 ;;
-            6) cfg_services; dirty=1 ;;
-            7) cfg_vpn_email; dirty=1 ;;
-            8) cfg_stack; dirty=1 ;;
+            2) cfg_access; cfg_manual_cert; [[ "${CFG[CERT_MODE]}" == letsencrypt ]] || CFG[CLOUDFLARE_DNS_ZONE]=${CFG[DOMAIN]}
+               [[ "${CFG[SERVICE_PRESET]}" == custom ]] || apply_preset; dirty=1 ;;
+            3) cfg_network; dirty=1 ;;
+            4) cfg_storage MEDIA; dirty=1 ;;
+            5) cfg_storage DATA; dirty=1 ;;
+            6) cfg_account; dirty=1 ;;
+            7) cfg_services; dirty=1 ;;
+            8) cfg_vpn_email; dirty=1 ;;
+            9) cfg_stack; dirty=1 ;;
             d) detect_defaults; dirty=1 ;;
             t) ask w "Test which share (MEDIA/DATA)" MEDIA; w=${w^^}
                [[ "$w" =~ ^(MEDIA|DATA)$ ]] && menu_action storage_test "$w" ;;
@@ -2165,12 +2643,20 @@ print_summary() {
     local envf="$FOLDER_FOR_YAML/.env" ip; ip=$(eff_local_ip)
     log_step "Done"
     [[ -f "$envf" ]] || return 0
-    local app port
-    for app in HOMEPAGE PORTAINER AUTHENTIK GUACAMOLE PLEX JELLYFIN AUDIOBOOKSHELF QBITTORRENT PROWLARR SONARR RADARR; do
-        [[ "$app" == AUDIOBOOKSHELF ]] && [[ "$(svc_state audiobookshelf)" != on ]] && continue
+    local app port z; z=$(tls_zone)
+    for app in HOMEPAGE HOMARR PORTAINER AUTHENTIK GUACAMOLE PLEX JELLYFIN AUDIOBOOKSHELF SEERR QBITTORRENT SABNZBD PROWLARR SONARR RADARR LIDARR; do
+        svc_enabled "${app,,}" || continue
         port=$(env_get "$envf" "WEBUI_PORT_$app" || true)
-        [[ -n "$port" ]] && printf '  %-12s http://%s:%s\n' "${app,,}" "$ip" "$port"
+        [[ -n "$port" ]] || continue
+        if svc_enabled traefik; then printf '  %-15s http://%s:%-6s https://%s.%s\n' "${app,,}" "$ip" "$port" "${app,,}" "$z"
+        else printf '  %-15s http://%s:%s\n' "${app,,}" "$ip" "$port"; fi
     done
+    if svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == selfsigned ]]; then
+        printf '\n  Self-signed: import %s/ca.crt on your devices (and point *.%s at %s in your DNS).\n' "$(tls_dir)" "$z" "$ip"
+    fi
+    if svc_enabled tailscale && [[ "${CFG[TAILSCALE_CONTROL]}" == tailscale ]]; then
+        printf '  Tailscale: approve the advertised routes / exit node for "exit-node" in the Tailscale admin console.\n'
+    fi
     printf '\n  Manage later with: sudo %s   (log: %s)\n' "$MS_INSTALL_BIN" "${LOG_FILE:-n/a}"
 }
 
@@ -2195,7 +2681,7 @@ secret_change() {
     in_list "$k" "${SECRET_KEYS[@]}" || { log_warn "Unknown key '$k'"; return 0; }
     if [[ "$k" == POSTGRESQL_PASSWORD ]]; then
         helper_prereq
-        [[ -f "$FOLDER_FOR_DATA/postgresql/PG_VERSION" ]] && ! docker ps -q --filter "name=^${PG_CONTAINER}$" | grep -q . \
+        [[ -f "$FOLDER_FOR_DATA/postgresql/PG_VERSION" ]] && [[ -z "$(docker ps -q --filter "name=^${PG_CONTAINER}$")" ]] \
             && die "PostgreSQL is initialised but not running; start the stack first so the role password can be changed in-database."
     fi
     if in_list "$k" "${SECRET_GENERATED[@]}" && confirm "Generate a new random value for $k?" y; then
@@ -2363,15 +2849,473 @@ menu_uninstall() {
 # LOGS MENU
 # -----------------------------------------------------------------------------
 menu_logs() {
-    printf '\n  %sLogs%s\n  1) List installer run logs\n  2) View previous run installer log\n  3) Container logs (one service)\n  0) Back\n' "$B" "$NC"
-    local ch s; read -rp "  Choice: " ch || return 0
+    printf '\n  %sLogs%s\n  1) List installer run logs\n  2) View previous run installer log\n  3) Container logs\n  0) Back\n' "$B" "$NC"
+    local ch s n; read -rp "  Choice: " ch || return 0
     case "$ch" in
         1) ls -1t "$MS_LOG_DIR"/installer-*.log 2>/dev/null | head -n "$LOG_KEEP" | sed 's/^/  /' ;;
         2) local f; f=$(ls -1t "$MS_LOG_DIR"/installer-*.log 2>/dev/null | sed -n 2p); [[ -n "$f" ]] && ${PAGER:-less} "$f" ;;
-        3) ask s "Service name" "gluetun"; menu_action compose_logs "$s" ;;
+        3) ask s "Service (blank = all)" ""; ask n "Lines" "100"; [[ "$n" =~ ^[0-9]+$ ]] || n=100
+           menu_action show_logs "$n" "$s" ;;
     esac
 }
-compose_logs() { require_config; resolve_runtime; load_secrets; compose_run logs --tail 200 "$1"; }
+
+# -----------------------------------------------------------------------------
+# SETTINGS FROM THE CLI (--show-config, --set KEY VALUE)
+# -----------------------------------------------------------------------------
+declare -A CONF_HELP=(
+    [FOLDER_FOR_MEDIA]="media library + downloads (share mountpoint when remote)"
+    [FOLDER_FOR_DATA]="app configs + databases"
+    [FOLDER_FOR_YAML]="compose file, .env, templates, wrappers (local)"
+    [DOMAIN]="domain for app hostnames"
+    [CLOUDFLARE_DNS_ZONE]="hostname base in Traefik labels; Cloudflare zone for letsencrypt"
+    [CLOUDFLARE_EMAIL]="Cloudflare account email (letsencrypt)"
+    [TIMEZONE]="IANA timezone"
+    [LOCAL_SUBNET]="auto | LAN CIDR"
+    [LOCAL_DOCKER_IP]="auto | host LAN IPv4"
+    [SERVICE_USER]="service account (PUID/PGID)"
+    [SERVICE_UID]="blank = auto (set for NFS)"
+    [SERVICE_GID]="blank = auto (set for NFS)"
+    [ADMIN_DOCKER_GROUP]="yes | no: add sudo user to docker group"
+    [VPN_TYPE]="openvpn | wireguard"
+    [VPN_SERVICE_PROVIDER]="Gluetun provider name"
+    [SERVER_REGIONS]="Gluetun server regions (blank = default)"
+    [EMAIL_SERVER_HOST]="SMTP host for Authentik (blank = none)"
+    [EMAIL_SERVER_PORT]="SMTP port"
+    [EMAIL_ADDRESS]="SMTP username/address"
+    [EMAIL_SENDER]="email sender"
+    [DISABLED_SERVICES]="never started, folders kept (setting it makes the preset custom)"
+    [REMOVED_SERVICES]="never started, no app-data folder (setting it makes the preset custom)"
+    [UPSTREAM_REPO]="owner/repo of MediaStack"
+    [UPSTREAM_REF]="pinned commit SHA (or tag/branch)"
+    [UPSTREAM_VARIANT]="full-download-vpn | mini-download-vpn | no-download-vpn"
+    [EXTRA_PACKAGES]="extra apt packages"
+    [CHOWN_MEDIA_RECURSIVE]="yes | no: re-own whole library on every apply"
+    [SECRETS_MODE]="vault | env"
+    [SECRETS_BACKEND]="auto | systemd-creds | openssl (then --rekey)"
+    [MEDIA_STORAGE]="local | smb | nfs | external"
+    [MEDIA_REMOTE]="//server/share or server:/export"
+    [MEDIA_SMB_DOMAIN]="SMB domain/workgroup"
+    [MEDIA_SMB_VERSION]="auto | 3.1.1 | 3.0 | 2.1 | 2.0 | 1.0"
+    [MEDIA_NFS_VERSION]="auto | 4.2 | 4.1 | 4 | 3"
+    [MEDIA_MOUNT_OPTS]="extra mount options"
+    [MEDIA_MOUNT_REQUIRED]="yes | no: Docker waits for the mount at boot"
+    [DATA_STORAGE]="local | nfs | external"
+    [DATA_REMOTE]="server:/export"
+    [DATA_NFS_VERSION]="auto | 4.2 | 4.1 | 4 | 3"
+    [DATA_MOUNT_OPTS]="extra mount options"
+    [DATA_MOUNT_REQUIRED]="yes | no: Docker waits for the mount at boot"
+    [ACCESS_MODE]="internet | lan"
+    [CERT_MODE]="letsencrypt | selfsigned | manual"
+    [TLS_CERT_FILE]="manual mode: PEM full-chain certificate path"
+    [TLS_KEY_FILE]="manual mode: PEM private key path"
+    [SERVICE_PRESET]="core | full | custom"
+    [PLAYER]="jellyfin | plex | both (Core preset)"
+    [TAILSCALE_CONTROL]="tailscale (official) | headscale (self-hosted)"
+    [BACKUP_DIR]="where backups are written"
+    [BACKUP_KEEP]="number of backups kept"
+    [BACKUP_FORMAT]="host | portable (passphrase-encrypted)"
+    [BACKUP_PASSPHRASE_FILE]="file whose first line is the portable-backup passphrase"
+    [BACKUP_STOP_STACK]="yes | no: stop containers while backing up"
+)
+
+validate_key() {   # validate_key KEY VALUE
+    local k=$1 v=$2
+    [[ "$v" != *$'\n'* && "$v" != *"'"* ]] || return 1
+    case "$k" in
+        FOLDER_FOR_MEDIA|FOLDER_FOR_DATA|FOLDER_FOR_YAML|BACKUP_DIR) v_path "$v" ;;
+        DOMAIN|CLOUDFLARE_DNS_ZONE) v_domain "$v" ;;
+        TIMEZONE) [[ "$v" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}$ ]] ;;
+        LOCAL_SUBNET) v_cidr_auto "$v" ;;
+        LOCAL_DOCKER_IP) v_ip_auto "$v" ;;
+        SERVICE_USER) v_user "$v" ;;
+        SERVICE_UID|SERVICE_GID) v_num_opt "$v" ;;
+        ADMIN_DOCKER_GROUP|CHOWN_MEDIA_RECURSIVE|MEDIA_MOUNT_REQUIRED|DATA_MOUNT_REQUIRED|BACKUP_STOP_STACK) v_yesno "$v" ;;
+        VPN_TYPE) v_vpn "$v" ;;
+        EMAIL_SERVER_PORT|BACKUP_KEEP) v_num "$v" ;;
+        UPSTREAM_REPO) [[ "$v" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ;;
+        UPSTREAM_REF) [[ "$v" =~ ^[A-Za-z0-9._/-]+$ ]] ;;
+        UPSTREAM_VARIANT) v_variant "$v" ;;
+        SECRETS_MODE) v_mode "$v" ;;
+        SECRETS_BACKEND) v_backend "$v" ;;
+        MEDIA_STORAGE) v_mtype "$v" ;;
+        DATA_STORAGE) v_dtype "$v" ;;
+        MEDIA_REMOTE) [[ -z "$v" ]] || v_smb_remote "$v" || v_nfs_remote "$v" ;;
+        DATA_REMOTE) [[ -z "$v" ]] || v_nfs_remote "$v" ;;
+        MEDIA_SMB_VERSION) v_smbver "$v" ;;
+        MEDIA_NFS_VERSION|DATA_NFS_VERSION) v_nfsver "$v" ;;
+        ACCESS_MODE) v_access "$v" ;;
+        CERT_MODE) v_cert "$v" ;;
+        TLS_CERT_FILE|TLS_KEY_FILE|BACKUP_PASSPHRASE_FILE) [[ -z "$v" ]] || v_path "$v" ;;
+        SERVICE_PRESET) v_preset "$v" ;;
+        PLAYER) v_player "$v" ;;
+        TAILSCALE_CONTROL) v_tscontrol "$v" ;;
+        BACKUP_FORMAT) v_bformat "$v" ;;
+        CLOUDFLARE_EMAIL|VPN_SERVICE_PROVIDER|SERVER_REGIONS|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
+        DISABLED_SERVICES|REMOVED_SERVICES|EXTRA_PACKAGES|MEDIA_SMB_DOMAIN|MEDIA_MOUNT_OPTS|DATA_MOUNT_OPTS) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+show_config() {
+    ensure_config
+    local k
+    printf '\n  %sSettings%s (%s)\n' "$B" "$NC" "$CONF_FILE"
+    for k in "${CONF_KEYS[@]}"; do
+        printf '    %-24s %-34s %s%s%s\n' "$k" "${CFG[$k]:-(empty)}" "$D" "${CONF_HELP[$k]:-}" "$NC"
+    done
+    printf '\n  Secrets are not shown; see the Secrets menu (--secrets).\n'
+}
+
+cli_set() {   # cli_set KEY VALUE
+    local k=$1 v=$2
+    require_config
+    in_list "$k" "${CONF_KEYS[@]}" || die "Unknown setting '$k'. See --show-config for valid keys."
+    case "$k" in
+        MEDIA_REMOTE) [[ "$v" == *:/* ]] && v=$(normalize_remote nfs "$v") || { [[ -n "$v" ]] && v=$(normalize_remote smb "$v"); } ;;
+        DATA_REMOTE)  [[ -n "$v" ]] && v=$(normalize_remote nfs "$v") ;;
+        FOLDER_FOR_*) v=${v%/} ;;
+    esac
+    validate_key "$k" "$v" || die "Invalid value for $k: '$v' (${CONF_HELP[$k]:-})"
+    CFG[$k]=$v
+    case "$k" in
+        DISABLED_SERVICES|REMOVED_SERVICES)
+            [[ "${CFG[SERVICE_PRESET]}" == custom ]] || { CFG[SERVICE_PRESET]=custom; log_info "SERVICE_PRESET is now custom"; } ;;
+        SERVICE_PRESET|PLAYER|ACCESS_MODE|TAILSCALE_CONTROL)
+            if [[ "${CFG[SERVICE_PRESET]}" != custom ]]; then apply_preset; log_info "Preset '${CFG[SERVICE_PRESET]}' re-applied"; fi ;;
+        DOMAIN|CERT_MODE)
+            [[ "${CFG[CERT_MODE]}" == letsencrypt ]] || CFG[CLOUDFLARE_DNS_ZONE]=${CFG[DOMAIN]} ;;
+    esac
+    [[ "$k" == CERT_MODE && "$v" == manual && ( -z "${CFG[TLS_CERT_FILE]}" || -z "${CFG[TLS_KEY_FILE]}" ) ]] \
+        && log_warn "Also set TLS_CERT_FILE and TLS_KEY_FILE before applying."
+    save_config
+    log_ok "$k=$v saved. Run --apply (or --start) to put it into effect."
+    report_dependencies warn
+}
+
+# -----------------------------------------------------------------------------
+# RESTART / LOGS
+# -----------------------------------------------------------------------------
+stack_restart() {
+    require_config; resolve_runtime; load_secrets
+    log_step "Restarting MediaStack containers"
+    run_logged compose_run restart
+    log_ok "Containers restarted (no converge; use --apply after changing settings)"
+}
+
+show_logs() {   # show_logs [N] [SERVICE]
+    local n=${1:-100} svc=${2:-}
+    require_config; resolve_runtime; load_secrets
+    if [[ -n "$svc" ]]; then compose_run logs --no-color --tail "$n" "$svc"
+    else compose_run logs --no-color --tail "$n"; fi
+}
+
+# -----------------------------------------------------------------------------
+# BACKUP / RESTORE
+#   host     : tar.gz of settings + vault + key, compose folder and app data (this host)
+#   portable : the same, with the vault decrypted inside an archive encrypted with a
+#              passphrase (AES-256-CBC, PBKDF2-SHA256) so it restores on any host
+#   Media is never included. Containers are stopped while archiving (BACKUP_STOP_STACK).
+# -----------------------------------------------------------------------------
+readonly PORTABLE_MAGIC="MEDIASTACK-BACKUP v1 portable"
+readonly PORTABLE_ITER=600000
+readonly PASSPHRASE_MIN=12
+readonly BACKUP_META="_mediastack_meta"
+BACKUP_FORMAT_OPT=""
+PASSPHRASE_FILE_OPT=""
+STACK_PAUSED=0
+BACKUP_EXCLUDES=( --exclude='*/Plex Media Server/Cache' --exclude='*/Plex Media Server/Crash Reports'
+                  --exclude='*/jellyfin/cache' --exclude='*/jellyfin/transcodes' --exclude='*/tdarr_transcode_cache' )
+
+backup_items() {   # paths relative to / (compose folder skipped when inside app data)
+    [[ -d "$MS_CONF_DIR" ]] && printf '%s\n' "${MS_CONF_DIR#/}"
+    if [[ -d "$FOLDER_FOR_YAML" && "$FOLDER_FOR_YAML" != "$FOLDER_FOR_DATA" && "$FOLDER_FOR_YAML" != "$FOLDER_FOR_DATA"/* ]]; then
+        printf '%s\n' "${FOLDER_FOR_YAML#/}"
+    fi
+    [[ -d "$FOLDER_FOR_DATA" ]] && printf '%s\n' "${FOLDER_FOR_DATA#/}"
+    return 0
+}
+
+list_backups() {
+    [[ -d "${CFG[BACKUP_DIR]}" ]] || return 0
+    find "${CFG[BACKUP_DIR]}" -maxdepth 1 -type f \( -name 'mediastack-*.tar.gz' -o -name 'mediastack-*.msbak' \) \
+        -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-
+}
+
+prune_backups() {
+    local old
+    while IFS= read -r old; do rm -f -- "$old"; log_info "Pruned $old"; done \
+        < <(list_backups | tail -n +$(( CFG[BACKUP_KEEP] + 1 )))
+}
+
+backup_pause() {
+    STACK_PAUSED=0
+    [[ "${CFG[BACKUP_STOP_STACK]}" == yes ]] && docker_up || return 0
+    [[ -n "$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT_NAME")" ]] || return 0
+    log_info "Stopping containers for a consistent backup"
+    compose_run stop >/dev/null 2>&1 && STACK_PAUSED=1
+    return 0
+}
+backup_resume() {
+    if (( STACK_PAUSED )); then
+        compose_run start >/dev/null 2>&1 && log_ok "Containers started again" || log_warn "Restarting containers failed; run --start"
+        STACK_PAUSED=0
+    fi
+    return 0
+}
+
+do_backup() {
+    require_config; resolve_runtime; load_secrets
+    local fmt=${BACKUP_FORMAT_OPT:-${CFG[BACKUP_FORMAT]}}
+    if [[ "$fmt" == portable ]]; then do_backup_portable; return; fi
+    log_step "Backup (this host)"
+    local out rc=0; out="${CFG[BACKUP_DIR]}/mediastack-$(date +%Y%m%d-%H%M%S).tar.gz"
+    local -a items; mapfile -t items < <(backup_items)
+    (( ${#items[@]} )) || die "Nothing to back up."
+    if (( DRY_RUN )); then run tar -czf "$out" --numeric-owner -C / "${items[@]}"; return 0; fi
+    install -d -m 0700 -o root -g root "${CFG[BACKUP_DIR]}"
+    backup_pause
+    ( umask 077; tar -czf "$out.part" --numeric-owner "${BACKUP_EXCLUDES[@]}" -C / "${items[@]}" ) || rc=$?
+    backup_resume
+    (( rc <= 1 )) || { rm -f -- "$out.part"; die "tar failed (rc=$rc)"; }
+    (( rc == 1 )) && log_warn "Some files changed while being archived (tar rc=1)."
+    mv -f -- "$out.part" "$out"; chmod 600 "$out"
+    log_ok "Backup written: $out ($(du -h "$out" | cut -f1))"
+    log_warn "It holds your settings, the vault AND its key, and all app data: keep it private."
+    [[ "$(secrets_file_backend)" == systemd-creds ]] && \
+        log_warn "Vault backend is systemd-creds (host/TPM-bound): this backup restores on THIS host only. Use --backup --portable for another host."
+    prune_backups
+}
+
+# get_passphrase VAR new|existing  -- --passphrase-file, $MS_BACKUP_PASSPHRASE, BACKUP_PASSPHRASE_FILE, prompt
+get_passphrase() {
+    local __var=$1 mode=$2 __p="" __src="" __b=""
+    if [[ -n "$PASSPHRASE_FILE_OPT" ]]; then __src=$PASSPHRASE_FILE_OPT
+    elif [[ -n "${MS_BACKUP_PASSPHRASE:-}" ]]; then __p=$MS_BACKUP_PASSPHRASE
+    elif [[ -n "${CFG[BACKUP_PASSPHRASE_FILE]:-}" && -f "${CFG[BACKUP_PASSPHRASE_FILE]}" ]]; then __src=${CFG[BACKUP_PASSPHRASE_FILE]}
+    fi
+    if [[ -n "$__src" ]]; then
+        [[ -r "$__src" ]] || die "Cannot read passphrase file $__src"
+        [[ "$(stat -c %a "$__src")" =~ ^[4-7]00$ ]] || log_warn "$__src is readable by others; chmod 600 it."
+        IFS= read -r __p <"$__src" || true
+    elif [[ -z "$__p" ]]; then
+        is_tty || die "A portable backup needs a passphrase: --passphrase-file FILE, MS_BACKUP_PASSPHRASE, or BACKUP_PASSPHRASE_FILE."
+        while :; do
+            read -rsp "  Backup passphrase: " __p || true; echo
+            [[ "$mode" == existing ]] && break
+            if (( ${#__p} < PASSPHRASE_MIN )); then log_warn "Use at least $PASSPHRASE_MIN characters."; continue; fi
+            read -rsp "  Confirm passphrase: " __b || true; echo
+            [[ "$__p" == "$__b" ]] && break
+            log_warn "Entries did not match, try again."
+        done
+    fi
+    [[ -n "$__p" ]] || die "Empty passphrase."
+    [[ "$mode" == new && ${#__p} -lt $PASSPHRASE_MIN ]] && die "The backup passphrase must be at least $PASSPHRASE_MIN characters."
+    printf -v "$__var" '%s' "$__p"
+}
+
+portable_encrypt() {   # portable_encrypt PASS < plaintext > file
+    printf '%s kdf=pbkdf2-sha256 iter=%s cipher=aes-256-cbc\n' "$PORTABLE_MAGIC" "$PORTABLE_ITER"
+    openssl enc -aes-256-cbc -pbkdf2 -iter "$PORTABLE_ITER" -md sha256 -salt -pass fd:3 3<<<"$1"
+}
+is_portable_backup() { [[ "$(head -c ${#PORTABLE_MAGIC} "$1" 2>/dev/null)" == "$PORTABLE_MAGIC" ]]; }
+portable_decrypt() {   # portable_decrypt FILE PASS > plaintext
+    local hdr iter
+    hdr=$(head -n1 "$1")
+    [[ "$hdr" == "$PORTABLE_MAGIC "* ]] || return 1
+    iter=$(sed -n 's/.* iter=\([0-9]*\).*/\1/p' <<<"$hdr")
+    [[ "$iter" =~ ^[0-9]+$ ]] || return 1
+    tail -c +$(( ${#hdr} + 2 )) "$1" | openssl enc -d -aes-256-cbc -pbkdf2 -iter "$iter" -md sha256 -pass fd:3 3<<<"$2"
+}
+
+do_backup_portable() {
+    log_step "Backup (portable)"
+    local out pp st k; out="${CFG[BACKUP_DIR]}/mediastack-$(date +%Y%m%d-%H%M%S).msbak"
+    local -a items=()
+    [[ -d "$FOLDER_FOR_YAML" && "$FOLDER_FOR_YAML" != "$FOLDER_FOR_DATA" && "$FOLDER_FOR_YAML" != "$FOLDER_FOR_DATA"/* ]] && items+=("${FOLDER_FOR_YAML#/}")
+    [[ -d "$FOLDER_FOR_DATA" ]] && items+=("${FOLDER_FOR_DATA#/}")
+    if (( DRY_RUN )); then log_info "[dry-run] would write the passphrase-encrypted archive $out (${items[*]})"; return 0; fi
+    get_passphrase pp new
+    install -d -m 0700 -o root -g root "${CFG[BACKUP_DIR]}"
+    st=$(mktemp -d "${CFG[BACKUP_DIR]}/.stage.XXXXXX"); chmod 700 "$st"
+    # shellcheck disable=SC2064
+    trap "rm -rf -- '$st'; trap - RETURN" RETURN
+    mkdir -p "$st/$BACKUP_META"
+    cp "$CONF_FILE" "$st/$BACKUP_META/host.conf"
+    ( umask 077
+      for k in "${!SECRETS[@]}"; do printf '%s=%s\n' "$k" "$(printf '%s' "${SECRETS[$k]}" | base64 -w0)"; done >"$st/$BACKUP_META/secrets.env" )
+    [[ -d "$(tls_dir)" ]] && cp -a "$(tls_dir)" "$st/$BACKUP_META/tls"
+    printf 'format=1\ncreated=%s\nhost=%s\ninstaller=%s\nupstream_ref=%s\ndata_dir=%s\nyaml_dir=%s\nmedia_dir=%s\n' \
+        "$(date '+%F %T %z')" "$(hostname -s 2>/dev/null || hostname)" "$SCRIPT_VERSION" "${CFG[UPSTREAM_REF]}" \
+        "$FOLDER_FOR_DATA" "$FOLDER_FOR_YAML" "$FOLDER_FOR_MEDIA" >"$st/$BACKUP_META/manifest"
+    ( cd "$st/$BACKUP_META" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS )
+    backup_pause
+    local rc=0
+    ( umask 077; tar -czf - --numeric-owner "${BACKUP_EXCLUDES[@]}" -C "$st" "$BACKUP_META" -C / "${items[@]}" \
+          | portable_encrypt "$pp" >"$out.part" ) || rc=$?
+    backup_resume
+    (( rc == 0 )) || { rm -f -- "$out.part"; die "Creating the portable backup failed (rc=$rc)."; }
+    mv -f -- "$out.part" "$out"; chmod 600 "$out"
+    log_ok "Portable backup written: $out ($(du -h "$out" | cut -f1))"
+    log_info "Encrypted with your passphrase (AES-256, PBKDF2-SHA256 x$PORTABLE_ITER). Restore on any host with:"
+    log_info "  sudo ./mediastack-installer.sh --restore $(basename "$out")"
+    log_warn "Without the passphrase this backup cannot be restored. Store the passphrase separately."
+    prune_backups
+}
+
+archive_conf_value() {   # archive_conf_value CONFTEXT KEY
+    local line
+    line=$(grep -m1 -E "^$2=" <<<"$1") || return 0
+    conf_unquote "${line#*=}"
+}
+
+move_aside() {   # move_aside PATH STAMP -- keep the current copy (contents kept in place for mountpoints)
+    local p=$1 ts=$2
+    [[ -e "$p" ]] || return 0
+    if is_mounted "$p"; then log_warn "$p is a mountpoint; restoring over its current contents"; return 0; fi
+    mv -- "$p" "$p.pre-restore-$ts"
+    log_info "Previous $p kept as $p.pre-restore-$ts"
+}
+
+do_restore() {
+    local file=$1
+    ensure_config
+    local cand
+    for cand in "$file" "${CFG[BACKUP_DIR]:-/var/backups/mediastack}/$file" "$SCRIPT_DIR/$file"; do
+        if [[ -f "$cand" ]]; then file=$cand; break; fi
+    done
+    [[ -f "$file" ]] || die "No such file: $file (looked here, in BACKUP_DIR and next to the installer)"
+    if is_portable_backup "$file"; then do_restore_portable "$file"; return; fi
+    log_step "Restore from $file"
+    ensure_config
+    local list aconf adata ayaml rel bad ts host_new=0
+    [[ -f "$CONF_FILE" ]] || host_new=1
+    list=$(tar -tzf "$file") || die "Not a readable tar.gz: $file"
+    aconf=$(tar -xzOf "$file" "${CONF_FILE#/}" 2>/dev/null) || die "$file has no ${CONF_FILE#/}: not a mediastack-installer host backup."
+    adata=$(archive_conf_value "$aconf" FOLDER_FOR_DATA); ayaml=$(archive_conf_value "$aconf" FOLDER_FOR_YAML)
+    [[ -n "$adata" && -n "$ayaml" ]] || die "The archive's settings lack FOLDER_FOR_DATA/FOLDER_FOR_YAML."
+    safe_path "$adata" && safe_path "$ayaml" || die "The archive points at unsafe folders ($adata, $ayaml)."
+    if grep -qE '(^|/)\.\.(/|$)' <<<"$list"; then die "The archive contains '..' paths; refusing."; fi
+    bad=$(grep -vE "^(${MS_CONF_DIR#/}|${adata#/}|${ayaml#/})(/|$)" <<<"$list" | head -n3 || true)
+    [[ -z "$bad" ]] || die "The archive contains paths outside the MediaStack folders (e.g. $bad); refusing."
+    local vb; vb=$(tar -xzOf "$file" "${SECRETS_FILE#/}" 2>/dev/null | head -n1 | sed -n 's/.*backend=//p')
+    [[ "$vb" == systemd-creds ]] && log_warn "This archive's vault is host/TPM-bound (systemd-creds): it restores only on the host that made it."
+    log_warn "This replaces $MS_CONF_DIR, $ayaml and $adata with the archive's copies (current ones are kept as *.pre-restore-*)."
+    confirm_typed RESTORE || { log_info "Cancelled."; return 0; }
+    if (( DRY_RUN )); then log_info "[dry-run] would stop the stack, move the folders aside, extract and apply"; return 0; fi
+    if [[ -f "$CONF_FILE" ]]; then ( resolve_runtime; load_secrets; stack_down_if_running ) || true; fi
+    ts=$(date +%Y%m%d-%H%M%S)
+    for rel in "$MS_CONF_DIR" "$ayaml" "$adata"; do move_aside "$rel" "$ts"; done
+    tar -xzf "$file" -C / --numeric-owner
+    log_ok "Archive extracted"
+    restore_finish "$host_new"
+}
+
+# restore_host_settings STAGE -- fresh host: adopt the backup's settings minus host-specific ones
+restore_host_settings() {
+    local st=$1 saved=$CONF_FILE
+    [[ -f "$st/host.conf" ]] || return 0
+    CONF_FILE="$st/host.conf"; CONFIG_LOADED=0; load_config; CONF_FILE=$saved
+    CFG[SERVICE_UID]=""; CFG[SERVICE_GID]=""; CFG[SECRETS_BACKEND]=auto
+    if [[ "${CFG[LOCAL_DOCKER_IP]}" != auto ]] && ! grep -qw -- "${CFG[LOCAL_DOCKER_IP]}" <<<"$(ip -o addr show 2>/dev/null)"; then
+        log_warn "LOCAL_DOCKER_IP ${CFG[LOCAL_DOCKER_IP]} is not on this host; using auto."; CFG[LOCAL_DOCKER_IP]=auto; CFG[LOCAL_SUBNET]=auto
+    fi
+    if [[ "${CFG[CERT_MODE]}" == manual && ! -f "${CFG[TLS_CERT_FILE]}" ]]; then
+        log_warn "Manual certificate ${CFG[TLS_CERT_FILE]} is not on this host; copy it there before applying."
+    fi
+    CONFIG_LOADED=1
+}
+
+do_restore_portable() {
+    local file=$1 pp st0 st line k is_new=0 ts b_data b_yaml
+    log_step "Restore portable backup $file"
+    ensure_config
+    get_passphrase pp existing
+    st0=$(mktemp -d); chmod 700 "$st0"
+    # shellcheck disable=SC2064
+    trap "rm -rf -- '$st0'; trap - RETURN" RETURN
+    portable_decrypt "$file" "$pp" 2>/dev/null | tar -xzf - -C "$st0" --no-same-owner "$BACKUP_META" 2>/dev/null \
+        || die "Cannot decrypt $file: wrong passphrase, or the file is damaged."
+    local m="$st0/$BACKUP_META"
+    [[ -f "$m/manifest" && -f "$m/secrets.env" && -f "$m/SHA256SUMS" ]] || die "$file is not a complete mediastack-installer backup."
+    ( cd "$m" && sha256sum --quiet -c SHA256SUMS ) >/dev/null 2>&1 || die "Checksum mismatch: the backup is damaged."
+    b_data=$(sed -n 's/^data_dir=//p' "$m/manifest"); b_yaml=$(sed -n 's/^yaml_dir=//p' "$m/manifest")
+    log_ok "Passphrase OK: made on $(sed -n 's/^host=//p' "$m/manifest") at $(sed -n 's/^created=//p' "$m/manifest") (installer v$(sed -n 's/^installer=//p' "$m/manifest"))"
+    [[ -f "$CONF_FILE" ]] || is_new=1
+    if (( is_new )); then log_info "No install on this host: adopting the backup's settings (host-specific values reset)."
+    else log_info "Keeping this host's settings and folders ($CONF_FILE); restoring app data, compose folder, secrets and TLS CA."; fi
+    log_warn "This replaces the app data and compose folders (current ones kept as *.pre-restore-*) and the vault contents."
+    confirm_typed RESTORE || { log_info "Cancelled."; return 0; }
+    if (( DRY_RUN )); then log_info "[dry-run] would stop, restore data + secrets, and apply"; return 0; fi
+    if (( is_new )); then restore_host_settings "$m"; else ( resolve_runtime; load_secrets; stack_down_if_running ) || true; fi
+    resolve_runtime
+    mkdir -p "$(dirname "$FOLDER_FOR_DATA")"
+    st=$(mktemp -d "$(dirname "$FOLDER_FOR_DATA")/.ms-restore.XXXXXX"); chmod 700 "$st"
+    portable_decrypt "$file" "$pp" 2>/dev/null | tar -xzf - -C "$st" --numeric-owner \
+        || { rm -rf -- "$st"; die "Extracting $file failed."; }
+    ts=$(date +%Y%m%d-%H%M%S)
+    restore_tree "$st/${b_data#/}" "$FOLDER_FOR_DATA" "$ts"
+    if [[ "$b_yaml" != "$b_data" && "$b_yaml" != "$b_data"/* ]]; then restore_tree "$st/${b_yaml#/}" "$FOLDER_FOR_YAML" "$ts"; fi
+    rm -rf -- "$st"
+    mkdir -p "$MS_CONF_DIR"; chmod 700 "$MS_CONF_DIR"
+    if [[ -d "$m/tls" ]]; then rm -rf -- "$(tls_dir)"; cp -a "$m/tls" "$(tls_dir)"; chmod 700 "$(tls_dir)"; fi
+    SECRETS=()
+    while IFS= read -r line; do
+        [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
+        k=${BASH_REMATCH[1]}
+        in_list "$k" "${SECRET_KEYS[@]}" && SECRETS[$k]=$(printf '%s' "${BASH_REMATCH[2]}" | base64 -d)
+    done <"$m/secrets.env"
+    SECRETS_LOADED=1
+    save_secrets
+    (( is_new )) && save_config
+    restore_finish "$is_new"
+}
+
+restore_tree() {   # restore_tree SRC DST STAMP
+    local src=$1 dst=$2 ts=$3
+    [[ -d "$src" ]] || { log_warn "Backup has no $(basename "$dst") folder; skipped"; return 0; }
+    if is_mounted "$dst"; then
+        log_warn "$dst is a mountpoint; copying the backup over its contents"
+        cp -a "$src/." "$dst/"
+    else
+        move_aside "$dst" "$ts"
+        mkdir -p "$(dirname "$dst")"; mv -- "$src" "$dst"
+    fi
+    log_ok "Restored $dst"
+}
+
+restore_finish() {   # restore_finish FRESH
+    CONFIG_LOADED=0; SECRETS_LOADED=0
+    load_config; resolve_runtime; load_secrets
+    if (( $1 )); then preflight; install_docker; fi
+    ensure_service_account
+    install_self
+    stack_apply nopull
+    log_ok "Restore complete"
+}
+
+secrets_rekey() {
+    require_config; load_secrets
+    [[ -f "$SECRETS_FILE" ]] || die "No vault to re-encrypt yet."
+    log_step "Re-encrypting the vault (backend: $(secrets_backend_resolve))"
+    save_secrets
+}
+
+menu_backup() {
+    ensure_config
+    printf '\n  %sBackup / restore%s  (folder: %s, keep %s)\n' "$B" "$NC" "${CFG[BACKUP_DIR]}" "${CFG[BACKUP_KEEP]}"
+    printf '  1) Back up now (this host)\n  2) Portable backup (passphrase-encrypted)\n  3) List backups\n  4) Restore...\n  0) Back\n'
+    local ch f n; read -rp "  Choice: " ch || return 0
+    case "$ch" in
+        1) BACKUP_FORMAT_OPT=host;     menu_action do_backup; BACKUP_FORMAT_OPT="" ;;
+        2) BACKUP_FORMAT_OPT=portable; menu_action do_backup; BACKUP_FORMAT_OPT="" ;;
+        3) list_backups | nl -w3 -s') ' | sed 's/^/  /' ;;
+        4) local -a bl; mapfile -t bl < <(list_backups)
+           (( ${#bl[@]} )) && printf '%s\n' "${bl[@]}" | nl -w3 -s') ' | sed 's/^/  /'
+           ask f "Number or path of the backup to restore" ""
+           if [[ "$f" =~ ^[0-9]+$ ]] && (( f >= 1 && f <= ${#bl[@]} )); then n=$((f - 1)); f=${bl[$n]}; fi
+           [[ -n "$f" ]] && menu_action do_restore "$f" ;;
+    esac
+}
 
 # -----------------------------------------------------------------------------
 # SELF-TEST (no root, no network, no Docker needed)
@@ -2417,6 +3361,126 @@ self_test() {
     printf '# static\nUUID=x / ext4 defaults 0 1\n' >"$t/fstab"
     st "fstab set/replace/remove"          '( MS_FSTAB="$t/fstab"; DRY_RUN=0; fstab_set MEDIA "a b cifs o 0 0" && fstab_set MEDIA "c d cifs o 0 0" && [[ "$(fstab_current MEDIA)" == "c d cifs o 0 0" && $(grep -c mediastack-installer:MEDIA "$MS_FSTAB") == 1 && "$(fstab_mountpoint MEDIA)" == d ]] && fstab_set MEDIA "" && [[ -z "$(fstab_current MEDIA)" && $(wc -l <"$MS_FSTAB") == 2 ]] && [[ -f "$MS_FSTAB.mediastack.bak" ]] )'
     st "config migration EXCLUDE->DISABLED" '( MS_CONF_DIR="$t/c"; CONF_FILE="$t/c/m.conf"; mkdir -p "$t/c"; printf "%s\n" "EXCLUDE_SERVICES='"'"'whisparr readarr'"'"'" >"$CONF_FILE"; REF_OVERRIDE=""; load_config; [[ "${CFG[DISABLED_SERVICES]}" == whisparr && "${CFG[REMOVED_SERVICES]}" == readarr ]] )'
+    # ---- v2: presets, dependencies, patches, TLS, backups (fixture compose mirrors upstream structure)
+    mkdir -p "$t/y" "$t/st" "$t/conf2" "$t/data/traefik"
+    cat >"$t/y/docker-compose.yaml" <<'FIX'
+networks:
+  mediastack:
+    name: mediastack
+services:
+  gluetun:
+    image: g
+  qbittorrent:
+    network_mode: "service:gluetun"
+  sonarr:
+    network_mode: service:gluetun
+  jellyfin:
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+  plex:
+    network_mode: "service:gluetun"
+  traefik:
+    image: t
+  traefik-certs-dumper:
+    image: d
+  crowdsec:
+    image: c
+  authentik:
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+  postgresql:
+    image: p
+  valkey:
+    image: v
+  homarr:
+    image: ghcr.io/ajnart/homarr:latest
+  tailscale:
+    image: ts
+  headscale:
+    image: hs
+  headplane:
+    depends_on:
+      - headscale
+  readarr:
+    image: r
+  whisparr:
+    image: w
+FIX
+    cat >"$t/data/traefik/traefik.yaml" <<'FIX'
+entryPoints:
+  secureweb:
+    address: :443
+    http:
+      tls:
+        options: default
+        certResolver: letsencrypt
+        domains:
+          - main: example.org
+            sans:
+              - "*.example.org"
+  metrics:
+    address: :8082
+providers:
+  file:
+    directory: /etc/traefik
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      storage: /letsencrypt/acme.json
+      dnsChallenge:
+        provider: cloudflare
+experimental:
+  plugins: {}
+FIX
+    cat >"$t/data/traefik/dynamic.yaml" <<'FIX'
+tls:
+  stores:
+    default:
+      defaultGeneratedCert:
+        resolver: letsencrypt
+        domain:
+          main: example.org
+          sans:
+            - "*.example.org"
+  options:
+    default:
+      sniStrict: true
+http:
+  middlewares: {}
+FIX
+    st_prep() { CFG[FOLDER_FOR_YAML]="$t/y"; CFG[ACCESS_MODE]=$1; CFG[PLAYER]=$2; CFG[TAILSCALE_CONTROL]=$3
+                CFG[SERVICE_PRESET]=$4; CFG[CERT_MODE]=${5:-letsencrypt}; apply_preset; }
+    st_on()  { local s; for s in "$@"; do [[ "$(eff_state "$s")" == on ]] || return 1; done; }
+    st_off() { local s; for s in "$@"; do [[ "$(eff_state "$s")" != on ]] || return 1; done; }
+    st "preset core/internet"              '( st_prep internet jellyfin tailscale core; st_on gluetun qbittorrent sonarr jellyfin traefik traefik-certs-dumper crowdsec authentik postgresql valkey tailscale audiobookshelf && st_off plex homarr headscale headplane whisparr && [[ $(svc_state readarr) == removed && -z "$(check_dependencies)" ]] )'
+    st "preset core/lan"                   '( st_prep lan plex tailscale core selfsigned; st_on plex gluetun tailscale && st_off jellyfin traefik crowdsec authentik postgresql valkey && [[ -z "$(check_dependencies)" ]] )'
+    st "preset core + headscale"           '( st_prep internet both headscale core; st_on headscale headplane jellyfin plex && [[ -z "$(check_dependencies)" ]] )'
+    st "preset full"                       '( st_prep internet jellyfin tailscale full; st_on homarr headscale plex traefik && [[ $(svc_state whisparr) == disabled && $(svc_state readarr) == removed ]] )'
+    st "compose_deps (map, list, network_mode)" '( d=$(compose_deps "$t/y/docker-compose.yaml"); grep -qx "jellyfin gluetun" <<<"$d" && grep -qx "headplane headscale" <<<"$d" && grep -qx "sonarr gluetun" <<<"$d" && grep -qx "authentik valkey" <<<"$d" )'
+    st "dependency problems detected"      '( st_prep internet jellyfin tailscale core; CFG[SERVICE_PRESET]=custom; set_svc_state gluetun disabled; set_svc_state crowdsec disabled; set_svc_state postgresql removed; d=$(check_dependencies); grep -qx "jellyfin needs gluetun" <<<"$d" && grep -qx "traefik needs crowdsec" <<<"$d" && grep -qx "authentik needs postgresql" <<<"$d" )'
+    st "homarr patch: homarr-labs + !override" '( st_prep internet jellyfin tailscale full; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"image: ghcr.io/homarr-labs/homarr:latest"* && "$o" == *"volumes: !override"* && "$o" == *"SECRET_ENCRYPTION_KEY=\${SECRET_ENCRYPTION_KEY:?err}"* ]] )'
+    st "disabled + patched -> one block"   '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ $(grep -c "^  homarr:" <<<"$o") == 1 ]] && [[ "$(awk "/^  homarr:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o")" == *profiles* ]] )'
+    st "tailscale patch follows control"   '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"TS_EXTRA_ARGS=--hostname=exit-node --advertise-exit-node"* && "$o" != *login-server* ]] && st_prep internet jellyfin headscale core && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *TS_EXTRA_ARGS* ]] )'
+    st "certs-dumper auto-off unless LE"   '( st_prep internet jellyfin tailscale core selfsigned; [[ $(svc_state traefik-certs-dumper) == on && $(eff_state traefik-certs-dumper) == disabled ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$(awk "/^  traefik-certs-dumper:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o")" == *profiles* ]] )'
+    st "secrets needed follow services"    '( st_prep lan jellyfin tailscale core selfsigned; ! secret_needed CLOUDFLARE_DNS_API_TOKEN && secret_needed TAILSCALE_AUTHKEY && secret_needed VPN_PASSWORD && ! secret_needed PLEX_CLAIM && st_prep internet plex tailscale core letsencrypt && secret_needed CLOUDFLARE_DNS_API_TOKEN && secret_needed PLEX_CLAIM )'
+    st "traefik static: ACME removed"      '( DRY_RUN=0; traefik_static_no_acme "$t/data/traefik/traefik.yaml"; f="$t/data/traefik/traefik.yaml"; ! grep -q "certResolver\|certificatesResolvers\|domains:\|acme" "$f" && grep -q "^experimental:" "$f" && grep -q "options: default" "$f" && grep -q "^  metrics:" "$f" )'
+    st "traefik dynamic: file certificate" '( DRY_RUN=0; traefik_dynamic_file_cert "$t/data/traefik/dynamic.yaml"; f="$t/data/traefik/dynamic.yaml"; ! grep -q "defaultGeneratedCert\|resolver:" "$f" && grep -q "^      defaultCertificate:" "$f" && grep -q "^  certificates:" "$f" && grep -q "sniStrict: true" "$f" && [[ $(grep -c "certFile: /etc/traefik/certs/cert.pem" "$f") == 2 ]] )'
+    st "self-signed CA + leaf (SANs, chain)" '( MS_CONF_DIR="$t/conf2"; MS_STATE_DIR="$t/st"; DRY_RUN=0; LOG_FILE=""; CFG[DOMAIN]=media.example.org; CFG[CLOUDFLARE_DNS_ZONE]=media.example.org; CFG[LOCAL_DOCKER_IP]=10.0.0.5; mkdir -p "$t/leaf"
+        ensure_local_ca && issue_leaf "$t/leaf" && state_set tls_sans "$(tls_sans)" &&
+        openssl verify -CAfile "$t/conf2/tls/ca.crt" "$t/leaf/cert.pem" &&
+        s=$(openssl x509 -in "$t/leaf/cert.pem" -noout -ext subjectAltName) && [[ "$s" == *"*.media.example.org"* && "$s" == *"10.0.0.5"* ]] &&
+        ! leaf_needs_reissue "$t/leaf/cert.pem" && CFG[LOCAL_DOCKER_IP]=10.0.0.6 && leaf_needs_reissue "$t/leaf/cert.pem" &&
+        [[ $(stat -c %a "$t/leaf/key.pem") == 600 && $(stat -c %a "$t/conf2/tls/ca.key") == 600 ]] )'
+    st "manual cert: pair check"            '( MS_CONF_DIR="$t/conf2"; CFG[CLOUDFLARE_DNS_ZONE]=media.example.org; tls_validate_pair "$t/leaf/cert.pem" "$t/leaf/key.pem" && openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$t/other.key" 2>/dev/null && ! tls_validate_pair "$t/leaf/cert.pem" "$t/other.key" && ! tls_validate_pair "$t/leaf/key.pem" "$t/leaf/key.pem" )'
+    st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
+    st "--set validation"                   'validate_key CERT_MODE selfsigned && ! validate_key CERT_MODE self && validate_key ACCESS_MODE lan && ! validate_key DATA_STORAGE smb && validate_key MEDIA_REMOTE "//nas/media" && validate_key BACKUP_KEEP 7 && ! validate_key BACKUP_KEEP x && ! validate_key NOPE 1 && ! validate_key DOMAIN "a b"'
+    st "v1.x config keeps old behaviour"    '( MS_CONF_DIR="$t/c3"; CONF_FILE="$t/c3/m.conf"; mkdir -p "$t/c3"; printf "%s\n" "DOMAIN='"'"'x.org'"'"'" >"$CONF_FILE"; REF_OVERRIDE=""; load_config; [[ ${CFG[ACCESS_MODE]} == internet && ${CFG[CERT_MODE]} == letsencrypt && ${CFG[SERVICE_PRESET]} == custom && ${CFG[TAILSCALE_CONTROL]} == headscale ]] )'
+    st "new install defaults"               '( CONF_FILE="$t/none.conf"; REF_OVERRIDE=""; load_config; [[ ${CFG[SERVICE_PRESET]} == core && ${CFG[TAILSCALE_CONTROL]} == tailscale && ${CFG[BACKUP_FORMAT]} == host ]] )'
     st "placeholder detection"             'looks_placeholder X "1234567890abcdef1234" && looks_placeholder X "<user>" && ! looks_placeholder X "Sup3rS3cret"'
     st "secrets round-trip (openssl)"      '(
         MS_CONF_DIR="$t/conf"; SECRETS_FILE="$t/conf/secrets.enc"; KEY_FILE="$t/conf/.k"; CFG[SECRETS_BACKEND]=openssl
@@ -2484,9 +3548,10 @@ main_menu() {
         printf '   4) Apply + pull updates   (converge, pull images, up)\n'
         printf '   5) Apply without pulling  (converge, up)\n'
         printf '   6) Stop stack             (containers down, data kept)\n'
+        printf '   R) Restart containers     (no converge)\n'
         printf '   7) Status\n   8) Post-install helpers\n   9) Logs\n'
         printf '  %sMaintenance%s\n' "$B" "$NC"
-        printf '   U) Uninstall...\n   T) Toggle dry-run\n   S) Self-test\n   0) Quit\n\n'
+        printf '   B) Backup / restore\n   C) Show settings (all keys)\n   U) Uninstall...\n   T) Toggle dry-run\n   S) Self-test\n   0) Quit\n\n'
         local ch; read -rp "  Choice: " ch || exit 0
         case "${ch,,}" in
             1) menu_action full_install ;;
@@ -2498,6 +3563,9 @@ main_menu() {
             7) menu_action show_status ;;
             8) menu_helpers ;;
             9) menu_logs ;;
+            r) menu_action stack_restart ;;
+            b) menu_backup ;;
+            c) menu_action show_config ;;
             u) menu_uninstall ;;
             t) DRY_RUN=$(( 1 - DRY_RUN )); log_info "Dry-run is now $( ((DRY_RUN)) && echo ON || echo OFF)"; continue ;;
             s) menu_action self_test ;;
@@ -2523,7 +3591,16 @@ Actions (default: interactive menu)
   --apply                Converge files/.env/folders, pull images, start stack
   --start                Converge and start without pulling images
   --stop                 Stop stack (docker compose down; data kept)
-  --status               Show configuration and container status
+  --restart              Restart the containers (no converge)
+  --status               Show configuration, storage, certificate and container status
+  --logs [N] [SERVICE]   Last N container log lines (default 100), all services or one
+  --show-config          Print every setting with its meaning
+  --set KEY VALUE        Change one setting (validated; presets re-applied), then --apply
+  --backup [--portable]  Back up settings, vault, compose folder and app data to BACKUP_DIR
+                         (--portable: passphrase-encrypted, restores on any host)
+  --restore FILE         Restore a backup (keyword RESTORE)
+  --passphrase-file FILE Portable backup passphrase (first line), or set MS_BACKUP_PASSPHRASE
+  --rekey                Re-encrypt the vault with the configured SECRETS_BACKEND
   --helper NAME          authentik-db | guacamole | akadmin | apikeys
   --settings             Settings menu (paths, network, storage, services, ...)
   --test-storage T       Trial-mount MEDIA or DATA share; check write + hardlinks
@@ -2538,7 +3615,7 @@ Options
   --dry-run              Show what would change; change nothing
   --yes                  Accept defaults for all prompts (non-interactive)
   --ref REF              Use this upstream commit/tag/branch for this run (saved on --install)
-  --confirm KEYWORD      Pre-answer a typed confirmation (UNINSTALL, PURGE-DOCKER)
+  --confirm KEYWORD      Pre-answer a typed confirmation (UNINSTALL, PURGE-DOCKER, RESTORE, DELETE-MEDIA)
 
 Files
   $CONF_FILE    settings (0600)
@@ -2559,13 +3636,24 @@ acquire_lock() {
 }
 
 main() {
-    local action="menu" helper="" ; local -a compose_args=() orig=("$@")
+    local action="menu" helper="" arg1="" arg2="" ; local -a compose_args=() orig=("$@") set_kv=()
     while (( $# )); do
         case "$1" in
             --install)      action=install ;;
             --apply)        action=apply ;;
             --start)        action=start ;;
             --stop)         action=stop ;;
+            --restart)      action=restart ;;
+            --logs)         action=logs
+                            if [[ "${2:-}" =~ ^[0-9]+$ ]]; then arg1=$2; shift; fi
+                            if [[ -n "${2:-}" && "${2:-}" != -* ]]; then arg2=$2; shift; fi ;;
+            --show-config)  action=showconfig ;;
+            --set)          action="set"; (( $# >= 3 )) || die "--set needs KEY VALUE"; set_kv=("$2" "$3"); shift 2 ;;
+            --backup)       action=backup ;;
+            --portable)     BACKUP_FORMAT_OPT=portable ;;
+            --restore)      action=restore; arg1=${2:-}; [[ -n "$arg1" ]] || die "--restore needs FILE"; shift ;;
+            --passphrase-file) PASSPHRASE_FILE_OPT=${2:-}; [[ -n "$PASSPHRASE_FILE_OPT" ]] || die "--passphrase-file needs FILE"; shift ;;
+            --rekey)        action=rekey ;;
             --status)       action=status ;;
             --helper)       action=helper; helper=${2:-}; shift ;;
             --secrets)      action=secrets ;;
@@ -2605,6 +3693,13 @@ main() {
         apply)     stack_apply pull ;;
         start)     stack_apply nopull ;;
         stop)      stack_stop ;;
+        restart)   stack_restart ;;
+        logs)      show_logs "${arg1:-100}" "$arg2" ;;
+        showconfig) show_config ;;
+        set)       cli_set "${set_kv[0]}" "${set_kv[1]}" ;;
+        backup)    do_backup ;;
+        restore)   do_restore "$arg1" ;;
+        rekey)     secrets_rekey ;;
         status)    show_status ;;
         secrets)   menu_secrets ;;
         settings)  is_tty || die "Settings menu needs a terminal."; menu_settings ;;
