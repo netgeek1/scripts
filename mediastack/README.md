@@ -590,7 +590,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 53 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 54 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
