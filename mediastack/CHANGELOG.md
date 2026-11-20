@@ -3,6 +3,77 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.0.0 — 2026-11-19 — Presets, access modes, certificates, Homarr 1.x, standard CLI
+
+### Breaking
+- **Homarr moves to homarr-labs (1.x).** `ghcr.io/homarr-labs/homarr:latest` replaces upstream's legacy
+  `ghcr.io/ajnart/homarr` via the managed override (`volumes`/`environment` use `!override`):
+  - data now lives in `<FOLDER_FOR_DATA>/homarr/appdata`, with a read-only Docker socket
+  - a generated 64-hex `SECRET_ENCRYPTION_KEY` comes from the vault
+  - 0.x boards are not migrated (they stay in `homarr/configs`)
+- Docker Compose **v2.24.4+** is required (for `!override`). The installer upgrades `docker-compose-plugin` when it
+  is older.
+- New installs default to the **Core** preset (about 15 services LAN-only, about 23 Internet-facing) instead of
+  "everything".
+- New installs default to the **official Tailscale control server**. Existing v1.x configs keep their behaviour
+  (see *Changed*).
+
+### Added
+- **Service presets** chosen in the wizard: `core` (default), `full` and `custom`.
+  - Core: Gluetun, qBittorrent, SABnzbd, Prowlarr, FlareSolverr, Unpackerr, Sonarr, Radarr, Lidarr, Bazarr, Seerr,
+    Homepage, **Tailscale**, Audiobookshelf + `PLAYER` (Jellyfin, Plex or both). In `internet` mode it adds
+    Traefik, Authentik + worker, CrowdSec, PostgreSQL, Valkey and traefik-certs-dumper; with Headscale control it
+    adds Headscale + Headplane.
+  - Full: every upstream service except Whisparr (disabled).
+  - Readarr is always removed (retired upstream).
+- **Access mode** asked at install: `internet` (Traefik, Authentik, CrowdSec on a public domain) or `lan` (apps on
+  their own ports; no Cloudflare or public domain needed; defaults to `mediastack.lan`).
+- **Certificate source** for Traefik:
+  - `letsencrypt`: upstream's Cloudflare DNS-01
+  - `selfsigned`: a local CA in `/etc/mediastack/tls`, plus a wildcard leaf for the domain and host IP that is
+    renewed 30 days before expiry or when the domain or IP changes
+  - `manual`: your full-chain cert + key, checked for key match, expiry and `*.<domain>` coverage, and re-copied on
+    every apply
+  - For `selfsigned` and `manual`, the ACME resolver is removed from Traefik's config, a `sniStrict`-compatible file
+    certificate is wired in, and `traefik-certs-dumper` is parked automatically.
+- **Tailscale control server** setting (`TAILSCALE_CONTROL`): `tailscale` (official; overrides only
+  `TS_EXTRA_ARGS` to drop upstream's `--login-server`) or `headscale` (upstream).
+- **Dependency check**: covers upstream `depends_on` and `network_mode: service:*`, plus Traefik → CrowdSec/Authentik
+  and Tailscale → Headscale. It warns in Settings, `--set` and status, and **refuses to apply** while an enabled
+  service needs a disabled one.
+- **Secrets are prompted only when used.** The Cloudflare token only with Traefik + Let's Encrypt, PLEX_CLAIM only
+  with Plex, VPN credentials only with Gluetun, and SMTP only with Authentik. Unused placeholders no longer warn.
+- **Standard CLI**, matching the other netgeek1 installers:
+  - `--restart` and `--logs [N] [SERVICE]`
+  - `--show-config` (every key with its meaning) and `--set KEY VALUE` (validated; re-applies presets; switches to
+    `custom` when the lists are edited)
+  - `--backup [--portable]`, `--restore FILE`, `--passphrase-file` / `MS_BACKUP_PASSPHRASE`, and `--rekey`
+- **Backup / restore:**
+  - host format (`tar.gz`): settings, vault + key, TLS CA, compose folder and app data, made with the containers
+    stopped
+  - portable format (`.msbak`): the same with secrets decrypted inside a passphrase-encrypted archive
+    (AES-256-CBC, PBKDF2-SHA256 × 600,000) that restores onto a fresh host
+  - Media and Plex/Jellyfin caches are excluded, and backups are pruned to `BACKUP_KEEP`.
+  - Restore keeps the previous folders as `*.pre-restore-*` and refuses unsafe archives.
+- Menu: **R** restart, **B** backup/restore, **C** show settings. Settings gains **Access / certs** and **Services**
+  (preset, player, Tailscale control), and the backup settings are added to the upstream/secrets section.
+- Status shows access mode, certificate source and expiry, preset, auto-off services and dependency problems. The
+  summary prints `https://<app>.<domain>` links when Traefik runs.
+- **MIT LICENSE** file. The header now reads *Author: netgeek1 & Claude (Anthropic)* and *License: MIT*, and the
+  script has `SCRIPT_DIR`.
+- Self-test grows to 53 checks.
+
+### Changed
+- Existing v1.x configs **keep their behaviour**. Settings missing from the file default to `ACCESS_MODE=internet`,
+  `CERT_MODE=letsencrypt`, `SERVICE_PRESET=custom`, `TAILSCALE_CONTROL=headscale` and `PLAYER=both`.
+- Post-install helpers are offered only for enabled services (Authentik, Guacamole).
+- The README quick start points at `netgeek1/scripts`.
+
+### Fixed
+- `producer | grep -q` pipelines could fail with SIGPIPE (rc 141) under `pipefail` and make an enabled service look
+  disabled. All such checks now match against captured output.
+- `--restore NAME` now finds backups in `BACKUP_DIR` and next to the installer.
+
 ## v1.2.0 — 2026-10-16 — Audiobookshelf add-on
 
 ### Added
