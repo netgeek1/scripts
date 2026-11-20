@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.0.1"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -792,10 +792,20 @@ preflight() {
     avail=$(df -Pk "$parent" | awk 'NR==2 {print int($4/1024/1024)}')
     (( avail >= 20 )) || log_warn "Only ${avail} GiB free under $parent; images alone need ~15 GiB."
     log_ok "Free space under $parent: ${avail} GiB"
-    compose_version_ok || log_warn "Docker Compose $(compose_version) is older than v2.24.4 (needed for '!override'); it is updated with Docker below."
+    if ! have_docker; then
+        log_info "Docker is not installed yet; it is installed (with Compose v2.24.4+) after the settings."
+    elif compose_version_ok; then
+        log_ok "Docker Compose $(compose_version)"
+    else
+        log_warn "Docker Compose $(compose_version) is older than v2.24.4 (needed for '!override'); it is updated with Docker below."
+    fi
 }
 
-compose_version() { docker compose version --short 2>/dev/null | sed 's/^v//'; }
+compose_version() {   # empty when Docker/Compose is not installed yet (never fails)
+    have_docker || return 0
+    local v; v=$(docker compose version --short 2>/dev/null) || v=""
+    printf '%s' "${v#v}"
+}
 compose_version_ok() {   # true when Compose understands the !override YAML tag (v2.24.4+)
     local v; v=$(compose_version)
     [[ -n "$v" ]] || return 1
@@ -3480,6 +3490,7 @@ FIX
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
     st "--set validation"                   'validate_key CERT_MODE selfsigned && ! validate_key CERT_MODE self && validate_key ACCESS_MODE lan && ! validate_key DATA_STORAGE smb && validate_key MEDIA_REMOTE "//nas/media" && validate_key BACKUP_KEEP 7 && ! validate_key BACKUP_KEEP x && ! validate_key NOPE 1 && ! validate_key DOMAIN "a b"'
     st "v1.x config keeps old behaviour"    '( MS_CONF_DIR="$t/c3"; CONF_FILE="$t/c3/m.conf"; mkdir -p "$t/c3"; printf "%s\n" "DOMAIN='"'"'x.org'"'"'" >"$CONF_FILE"; REF_OVERRIDE=""; load_config; [[ ${CFG[ACCESS_MODE]} == internet && ${CFG[CERT_MODE]} == letsencrypt && ${CFG[SERVICE_PRESET]} == custom && ${CFG[TAILSCALE_CONTROL]} == headscale ]] )'
+    st "compose version check without Docker" '( PATH=/nonexistent; e=$(compose_version 2>&1); [[ -z "$e" ]] && ! compose_version_ok 2>/dev/null )'
     st "new install defaults"               '( CONF_FILE="$t/none.conf"; REF_OVERRIDE=""; load_config; [[ ${CFG[SERVICE_PRESET]} == core && ${CFG[TAILSCALE_CONTROL]} == tailscale && ${CFG[BACKUP_FORMAT]} == host ]] )'
     st "placeholder detection"             'looks_placeholder X "1234567890abcdef1234" && looks_placeholder X "<user>" && ! looks_placeholder X "Sup3rS3cret"'
     st "secrets round-trip (openssl)"      '(
