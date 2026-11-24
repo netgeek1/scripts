@@ -3,6 +3,17 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.2 — 2026-11-23
+
+### Fixed
+- **`custom` + WireGuard refused to start** ("for VPN service provider custom: the country specified is not valid").
+  Server filters kept from a listed provider were still passed. `custom` has no server list, so Apply now leaves
+  `SERVER_COUNTRIES`/`CITIES`/`HOSTNAMES`/`REGIONS` out of `.env` for `custom` (the settings are kept for switching
+  back), and the wizard doesn't ask for them. There is a matching hint in the start-failure diagnosis.
+- **Deprecated endpoint names:** Gluetun warned about `VPN_ENDPOINT_IP`/`_PORT`, which upstream's compose file
+  passes. They are now blank in `.env`, and the override sets `WIREGUARD_ENDPOINT_IP`/`_PORT` for custom WireGuard.
+- Self-test: 74 checks.
+
 ## v2.5.1 — 2026-11-23
 
 ### Fixed
