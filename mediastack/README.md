@@ -164,7 +164,7 @@ You can re-run detection any time with **Settings → D**.
 | `--cert-push-setup [FILE\|-]` | Set up the push receiver: user, forced-command key, sudoers rule. Public key from a file, stdin or a prompt |
 | `--cert-receive` | The push receiver itself (run by the forced SSH command; reads chain + key on stdin) |
 | `--test-storage MEDIA\|DATA` | Trial-mount the share; test write and hardlinks as the service account |
-| `--helper NAME` | `authentik-db`, `guacamole`, `akadmin`, `apikeys` or `vpn-servers` |
+| `--helper NAME` | `authentik-db`, `guacamole`, `akadmin`, `apikeys`, `vpn-servers` or `vpn-check` |
 | `--secrets` | Secrets menu |
 | `--uninstall` | Remove stack, compose and app-data folders, and managed mounts (keyword `UNINSTALL`) |
 | `--purge-docker` | Remove Docker Engine host-wide (keyword `PURGE-DOCKER`) |
@@ -379,7 +379,15 @@ still fail to start, for example because the VPN rejected the login, the install
   provider, a custom config problem, a rejected WireGuard key or address, a missing TUN device, an unreachable
   server, or a tunnel that is up but passes no traffic (key not accepted, or an outdated server list)
 
-Only Gluetun's own `ERROR`/`WARN` lines are used for this, and each line is judged on its own. Normal WireGuard log lines no longer produce a "WireGuard
+Only Gluetun's own `ERROR`/`WARN` lines are used for this, and each line is judged on its own.
+
+With WireGuard, the diagnosis (and Post-install helpers → 6, `--helper vpn-check`) also reads WireGuard's own state
+inside Gluetun: the interface public key, the peer, the bytes sent and received, and whether a handshake happened.
+This needs `wireguard-tools` on the host. WireGuard itself never reports errors, so this tells apart three cases:
+
+- a wrong stored key: the public key differs from the one your working config shows
+- packets that get no answer: no handshake
+- a working tunnel with a problem above it, such as DNS: a handshake and bytes received Normal WireGuard log lines no longer produce a "WireGuard
 settings problem" hint.
 
 Read the full log with `--logs 200 gluetun`. To run without a VPN, pick the `no-download-vpn` variant.
@@ -705,6 +713,7 @@ password**.
 | Create Guacamole DB | Creates the database, grants access, loads the schema and restarts Guacamole. The default login is `guacadmin`/`guacadmin`, so change it |
 | Reset akadmin | Runs `ak changepassword akadmin` once Authentik is healthy |
 | *ARR API keys | Reads each app's key and optionally stores the keys in the vault for unpackerr/homepage |
+| VPN check | Settings problems, Gluetun's health, its recent errors with hints, and (WireGuard) the handshake state read inside Gluetun's network namespace (`--helper vpn-check`) |
 | Update VPN server list | Runs Gluetun's server-list updater once and restarts Gluetun (`--helper vpn-servers`; see [Server list updates](#server-list-updates)) |
 
 ## Uninstall
@@ -762,7 +771,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 74 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 75 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
