@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.2.1"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -123,7 +123,7 @@ SECRET_KEYS=( VPN_USERNAME VPN_PASSWORD PLEX_CLAIM CLOUDFLARE_DNS_API_TOKEN EMAI
 # Vault entries that are not .env variables
 SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE )
 SECRET_PROMPTED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY EMAIL_PASSWORD PLEX_CLAIM )
-SECRET_WIREGUARD=( WIREGUARD_PRIVATE_KEY WIREGUARD_PRESHARED_KEY )
+SECRET_WIREGUARD=( WIREGUARD_PRIVATE_KEY )   # WIREGUARD_PRESHARED_KEY is optional: taken from wg0.conf only
 SECRET_REQUIRED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY )   # compose :?err
 SECRET_GENERATED=( POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY HEADPLANE_COOKIE_SECRET SECRET_ENCRYPTION_KEY )
 readonly SECRET_UNSET="not-set"
@@ -551,7 +551,8 @@ secret_needed() {
     case "$1" in
         VPN_USERNAME|VPN_PASSWORD) svc_enabled gluetun && [[ "${CFG[VPN_TYPE]}" == openvpn ]] \
                                    && { [[ "${CFG[VPN_SERVICE_PROVIDER]}" != custom ]] || grep -qE '^[[:space:]]*auth-user-pass' "${CFG[VPN_CUSTOM_OVPN_FILE]:-/dev/null}" 2>/dev/null; } ;;
-        WIREGUARD_PRIVATE_KEY|WIREGUARD_PRESHARED_KEY) svc_enabled gluetun && [[ "${CFG[VPN_TYPE]}" == wireguard ]] ;;
+        WIREGUARD_PRIVATE_KEY) svc_enabled gluetun && [[ "${CFG[VPN_TYPE]}" == wireguard ]] ;;
+        WIREGUARD_PRESHARED_KEY) return 1 ;;   # optional; most providers do not use one
         CLOUDFLARE_DNS_API_TOKEN) svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == letsencrypt ]] ;;
         TAILSCALE_AUTHKEY) svc_enabled tailscale ;;
         PLEX_CLAIM) svc_enabled plex ;;
@@ -1991,7 +1992,7 @@ wg_import() {
     pub=$(wg_value Peer PublicKey "$f"); psk=$(wg_value Peer PresharedKey "$f"); ep=$(wg_value Peer Endpoint "$f")
     [[ -n "$pk" && -n "$addr" ]] || { log_error "No [Interface] PrivateKey/Address found; is this a WireGuard config?"; return 1; }
     SECRETS[WIREGUARD_PRIVATE_KEY]=$pk; SECRETS_DIRTY=1
-    [[ -n "$psk" ]] && SECRETS[WIREGUARD_PRESHARED_KEY]=$psk
+    SECRETS[WIREGUARD_PRESHARED_KEY]=$psk   # blank when the new config has none (clears an old one)
     if [[ "$addr" == *,* ]]; then
         log_info "Address has several entries ($addr); Gluetun uses them as given (IPv6 needs IPv6 enabled in Docker)."
     fi
@@ -3954,6 +3955,7 @@ FIX
         [[ "$(openssl crl2pkcs7 -nocrl -certfile "$d/out.pem" | openssl pkcs7 -print_certs -noout | sed -n "s/^subject=//p" | tr -d " " | xargs)" == "CN=media.example.org CN=TestInt CN=TestRoot" ]] &&
         ! tls_validate_pair "$d/mixed.pem" "$d/root.key.missing" ; rc=$?; rm -rf "$d"; exit $rc )'
     st "wg0.conf import (custom)"         '( printf "[Interface]\nPrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=\nAddress = 10.64.1.2/32\nDNS = 10.64.0.1\n\n[Peer]\nPublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=\nPresharedKey = ccc=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.7:51820 # srv\n" >"$t/wg0.conf"; CFG[VPN_SERVICE_PROVIDER]=custom; wg_import "$t/wg0.conf" && [[ "${SECRETS[WIREGUARD_PRIVATE_KEY]}" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa= && "${CFG[WIREGUARD_ADDRESSES]}" == 10.64.1.2/32 && "${CFG[VPN_ENDPOINT_IP]}" == 198.51.100.7 && "${CFG[VPN_ENDPOINT_PORT]}" == 51820 && "${CFG[WIREGUARD_PUBLIC_KEY]}" == bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb= && "${SECRETS[WIREGUARD_PRESHARED_KEY]}" == ccc= ]] && validate_key WIREGUARD_PUBLIC_KEY "${CFG[WIREGUARD_PUBLIC_KEY]}" )'
+    st "wg0.conf without PresharedKey"    '( st_prep lan jellyfin tailscale core selfsigned; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=mullvad; SECRETS[WIREGUARD_PRESHARED_KEY]=old=; printf "[Interface]\nPrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=\nAddress = 10.64.1.2/32\n\n[Peer]\nPublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=\nEndpoint = 198.51.100.7:51820\n" >"$t/wg1.conf"; wg_import "$t/wg1.conf" >/dev/null && [[ -z "${SECRETS[WIREGUARD_PRESHARED_KEY]}" ]] && secret_needed WIREGUARD_PRIVATE_KEY && ! secret_needed WIREGUARD_PRESHARED_KEY && ! in_list WIREGUARD_PRESHARED_KEY "${SECRET_WIREGUARD[@]}" && [[ -z "$(vpn_problems)" || "$(vpn_problems)" != *PRESHARED* ]] )'
     st "VPN problems detected"             '( st_prep lan jellyfin tailscale core selfsigned; CFG[VPN_TYPE]=openvpn; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[VPN_CUSTOM_OVPN_FILE]=""; p=$(vpn_problems); [[ "$p" == *".ovpn"* ]] &&
         CFG[VPN_SERVICE_PROVIDER]=nordvpn && SECRETS[VPN_USERNAME]=""; p=$(vpn_problems); [[ "$p" == *"VPN_USERNAME"* ]] &&
         SECRETS[VPN_USERNAME]=u && SECRETS[VPN_PASSWORD]=p && p=$(vpn_problems) && [[ "$p" != *VPN_USERNAME* ]] &&
