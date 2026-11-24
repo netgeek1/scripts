@@ -3,6 +3,17 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.10 — 2026-11-24
+
+### Fixed
+- **"Served now" was empty, and every certificate check restarted Traefik.** The local check connected with the bare
+  domain as SNI (`certifiedgeeks.net`). A wildcard certificate (`*.certifiedgeeks.net`) doesn't cover it, so
+  Traefik's strict SNI refused the handshake. The check read that as "old certificate" and restarted Traefik. It now
+  uses `mediastack-probe.<domain>`, which the wildcard covers.
+- No TLS answer at all is now reported as `live=unknown`, with a pointer to Traefik's log, instead of restarting
+  Traefik. A restart happens only when Traefik answers with a different certificate.
+- Self-test: 79 checks.
+
 ## v2.5.9 — 2026-11-24
 
 ### Fixed
