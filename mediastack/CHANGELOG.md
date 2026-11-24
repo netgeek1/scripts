@@ -3,6 +3,17 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.8 — 2026-11-24
+
+### Fixed
+- **The second route came from an orphaned bridge, not a Docker network.** `br-cef1f9fa439b` was left behind by a
+  Docker network that no longer exists. Docker no longer lists it, so 2.5.7's check didn't see it, but its
+  `linkdown` route for `172.28.10.0/24` still captured the replies, because Linux uses linkdown routes unless
+  `ignore_routes_with_linkdown` is set. Apply now also checks host interfaces on the stack's subnet:
+  - orphaned Docker bridges (`br-<12 hex>`, no ports, unknown to Docker) are deleted
+  - any other interface on that subnet stops Apply with what to do
+- Self-test: 78 checks.
+
 ## v2.5.7 — 2026-11-23
 
 ### Fixed
