@@ -3,6 +3,40 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.2.0 — 2026-11-23 — Certificate chains, VPN checks and diagnostics
+
+### Fixed
+- **Full chains with several certificates.** The chain paste stopped at the first blank line after a certificate,
+  so a chain with blank lines between its certificates kept only the first one. The paste now reads every
+  certificate and ends 3 seconds after the paste, at `END`, or at Ctrl-D.
+- **Gluetun unhealthy → most apps "not started".** The new-install default `VPN_SERVICE_PROVIDER=custom` cannot work
+  without a custom config, and the installer never collected one. The provider now has no default and must be
+  chosen, and the VPN is checked before anything starts (see *Added*).
+- A failed `compose up` or `pull` no longer prints error-trap stack lines. It ends with a diagnosis and one clear
+  message.
+
+### Added
+- **Chain handling for manual certificates:** the chain may be in any order. It is listed (`subject <- issued by`),
+  the leaf is found by its key, and Traefik gets it as leaf → intermediate(s) → root. There is a warning when only
+  the server certificate is present.
+- **VPN section in the wizard (Settings → 8):**
+  - The provider is checked against Gluetun's names.
+  - OpenVPN credentials are entered there.
+  - `custom` + OpenVPN takes your `.ovpn` by path or paste. It is stored in `/etc/mediastack/vpn/`, copied to
+    Gluetun as `/gluetun/custom.ovpn`, and sets `OPENVPN_CUSTOM_CONFIG`.
+  - WireGuard imports your provider's `wg0.conf` by path or paste. The private/preshared keys go into the vault,
+    plus `WIREGUARD_ADDRESSES` and, for `custom`, the endpoint IP/port and the server public key.
+- **VPN preflight:** before starting, the installer lists what stops Gluetun connecting (provider, credentials,
+  `.ovpn`, WireGuard key/address/endpoint, `/dev/net/tun`). It refuses to start unless you confirm.
+- **Start-failure diagnosis:** shows the containers that are not running, Gluetun's last error lines, and the likely
+  cause (wrong credentials, no matching server, unknown provider, custom config, WireGuard, TUN device, unreachable
+  server).
+- Status shows the VPN provider/type and any VPN problems.
+- New settings: `VPN_CUSTOM_OVPN_FILE`, `WIREGUARD_ADDRESSES`, `VPN_ENDPOINT_IP`, `VPN_ENDPOINT_PORT` and
+  `WIREGUARD_PUBLIC_KEY` (written to `.env` only when set). They are also detected from an existing install's
+  `.env`.
+- Self-test: 61 checks.
+
 ## v2.1.0 — 2026-11-19 — Paste and encrypted keys for manual certificates
 
 ### Added
