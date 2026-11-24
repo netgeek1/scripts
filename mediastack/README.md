@@ -283,8 +283,10 @@ The certificate source applies whenever Traefik runs, in either mode:
 
 All file-based modes (`manual`, `fetch`, `push`) go through the same checks before anything is replaced: the
 chain is ordered leaf first, the key must match, and the certificate must not be expired. After installing,
-the installer makes sure Traefik **really serves** the new certificate. It first lets Traefik reload on its own,
-and restarts the `traefik` container only if it still serves the old one.
+the installer makes sure Traefik **really serves** the new certificate. It connects to `127.0.0.1` with the name
+`mediastack-probe.<domain>`. Traefik uses strict SNI, and a wildcard certificate covers `*.<domain>` but often not
+the bare domain. It first lets Traefik reload on its own, and restarts the `traefik` container only if Traefik
+answers with a different certificate. No TLS answer at all is reported as `unknown`, without a restart.
 
 ### Pull mode (`fetch`)
 
@@ -321,7 +323,7 @@ The receiver works like docker-dashboard's, with the same status line, so the sa
 - **Lock:** if a menu or apply run holds the lock, the push waits up to 5 minutes.
 - **Output:** the last stdout line is machine-readable; diagnostics go to stderr. Exit code 0 means OK.
   ```
-  DD-CERT-RECEIVE OK changed|unchanged sha256=<fingerprint> notafter=<date> live=yes|no|n/a
+  DD-CERT-RECEIVE OK changed|unchanged sha256=<fingerprint> notafter=<date> live=yes|no|unknown|n/a
   DD-CERT-RECEIVE FAIL <reason>
   ```
   The `sha256=` value is the leaf's fingerprint, in the format `openssl x509 -fingerprint -sha256` prints after the
@@ -781,7 +783,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 78 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 79 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
