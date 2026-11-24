@@ -3,6 +3,24 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.1.0 — 2026-11-19 — Paste and encrypted keys for manual certificates
+
+### Added
+- **Paste instead of a path.** At the certificate and key prompts (wizard and Settings → Access/certs), type
+  `paste` and paste the PEM.
+  - The chain ends at a blank line, `END` or Ctrl-D.
+  - The key paste is hidden and ends at its `-----END … PRIVATE KEY-----` line. CRLF is accepted.
+  - Pasted PEMs are stored in `/etc/mediastack/tls/manual-cert.pem` (0644) and `manual-key.pem` (0600), and are
+    covered by both backup formats.
+- **Encrypted private keys.** PKCS#8 (`ENCRYPTED PRIVATE KEY`) and traditional (`Proc-Type: 4,ENCRYPTED`) keys are
+  detected.
+  - The passphrase is asked for, verified (3 tries) and stored in the vault as `TLS_KEY_PASSPHRASE`. It is passed to
+    OpenSSL on a file descriptor, never on the command line or in logs.
+  - Each apply decrypts the key into Traefik's root-only copy, so a renewal job can keep writing encrypted keys
+    without prompts.
+  - A missing or wrong passphrase stops the apply with instructions.
+- Self-test: 56 checks (encrypted key formats and passphrases; the paste readers).
+
 ## v2.0.1 — 2026-11-19 — Preflight fix
 
 ### Fixed
