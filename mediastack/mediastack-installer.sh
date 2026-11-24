@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.4.0"
+readonly SCRIPT_VERSION="2.5.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -100,9 +100,8 @@ CONF_KEYS=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA FOLDER_FOR_YAML DOMAIN CLOUDFLARE_D
             ACCESS_MODE CERT_MODE TLS_CERT_FILE TLS_KEY_FILE SERVICE_PRESET PLAYER TAILSCALE_CONTROL
             BACKUP_DIR BACKUP_KEEP BACKUP_FORMAT BACKUP_PASSPHRASE_FILE BACKUP_STOP_STACK
             VPN_CUSTOM_OVPN_FILE VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES
-            CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY CERT_PUSH_USER CERT_PUSH_FROM )
-# .env keys written only when the setting has a value (never blanked, so hand edits survive)
-ENV_OPTIONAL=( VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES )
+            CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY CERT_PUSH_USER CERT_PUSH_FROM
+            SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES VPN_SERVERS_UPDATE_PERIOD VPN_UPDATER_PROTON_EMAIL )
 # Settings that did not exist before v2.0.0: an existing config without them keeps its old behaviour
 declare -A CONF_LEGACY=( [ACCESS_MODE]=internet [CERT_MODE]=letsencrypt [SERVICE_PRESET]=custom
                          [TAILSCALE_CONTROL]=headscale [PLAYER]=both )
@@ -110,7 +109,7 @@ declare -A CFG=()
 
 # .env keys driven from CFG on every apply
 ENV_MANAGED=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA TIMEZONE LOCAL_SUBNET LOCAL_DOCKER_IP VPN_TYPE
-              VPN_SERVICE_PROVIDER SERVER_REGIONS CLOUDFLARE_EMAIL CLOUDFLARE_DNS_ZONE EMAIL_SERVER_HOST
+              VPN_SERVICE_PROVIDER SERVER_REGIONS SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES CLOUDFLARE_EMAIL CLOUDFLARE_DNS_ZONE EMAIL_SERVER_HOST
               EMAIL_SERVER_PORT EMAIL_ADDRESS EMAIL_SENDER )
 
 # -----------------------------------------------------------------------------
@@ -120,7 +119,7 @@ SECRET_KEYS=( VPN_USERNAME VPN_PASSWORD PLEX_CLAIM CLOUDFLARE_DNS_API_TOKEN EMAI
               WIREGUARD_PRIVATE_KEY WIREGUARD_PRESHARED_KEY POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY
               HEADPLANE_COOKIE_SECRET SONARR_API_TOKEN RADARR_API_TOKEN LIDARR_API_TOKEN READARR_API_TOKEN
               WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD SECRET_ENCRYPTION_KEY
-              TLS_KEY_PASSPHRASE )
+              TLS_KEY_PASSPHRASE UPDATER_PROTONVPN_PASSWORD )
 # Vault entries that are not .env variables
 SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE )
 SECRET_PROMPTED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY EMAIL_PASSWORD PLEX_CLAIM )
@@ -403,6 +402,11 @@ set_default_config() {
         [CERT_FETCH_KEY]="privkey.pem"
         [CERT_PUSH_USER]="mscertpush"
         [CERT_PUSH_FROM]=""
+        [SERVER_COUNTRIES]=""
+        [SERVER_CITIES]=""
+        [SERVER_HOSTNAMES]=""
+        [VPN_SERVERS_UPDATE_PERIOD]="480h"
+        [VPN_UPDATER_PROTON_EMAIL]=""
     )
 }
 
@@ -424,6 +428,12 @@ load_config() {
             CFG[DISABLED_SERVICES]=$( { list_words "$legacy_excl" | grep -vxF -f <(list_words "${CFG[REMOVED_SERVICES]}") || true; } | xargs)
         fi
         for k in "${!CONF_LEGACY[@]}"; do [[ -n "${seen[$k]:-}" ]] || CFG[$k]=${CONF_LEGACY[$k]}; done
+        # server filters were hand-edited in .env before v2.5.0: keep them when the config predates the keys
+        for k in SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES; do
+            [[ -n "${seen[$k]:-}" ]] && continue
+            v=$(env_get "${CFG[FOLDER_FOR_YAML]%/}/.env" "$k" 2>/dev/null || true)
+            [[ "$v" =~ ^[^=#/]*$ ]] && CFG[$k]=$v
+        done
     fi
     [[ -n "$REF_OVERRIDE" ]] && CFG[UPSTREAM_REF]=$REF_OVERRIDE
     [[ -z "${CFG[CLOUDFLARE_DNS_ZONE]}" ]] && CFG[CLOUDFLARE_DNS_ZONE]=${CFG[DOMAIN]}
@@ -559,6 +569,7 @@ secret_needed() {
                                    && { [[ "${CFG[VPN_SERVICE_PROVIDER]}" != custom ]] || grep -qE '^[[:space:]]*auth-user-pass' "${CFG[VPN_CUSTOM_OVPN_FILE]:-/dev/null}" 2>/dev/null; } ;;
         WIREGUARD_PRIVATE_KEY) svc_enabled gluetun && [[ "${CFG[VPN_TYPE]}" == wireguard ]] ;;
         WIREGUARD_PRESHARED_KEY) return 1 ;;   # optional; most providers do not use one
+        UPDATER_PROTONVPN_PASSWORD) svc_enabled gluetun && [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -n "${CFG[VPN_UPDATER_PROTON_EMAIL]}" ]] ;;
         CLOUDFLARE_DNS_API_TOKEN) svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == letsencrypt ]] ;;
         TAILSCALE_AUTHKEY) svc_enabled tailscale ;;
         PLEX_CLAIM) svc_enabled plex ;;
@@ -1072,11 +1083,18 @@ render_env() {
     done
     env_set "$envf" PUID "$PUID"
     env_set "$envf" PGID "$PGID"
-    for k in "${ENV_OPTIONAL[@]}"; do
-        [[ -n "${CFG[$k]:-}" ]] && env_set "$envf" "$k" "${CFG[$k]}"
+    vpn_normalize
+    for k in VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY; do
+        # only provider 'custom' takes them; for listed providers they pin a server that is often not in
+        # Gluetun's list ("target IP address not found"), so a stale value is actively blanked
+        env_set "$envf" "$k" "${CFG[$k]:-}"
     done
+    v=$(wg_addresses_usable "${CFG[WIREGUARD_ADDRESSES]:-}")
+    [[ -n "$v" ]] && env_set "$envf" WIREGUARD_ADDRESSES "$v"
     if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom && "${CFG[VPN_TYPE]}" == openvpn ]]; then
         env_set "$envf" OPENVPN_CUSTOM_CONFIG "$GLUETUN_OVPN_PATH"
+    else
+        env_set "$envf" OPENVPN_CUSTOM_CONFIG ""
     fi
     local a kv
     while IFS= read -r a; do
@@ -1307,6 +1325,14 @@ render_patch() {   # render_patch NAME -> body that changes an upstream service
       - SECRET_ENCRYPTION_KEY=${SECRET_ENCRYPTION_KEY:?err}
 EOF
             ;;
+        gluetun)
+            printf '    # Gluetun: periodic VPN server-list update (VPN_SERVERS_UPDATE_PERIOD)\n    environment:\n'
+            printf '      - UPDATER_PERIOD=%s\n' "$(vpn_update_period)"
+            if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -n "${CFG[VPN_UPDATER_PROTON_EMAIL]}" ]]; then
+                printf '      - UPDATER_PROTONVPN_EMAIL=%s\n' "${CFG[VPN_UPDATER_PROTON_EMAIL]}"
+                printf '      - UPDATER_PROTONVPN_PASSWORD=${UPDATER_PROTONVPN_PASSWORD:-}\n'
+            fi
+            ;;
         tailscale)
             cat <<'EOF'
     # TAILSCALE_CONTROL=tailscale: official control server (upstream logs in to self-hosted Headscale)
@@ -1326,6 +1352,7 @@ active_patches() {   # upstream services this installer modifies
     local compose=$1
     [[ -f "$compose" ]] || return 0
     if grep -qE '^  homarr:[[:space:]]*$' "$compose" && ! is_removed homarr; then echo homarr; fi
+    if grep -qE '^  gluetun:[[:space:]]*$' "$compose" && ! is_removed gluetun && [[ -n "$(vpn_update_period)" ]]; then echo gluetun; fi
     if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale \
         && [[ "${CFG[TAILSCALE_CONTROL]}" == tailscale ]]; then echo tailscale; fi
     return 0
@@ -1338,7 +1365,7 @@ render_override() {   # render_override COMPOSEFILE -> stdout
     printf '%s\n' "$OVERRIDE_MARKER"
     printf '# Regenerated on every install/apply -- do not edit (a file without the marker line is left alone).\n'
     printf '# - add-on services defined by the installer (not part of upstream MediaStack)\n'
-    printf '# - patches to upstream services (Homarr 1.x image, Tailscale control server)\n'
+    printf '# - patches to upstream services (Homarr 1.x image, Tailscale control server, Gluetun server updates)\n'
     printf "# - disabled / removed services parked in the 'disabled' profile\n"
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
@@ -1907,7 +1934,13 @@ vpn_problems() {
     svc_enabled gluetun || return 0
     local p=${CFG[VPN_SERVICE_PROVIDER]:-} f=${CFG[VPN_CUSTOM_OVPN_FILE]:-}
     [[ -n "$p" ]] || echo "VPN_SERVICE_PROVIDER is not set"
-    validate_key SERVER_REGIONS "${CFG[SERVER_REGIONS]:-}" || echo "SERVER_REGIONS '${CFG[SERVER_REGIONS]}' is not a region list (clear it in Settings -> VPN)"
+    local fk
+    for fk in SERVER_REGIONS SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES; do
+        validate_key "$fk" "${CFG[$fk]:-}" || echo "$fk '${CFG[$fk]}' is not a list of names (clear it in Settings -> VPN)"
+    done
+    if [[ "$p" == protonvpn && -n "${CFG[VPN_UPDATER_PROTON_EMAIL]:-}" ]] && ! secret_is_set UPDATER_PROTONVPN_PASSWORD; then
+        echo "VPN_UPDATER_PROTON_EMAIL is set but UPDATER_PROTONVPN_PASSWORD is not (Settings -> VPN or the Secrets menu)"
+    fi
     if [[ "${CFG[VPN_TYPE]}" == wireguard ]]; then
         secret_is_set WIREGUARD_PRIVATE_KEY || echo "WIREGUARD_PRIVATE_KEY is not set (import your provider's wg0.conf)"
         [[ -n "${CFG[WIREGUARD_ADDRESSES]:-}" ]] || echo "WIREGUARD_ADDRESSES is not set (the Address line of your wg0.conf)"
@@ -1949,25 +1982,90 @@ vpn_preflight() {
 }
 
 # vpn_log_hints TEXT -> likely causes for a Gluetun log excerpt
-vpn_log_hints() {
+vpn_log_hints() {   # vpn_log_hints "ERROR/WARN LINES" -> one hint per recognised cause
     local l=${1,,}
     [[ "$l" =~ auth_failed|auth.*fail|authentication\ fail|wrong\ (username|password) ]] && \
         echo "The VPN rejected the username/password. Many providers use separate OpenVPN/service credentials (e.g. NordVPN 'service credentials', Surfshark 'manual setup'); set them in the Secrets menu."
-    if [[ "$l" =~ server\ selection|no\ server|server.*not\ found|no\ .*server.*match|filter|(region|country|city|hostname).*not\ valid ]]; then
-        echo "No server matches the server filter. Clear or correct SERVER_REGIONS (Settings -> VPN), or SERVER_COUNTRIES/CITIES in .env."
-        [[ "$l" =~ region.*no\ possible\ value ]] && echo "This provider has no regions in Gluetun: leave SERVER_REGIONS blank (use SERVER_COUNTRIES in .env to pick a country)."
+    if [[ "$l" =~ target\ ip\ address\ not\ found|endpoint\ ip\ is\ not\ set ]]; then
+        echo "A fixed server endpoint (VPN_ENDPOINT_IP/PORT) only works with provider 'custom'. For a listed provider it must be blank (Apply blanks it now); choose servers with SERVER_COUNTRIES/CITIES/HOSTNAMES."
+    elif [[ "$l" =~ server\ selection|no\ server|server.*not\ found|no\ .*server.*match|(region|country|city|hostname).*not\ valid ]]; then
+        echo "No server matches the server filter. Clear or correct the filters (Settings -> VPN), or update Gluetun's server list (Post-install helpers -> 5)."
+        [[ "$l" =~ region.*no\ possible\ value ]] && echo "This provider has no regions in Gluetun: leave SERVER_REGIONS blank and use SERVER_COUNTRIES."
     elif [[ "$l" =~ provider.*(not\ valid|invalid|unknown)|vpn_service_provider ]]; then
         echo "VPN_SERVICE_PROVIDER is not a Gluetun provider name (see the list in Settings -> VPN)."
     fi
     [[ "$l" =~ custom.*config|openvpn_custom_config|\.ovpn ]] && \
         echo "The custom OpenVPN config could not be used; check the .ovpn (Settings -> VPN)."
-    [[ "$l" =~ wireguard|wg0 ]] && \
-        echo "WireGuard settings problem: re-import the provider's wg0.conf (Settings -> VPN)."
+    [[ "$l" =~ wireguard.*(private\ key|public\ key|address|preshared)|(private|public)\ key.*(not\ valid|invalid|malformed)|interface\ address ]] && \
+        echo "Gluetun rejected a WireGuard value (key or address): re-import the provider's wg0.conf (Settings -> VPN)."
     [[ "$l" =~ /dev/net/tun|tun\ device ]] && \
         echo "The TUN device is unavailable: run 'modprobe tun' on the host (and add 'tun' to /etc/modules)."
     [[ "$l" =~ tls\ key\ negotiation|tls\ handshake|connection\ timed\ out|no\ route\ to\ host|network\ is\ unreachable ]] && \
         echo "The VPN server could not be reached: the firewall may block outbound UDP/TCP to it; try another server/protocol."
+    if [[ "$l" =~ healthcheck|unhealthy|handshake ]] && [[ ! "$l" =~ auth_failed|server\ selection|not\ valid|invalid ]]; then
+        echo "The tunnel came up but passes no traffic. With WireGuard this usually means the key is not accepted by that server (revoked or for another account) or Gluetun's server list is out of date: update it (Post-install helpers -> 5), or re-download the provider's config."
+    fi
     return 0
+}
+
+# vpn_normalize -- endpoint/public key only apply to provider 'custom'
+vpn_normalize() {
+    [[ "${CFG[VPN_SERVICE_PROVIDER]:-}" == custom ]] && return 0
+    CFG[VPN_ENDPOINT_IP]=""; CFG[VPN_ENDPOINT_PORT]=""; CFG[WIREGUARD_PUBLIC_KEY]=""
+}
+# wg_addresses_usable LIST -> the IPv4 entries (all entries when there is no IPv4 one)
+wg_addresses_usable() {
+    local a out="" x
+    for x in ${1//,/ }; do [[ "$x" == *:* ]] || out+="${out:+,}$x"; done
+    [[ -n "$out" ]] && a=$out || a=$1
+    printf '%s' "$a"
+}
+# vpn_update_period -> UPDATER_PERIOD value, blank when periodic updates are off/impossible
+vpn_update_period() {
+    local p=${CFG[VPN_SERVERS_UPDATE_PERIOD]:-off}
+    [[ "$p" == off || "${CFG[VPN_SERVICE_PROVIDER]:-}" == custom || -z "${CFG[VPN_SERVICE_PROVIDER]:-}" ]] && return 0
+    # ProtonVPN only serves its server list to logged-in accounts
+    [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -z "${CFG[VPN_UPDATER_PROTON_EMAIL]}" ]] && return 0
+    printf '%s' "$p"
+}
+gluetun_image() {
+    local img=""
+    [[ -f "$FOLDER_FOR_YAML/docker-compose.yaml" ]] && \
+        img=$(awk '/^  gluetun:[[:space:]]*$/ {f = 1; next} f && /^  [a-z]/ {exit} f && $1 == "image:" {print $2; exit}' "$FOLDER_FOR_YAML/docker-compose.yaml")
+    printf '%s' "${img:-qmcgaw/gluetun:latest}"
+}
+
+# vpn_update_servers -- refresh Gluetun's server list now (CLI updater, outside the tunnel), restart Gluetun
+vpn_update_servers() {
+    require_config; resolve_runtime; load_secrets
+    local p=${CFG[VPN_SERVICE_PROVIDER]} img e="" pw=""
+    [[ -n "$p" && "$p" != custom ]] || die "Server-list updates apply to listed providers, not '${p:-<unset>}'."
+    docker_up || die "Docker is not running."
+    img=$(gluetun_image)
+    if [[ "$p" == protonvpn ]]; then
+        e=${CFG[VPN_UPDATER_PROTON_EMAIL]}; pw=${SECRETS[UPDATER_PROTONVPN_PASSWORD]:-}
+        if [[ -z "$e" || -z "$pw" ]]; then
+            is_tty || die "ProtonVPN needs account credentials to download its server list (Settings -> VPN)."
+            log_info "ProtonVPN serves its server list only to a logged-in account (a free account is enough for free servers)."
+            ask e "Proton account email" "$e"; ask_secret pw "Proton account password"
+            [[ -n "$e" && -n "$pw" ]] || die "Both are required."
+        fi
+    fi
+    log_step "Updating Gluetun's $p server list"
+    log_warn "This runs outside the VPN: your public IP is visible to the provider's API and the DNS-over-HTTPS resolver."
+    if (( DRY_RUN )); then run docker run --rm -v "$FOLDER_FOR_DATA/gluetun:/gluetun" "$img" update -providers "$p"; return 0; fi
+    install -d "$FOLDER_FOR_DATA/gluetun"
+    # credentials travel as environment variables, never on this host's docker command line
+    if ! PE=$e PP=$pw run_logged docker run --rm -e PE -e PP -e PROV="$p" -v "$FOLDER_FOR_DATA/gluetun:/gluetun" \
+            --entrypoint /bin/sh "$img" -c 'set -- update -providers "$PROV"
+                [ -n "$PE" ] && set -- "$@" -proton-email "$PE" -proton-password "$PP"
+                exec /gluetun-entrypoint "$@"'; then
+        die "The server-list update failed (see above)."
+    fi
+    log_ok "Server list updated in $FOLDER_FOR_DATA/gluetun/servers.json"
+    if docker ps -q --filter 'name=^gluetun$' | grep -q .; then
+        run docker restart gluetun >/dev/null && log_ok "Gluetun restarted with the new list"
+    fi
 }
 
 diagnose_start_failure() {
@@ -1984,7 +2082,7 @@ diagnose_start_failure() {
             log_info "Gluetun log (last errors/warnings):"
             printf '%s\n' "$ex" | sed 's/^/    /'
         fi
-        hints=$(vpn_log_hints "$lg")
+        hints=$(vpn_log_hints "${ex:-$(tail -n 20 <<<"$lg")}")
         if [[ -n "$hints" ]]; then
             while IFS= read -r ex; do log_warn "$ex"; done <<<"$hints"
         else
@@ -2002,10 +2100,11 @@ wg_import() {
     [[ -n "$pk" && -n "$addr" ]] || { log_error "No [Interface] PrivateKey/Address found; is this a WireGuard config?"; return 1; }
     SECRETS[WIREGUARD_PRIVATE_KEY]=$pk; SECRETS_DIRTY=1
     SECRETS[WIREGUARD_PRESHARED_KEY]=$psk   # blank when the new config has none (clears an old one)
-    if [[ "$addr" == *,* ]]; then
-        log_info "Address has several entries ($addr); Gluetun uses them as given (IPv6 needs IPv6 enabled in Docker)."
+    addr=${addr// /}
+    if [[ "$(wg_addresses_usable "$addr")" != "$addr" ]]; then
+        log_info "Address $addr: Docker gives Gluetun no IPv6 by default, so only $(wg_addresses_usable "$addr") is used."
     fi
-    CFG[WIREGUARD_ADDRESSES]=${addr// /}
+    CFG[WIREGUARD_ADDRESSES]=$addr
     if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]]; then
         [[ -n "$pub" && -n "$ep" ]] || { log_error "A custom WireGuard server needs [Peer] PublicKey and Endpoint"; return 1; }
         host=${ep%:*}; port=${ep##*:}; host=${host#[}; host=${host%]}
@@ -2015,6 +2114,9 @@ wg_import() {
              log_warn "Endpoint $host resolved to $ip; Gluetun needs an IP, so update it if the server's address changes."
         fi
         CFG[VPN_ENDPOINT_IP]=$ip; CFG[VPN_ENDPOINT_PORT]=$port; CFG[WIREGUARD_PUBLIC_KEY]=$pub
+    else
+        vpn_normalize
+        [[ -n "$ep" ]] && log_info "Endpoint ${ep} is not used: Gluetun picks a ${CFG[VPN_SERVICE_PROVIDER]} server from its list (filters: countries/cities/hostnames)."
     fi
     log_ok "WireGuard settings imported (private key$( [[ -n "$psk" ]] && printf ' + preshared key') stored in the vault)"
 }
@@ -2096,15 +2198,38 @@ cfg_vpn() {
             if [[ -n "$u" ]]; then SECRETS[VPN_PASSWORD]=$u; SECRETS_DIRTY=1; fi
         fi
     fi
-    if ! validate_key SERVER_REGIONS "${CFG[SERVER_REGIONS]}"; then
-        log_warn "Stored SERVER_REGIONS '${CFG[SERVER_REGIONS]}' is not a region list (pasted text?); cleared."
-        CFG[SERVER_REGIONS]=""
-    fi
-    while :; do
-        ask "CFG[SERVER_REGIONS]" "VPN server regions, comma-separated (blank = any; not every provider has regions)" "${CFG[SERVER_REGIONS]}"
-        validate_key SERVER_REGIONS "${CFG[SERVER_REGIONS]}" && break
-        log_warn "That is not a region list (e.g. 'Netherlands' or 'US East,US West')."; CFG[SERVER_REGIONS]=""
+    vpn_normalize
+    local k lbl
+    log_info "Server filters (all optional, comma-separated; blank = any server of the provider):"
+    for k in SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES SERVER_REGIONS; do
+        case "$k" in
+            SERVER_COUNTRIES) lbl="Countries (e.g. Switzerland,Netherlands)" ;;
+            SERVER_CITIES)    lbl="Cities (e.g. Zurich)" ;;
+            SERVER_HOSTNAMES) lbl="Server hostnames (e.g. ch-01.protonvpn.net)" ;;
+            SERVER_REGIONS)   lbl="Regions (not every provider has regions; ProtonVPN has none)" ;;
+        esac
+        if ! validate_key "$k" "${CFG[$k]}"; then
+            log_warn "Stored $k '${CFG[$k]}' is not a list of names (pasted text?); cleared."; CFG[$k]=""
+        fi
+        while :; do
+            ask "CFG[$k]" "$lbl" "${CFG[$k]}"
+            validate_key "$k" "${CFG[$k]}" && break
+            log_warn "That is not a list of names."; CFG[$k]=""
+        done
     done
+    if [[ "$v" != custom ]]; then
+        log_info "Gluetun ships a server list that ages; it can refresh it itself (through the VPN) every N hours."
+        ask_valid "CFG[VPN_SERVERS_UPDATE_PERIOD]" "Update the server list every (e.g. 480h, min 360h; off)" "${CFG[VPN_SERVERS_UPDATE_PERIOD]}" v_period "off or hours such as 480h"
+        if [[ "$v" == protonvpn && "${CFG[VPN_SERVERS_UPDATE_PERIOD]}" != off ]]; then
+            log_info "ProtonVPN serves its server list only to a logged-in account (stored: email in the config, password in the vault)."
+            ask_valid "CFG[VPN_UPDATER_PROTON_EMAIL]" "Proton account email (blank = no automatic updates)" "${CFG[VPN_UPDATER_PROTON_EMAIL]}" v_email_opt "an email address or blank"
+            if [[ -n "${CFG[VPN_UPDATER_PROTON_EMAIL]}" ]]; then
+                secret_is_set UPDATER_PROTONVPN_PASSWORD && log_info "A password is stored; press Enter to keep it."
+                ask_secret u "Proton account password"
+                if [[ -n "$u" ]]; then SECRETS[UPDATER_PROTONVPN_PASSWORD]=$u; SECRETS_DIRTY=1; fi
+            fi
+        fi
+    fi
     local probs l; probs=$(vpn_problems)
     if [[ -n "$probs" ]]; then while IFS= read -r l; do log_warn "VPN: $l"; done <<<"$probs"; else log_ok "VPN settings complete"; fi
 }
@@ -2997,7 +3122,8 @@ detect_defaults() {
         LEGACY_ENV="$found/.env"
         for k in FOLDER_FOR_MEDIA FOLDER_FOR_DATA TIMEZONE VPN_TYPE VPN_SERVICE_PROVIDER SERVER_REGIONS \
                  CLOUDFLARE_EMAIL CLOUDFLARE_DNS_ZONE EMAIL_SERVER_HOST EMAIL_SERVER_PORT EMAIL_ADDRESS EMAIL_SENDER \
-                 VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES; do
+                 VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES \
+                 SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES; do
             v=$(env_get "$LEGACY_ENV" "$k" || true)
             [[ -z "$v" ]] && continue
             looks_placeholder "$k" "$v" && continue
@@ -3064,6 +3190,8 @@ v_access()   { [[ "$1" =~ ^(internet|lan)$ ]]; }
 v_cert()     { [[ "$1" =~ ^(letsencrypt|selfsigned|manual|fetch|push)$ ]]; }
 v_fetchsrc() { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.:_-]+:/[^[:space:]\']*$ ]]; }
 v_fname()    { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+v_period()   { [[ "$1" == off || "$1" =~ ^[0-9]+h$ ]]; }
+v_email_opt(){ [[ -z "$1" || "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]]; }
 v_from_opt() { [[ -z "$1" || "$1" =~ ^[0-9A-Fa-f.:/,*?]+$ ]]; }
 v_preset()   { [[ "$1" =~ ^(core|full|custom)$ ]]; }
 v_player()   { [[ "$1" =~ ^(jellyfin|plex|both)$ ]]; }
@@ -3852,6 +3980,11 @@ declare -A CONF_HELP=(
     [DATA_MOUNT_REQUIRED]="yes | no: Docker waits for the mount at boot"
     [ACCESS_MODE]="internet | lan"
     [CERT_MODE]="letsencrypt | selfsigned | manual | fetch (pull over scp daily) | push (received over SSH)"
+    [SERVER_COUNTRIES]="Gluetun server filter: countries, comma-separated (blank = any)"
+    [SERVER_CITIES]="Gluetun server filter: cities, comma-separated (blank = any)"
+    [SERVER_HOSTNAMES]="Gluetun server filter: server hostnames, comma-separated (blank = any)"
+    [VPN_SERVERS_UPDATE_PERIOD]="Gluetun updates its VPN server list this often, e.g. 480h (min 360h); off = never"
+    [VPN_UPDATER_PROTON_EMAIL]="protonvpn: Proton account email for server-list updates (password in the vault)"
     [CERT_FETCH_SOURCE]="fetch mode: user@host:/folder holding the certificate files"
     [CERT_FETCH_CERT]="fetch mode: full-chain certificate file name in that folder"
     [CERT_FETCH_KEY]="fetch mode: private key file name in that folder"
@@ -3916,7 +4049,9 @@ validate_key() {   # validate_key KEY VALUE
         WIREGUARD_PUBLIC_KEY) [[ -z "$v" || "$v" =~ ^[A-Za-z0-9+/]{42,43}=?$ ]] ;;
         WIREGUARD_ADDRESSES) return 0 ;;
         VPN_SERVICE_PROVIDER) [[ -n "$v" ]] ;;
-        SERVER_REGIONS) [[ "$v" != *[=\[\]#/]* ]] ;;
+        SERVER_REGIONS|SERVER_COUNTRIES|SERVER_CITIES|SERVER_HOSTNAMES) [[ "$v" != *[=\[\]#/]* ]] ;;
+        VPN_SERVERS_UPDATE_PERIOD) [[ "$v" == off || "$v" =~ ^[0-9]+h$ ]] ;;
+        VPN_UPDATER_PROTON_EMAIL) [[ -z "$v" || "$v" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ;;
         CLOUDFLARE_EMAIL|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
         DISABLED_SERVICES|REMOVED_SERVICES|EXTRA_PACKAGES|MEDIA_SMB_DOMAIN|MEDIA_MOUNT_OPTS|DATA_MOUNT_OPTS) return 0 ;;
         *) return 1 ;;
@@ -4488,7 +4623,10 @@ FIX
         SECRETS[VPN_USERNAME]=u && SECRETS[VPN_PASSWORD]=p && p=$(vpn_problems) && [[ "$p" != *VPN_USERNAME* ]] &&
         CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=mullvad && SECRETS[WIREGUARD_PRIVATE_KEY]="" && p=$(vpn_problems) && [[ "$p" == *WIREGUARD_PRIVATE_KEY* && "$p" == *WIREGUARD_ADDRESSES* ]] &&
         CFG[VPN_SERVICE_PROVIDER]="" && p=$(vpn_problems) && [[ "$p" == *"VPN_SERVICE_PROVIDER is not set"* ]] )'
-    st "Gluetun log hints"                 '( h=$(vpn_log_hints "2026 ERROR [openvpn] AUTH: Received control message: AUTH_FAILED"); [[ "$h" == *username/password* ]] && h=$(vpn_log_hints "ERROR no server found: for VPN openvpn; protocol udp; region Narnia"); [[ "$h" == *SERVER_REGIONS* ]] && [[ -z "$(vpn_log_hints "INFO all good")" ]] )'
+    st "Gluetun log hints"                 '( h=$(vpn_log_hints "2026 ERROR [openvpn] AUTH: Received control message: AUTH_FAILED"); [[ "$h" == *username/password* ]] && h=$(vpn_log_hints "ERROR no server found: for VPN openvpn; protocol udp; region Narnia"); [[ "$h" == *"server filter"* ]] && [[ -z "$(vpn_log_hints "INFO all good")" ]] )'
+    st "Gluetun hints: WireGuard + endpoint" '( [[ -z "$(vpn_log_hints "2026-11-24T03:01:02Z INFO [wireguard] Using available kernelspace implementation")" ]] && h=$(vpn_log_hints "ERROR [vpn] finding a VPN server: target IP address not found") && [[ "$h" == *"only works with provider '"'"'custom'"'"'"* && "$h" != *"server filter"* ]] && h=$(vpn_log_hints "INFO [healthcheck] program has been unhealthy for 21s: restarting VPN") && [[ "$h" == *"passes no traffic"* ]] && h=$(vpn_log_hints "ERROR VPN settings: wireguard settings: private key is not valid") && [[ "$h" == *"re-import"* ]] )'
+    st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
+    st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
     st "--set validation"                   'validate_key CERT_MODE selfsigned && ! validate_key CERT_MODE self && validate_key ACCESS_MODE lan && ! validate_key DATA_STORAGE smb && validate_key MEDIA_REMOTE "//nas/media" && validate_key BACKUP_KEEP 7 && ! validate_key BACKUP_KEEP x && ! validate_key NOPE 1 && ! validate_key DOMAIN "a b"'
     st "v1.x config keeps old behaviour"    '( MS_CONF_DIR="$t/c3"; CONF_FILE="$t/c3/m.conf"; mkdir -p "$t/c3"; printf "%s\n" "DOMAIN='"'"'x.org'"'"'" >"$CONF_FILE"; REF_OVERRIDE=""; load_config; [[ ${CFG[ACCESS_MODE]} == internet && ${CFG[CERT_MODE]} == letsencrypt && ${CFG[SERVICE_PRESET]} == custom && ${CFG[TAILSCALE_CONTROL]} == headscale ]] )'
@@ -4528,13 +4666,15 @@ menu_action() {
 menu_helpers() {
     printf '\n  %sPost-install helpers%s\n' "$B" "$NC"
     printf '  1) Secure Authentik database (grants)\n  2) Create Guacamole database + schema\n'
-    printf '  3) Reset Authentik akadmin password\n  4) Show *ARR API keys (optionally store in vault)\n  0) Back\n'
+    printf '  3) Reset Authentik akadmin password\n  4) Show *ARR API keys (optionally store in vault)\n'
+    printf '  5) Update Gluetun VPN server list now\n  0) Back\n'
     local ch; read -rp "  Choice: " ch || return 0
     case "$ch" in
         1) menu_action helper_authentik_db ;;
         2) menu_action helper_guacamole_db ;;
         3) menu_action helper_akadmin ;;
         4) menu_action helper_apikeys ;;
+        5) menu_action vpn_update_servers ;;
     esac
 }
 
@@ -4621,7 +4761,7 @@ Actions (default: interactive menu)
   --cert-push-setup [F|-] Set up the push receiver (user, forced-command key, sudoers); public key
                          from file F, stdin (-) or a prompt (CERT_MODE=push)
   --cert-receive         Push receiver: read chain + key on stdin (run by the forced SSH command)
-  --helper NAME          authentik-db | guacamole | akadmin | apikeys
+  --helper NAME          authentik-db | guacamole | akadmin | apikeys | vpn-servers
   --settings             Settings menu (paths, network, storage, services, ...)
   --test-storage T       Trial-mount MEDIA or DATA share; check write + hardlinks
   --secrets              Secrets menu
@@ -4749,7 +4889,8 @@ main() {
                 guacamole)    helper_guacamole_db ;;
                 akadmin)      helper_akadmin ;;
                 apikeys)      helper_apikeys ;;
-                *)            die "Unknown helper '$helper' (authentik-db|guacamole|akadmin|apikeys)" ;;
+                vpn-servers)  vpn_update_servers ;;
+                *)            die "Unknown helper '$helper' (authentik-db|guacamole|akadmin|apikeys|vpn-servers)" ;;
             esac ;;
     esac
     _log_file INFO "Finished action=$action"
