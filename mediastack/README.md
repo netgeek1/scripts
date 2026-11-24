@@ -164,7 +164,7 @@ You can re-run detection any time with **Settings → D**.
 | `--cert-push-setup [FILE\|-]` | Set up the push receiver: user, forced-command key, sudoers rule. Public key from a file, stdin or a prompt |
 | `--cert-receive` | The push receiver itself (run by the forced SSH command; reads chain + key on stdin) |
 | `--test-storage MEDIA\|DATA` | Trial-mount the share; test write and hardlinks as the service account |
-| `--helper NAME` | `authentik-db`, `guacamole`, `akadmin` or `apikeys` |
+| `--helper NAME` | `authentik-db`, `guacamole`, `akadmin`, `apikeys` or `vpn-servers` |
 | `--secrets` | Secrets menu |
 | `--uninstall` | Remove stack, compose and app-data folders, and managed mounts (keyword `UNINSTALL`) |
 | `--purge-docker` | Remove Docker Engine host-wide (keyword `PURGE-DOCKER`) |
@@ -212,9 +212,13 @@ or by hand followed by **Apply**.
 | `TAILSCALE_CONTROL` | `tailscale` | `tailscale` (official service) or `headscale` (self-hosted, upstream's setup) |
 | `DISABLED_SERVICES` | from preset | Never started; folders kept. Editing it switches the preset to `custom` |
 | `REMOVED_SERVICES` | `readarr` | Never started; no app-data folder (also applies to add-ons) |
-| `VPN_TYPE` / `VPN_SERVICE_PROVIDER` / `SERVER_REGIONS` | `openvpn` / *required* / blank | Gluetun provider name (see [VPN](#vpn-gluetun)) |
+| `VPN_TYPE` / `VPN_SERVICE_PROVIDER` | `openvpn` / *required* | Gluetun provider name (see [VPN](#vpn-gluetun)) |
+| `SERVER_COUNTRIES` / `SERVER_CITIES` / `SERVER_HOSTNAMES` / `SERVER_REGIONS` | blank | Gluetun server filters, comma-separated |
+| `VPN_SERVERS_UPDATE_PERIOD` | `480h` | How often Gluetun refreshes its server list (`off` = never) |
+| `VPN_UPDATER_PROTON_EMAIL` | blank | ProtonVPN: account email for server-list updates (password in the vault) |
 | `VPN_CUSTOM_OVPN_FILE` | blank | `custom` + OpenVPN: your `.ovpn` (path or pasted copy in `/etc/mediastack/vpn/`) |
-| `WIREGUARD_ADDRESSES` / `VPN_ENDPOINT_IP` / `VPN_ENDPOINT_PORT` / `WIREGUARD_PUBLIC_KEY` | blank | WireGuard values, normally imported from a `wg0.conf` |
+| `WIREGUARD_ADDRESSES` | blank | WireGuard address(es), imported from a `wg0.conf` |
+| `VPN_ENDPOINT_IP` / `VPN_ENDPOINT_PORT` / `WIREGUARD_PUBLIC_KEY` | blank | `custom` + WireGuard only (blanked for listed providers) |
 | `EMAIL_SERVER_HOST` / `_PORT` / `EMAIL_ADDRESS` / `EMAIL_SENDER` | blank / `587` | Authentik email |
 | `UPSTREAM_REPO` / `UPSTREAM_REF` / `UPSTREAM_VARIANT` | `geekau/mediastack` / pinned SHA / `full-download-vpn` | |
 | `SECRETS_MODE` / `SECRETS_BACKEND` | `vault` / `auto` | See [Secrets](#secrets) |
@@ -353,7 +357,14 @@ starting anything:
 - **WireGuard:** give your provider's `wg0.conf` as a path or by pasting it.
   - The private key goes into the vault, and `Address` goes into `WIREGUARD_ADDRESSES`. A `PresharedKey` is
     optional: it is stored only if your file has one, and you are never asked for it.
+  - Docker gives Gluetun no IPv6 by default, so an IPv6 entry in `Address` (newer ProtonVPN configs have one) is
+    left out of what Gluetun gets.
   - For `custom`, the server's `Endpoint` (resolved to an IP) and `PublicKey` are also taken.
+  - For **listed providers** (ProtonVPN, Mullvad, …) the `Endpoint` and `PublicKey` are **not** used. Gluetun
+    picks a server from its own list, and the provider's key works with any of its servers. A fixed
+    `VPN_ENDPOINT_IP`/`_PORT` makes Gluetun look for exactly that server in its list ("target IP address not
+    found"), so Apply blanks these for every provider except `custom`, including values left from an earlier
+    setup.
 - **Host:** `/dev/net/tun` must exist.
 
 If something is missing, Apply stops and says what. Interactively you can choose to start anyway. If containers
@@ -361,15 +372,41 @@ still fail to start, for example because the VPN rejected the login, the install
 
 - lists the containers that are not running
 - shows Gluetun's last error lines
-- names the likely cause: wrong credentials, a server filter matching nothing, an unknown provider, a custom config
-  problem, WireGuard settings, a missing TUN device, or an unreachable server
+- names the likely cause: wrong credentials, a fixed endpoint, a server filter matching nothing, an unknown
+  provider, a custom config problem, a rejected WireGuard key or address, a missing TUN device, an unreachable
+  server, or a tunnel that is up but passes no traffic (key not accepted, or an outdated server list)
+
+Only Gluetun's error and warning lines are used for this. Normal WireGuard log lines no longer produce a "WireGuard
+settings problem" hint.
 
 Read the full log with `--logs 200 gluetun`. To run without a VPN, pick the `no-download-vpn` variant.
 
-`SERVER_REGIONS` is optional. Some providers have no regions in Gluetun (ProtonVPN, for example), and any value
-then stops Gluetun with "the region specified is not valid". Leave it blank, or choose a country with
-`SERVER_COUNTRIES` in `.env`. Values that are clearly not region names are rejected, for example a line from a
-pasted `wg0.conf`.
+### Server filters
+
+`SERVER_COUNTRIES`, `SERVER_CITIES`, `SERVER_HOSTNAMES` and `SERVER_REGIONS` are optional, comma-separated, and set
+in the wizard. Blank means any server of the provider. Some providers have no regions in Gluetun (ProtonVPN, for
+example), and any value then stops Gluetun with "the region specified is not valid": use countries instead.
+Values that are clearly not names are rejected, for example a line from a pasted `wg0.conf`. Filters set by hand in
+`.env` before v2.5.0 are taken over into the config.
+
+### Server list updates
+
+Gluetun picks servers from a list built into its image, which goes out of date. It can then find no server or
+connect to one that no longer accepts your key. Two ways to keep the list fresh
+([Gluetun wiki](https://github.com/qdm12/gluetun-wiki/blob/main/setup/servers.md)):
+
+- **Automatic** (`VPN_SERVERS_UPDATE_PERIOD`, default `480h` = 20 days; the wiki asks for at least `360h`; `off` to
+  disable). Gluetun refreshes the list for your provider through the tunnel and keeps it in `<data>/gluetun/`. It
+  is set as `UPDATER_PERIOD` in the managed override.
+- **Now:** Post-install helpers → 5 or `--helper vpn-servers`. This runs Gluetun's updater once and restarts Gluetun.
+  It is the fix when the list is so old that no tunnel comes up. It runs **outside** the VPN, so your public IP is
+  visible to the provider's API and the DNS-over-HTTPS resolver.
+
+**ProtonVPN** only serves its server list to a logged-in account. The wizard asks for the Proton account email
+(`VPN_UPDATER_PROTON_EMAIL`) and password (vault: `UPDATER_PROTONVPN_PASSWORD`), and a free account is enough for
+the free servers. Without them, automatic updates are off for ProtonVPN and "update now" asks for them. The
+credentials reach the updater as environment variables. They are never on this host's `docker` command line, but
+inside the one-off update container Gluetun's updater takes them as arguments for the few seconds it runs.
 
 ---
 
@@ -665,6 +702,7 @@ password**.
 | Create Guacamole DB | Creates the database, grants access, loads the schema and restarts Guacamole. The default login is `guacadmin`/`guacadmin`, so change it |
 | Reset akadmin | Runs `ak changepassword akadmin` once Authentik is healthy |
 | *ARR API keys | Reads each app's key and optionally stores the keys in the vault for unpackerr/homepage |
+| Update VPN server list | Runs Gluetun's server-list updater once and restarts Gluetun (`--helper vpn-servers`; see [Server list updates](#server-list-updates)) |
 
 ## Uninstall
 
@@ -721,7 +759,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 69 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 72 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
