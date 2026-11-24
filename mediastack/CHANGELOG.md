@@ -3,6 +3,13 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.6 — 2026-11-23
+
+### Changed
+- The container egress test also runs on **the stack's own Docker network** (Gluetun's network, a `br-…` bridge),
+  not only on `docker0`. When `docker0` works and the stack's bridge doesn't, it says so and points at a host
+  firewall rule that allows `docker0` only. The tcpdump advice explains how to read a lost reply.
+
 ## v2.5.5 — 2026-11-23
 
 ### Fixed
