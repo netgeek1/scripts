@@ -359,7 +359,10 @@ starting anything:
     optional: it is stored only if your file has one, and you are never asked for it.
   - Docker gives Gluetun no IPv6 by default, so an IPv6 entry in `Address` (newer ProtonVPN configs have one) is
     left out of what Gluetun gets.
-  - For `custom`, the server's `Endpoint` (resolved to an IP) and `PublicKey` are also taken.
+  - For `custom`, the server's `Endpoint` (resolved to an IP) and `PublicKey` are also taken. Gluetun gets the
+    endpoint as `WIREGUARD_ENDPOINT_IP`/`_PORT` through the managed override: upstream passes the deprecated
+    `VPN_ENDPOINT_*` names, which are left blank. `custom` has no server list, so the server filters are not
+    asked for and are left out of `.env`. Any filter would stop Gluetun with "the country specified is not valid".
   - For **listed providers** (ProtonVPN, Mullvad, …) the `Endpoint` and `PublicKey` are **not** used. Gluetun
     picks a server from its own list, and the provider's key works with any of its servers. A fixed
     `VPN_ENDPOINT_IP`/`_PORT` makes Gluetun look for exactly that server in its list ("target IP address not
@@ -759,7 +762,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 73 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 74 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
