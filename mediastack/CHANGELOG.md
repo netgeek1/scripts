@@ -3,6 +3,18 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.7 — 2026-11-23
+
+### Fixed
+- **Gluetun's WireGuard handshake never completed** although the server answered. Two Docker networks used the
+  stack's subnet `172.28.10.0/24` (`br-96030da22a8b` and `br-cef1f9fa439b`), so the host had two routes for it, and
+  the de-NATed answers were routed into the other bridge. Apply now checks this before starting (`ensure_stack_network`):
+  - duplicates that belong to MediaStack or are unused are removed (the stack is stopped first) and Compose recreates
+    the network
+  - a network from something else that is in use stops Apply with what to do
+- The WireGuard probe reports more than one host route for the stack's subnet.
+- Self-test: 77 checks.
+
 ## v2.5.6 — 2026-11-23
 
 ### Changed
