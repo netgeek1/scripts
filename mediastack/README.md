@@ -376,7 +376,7 @@ still fail to start, for example because the VPN rejected the login, the install
   provider, a custom config problem, a rejected WireGuard key or address, a missing TUN device, an unreachable
   server, or a tunnel that is up but passes no traffic (key not accepted, or an outdated server list)
 
-Only Gluetun's error and warning lines are used for this. Normal WireGuard log lines no longer produce a "WireGuard
+Only Gluetun's own `ERROR`/`WARN` lines are used for this, and each line is judged on its own. Normal WireGuard log lines no longer produce a "WireGuard
 settings problem" hint.
 
 Read the full log with `--logs 200 gluetun`. To run without a VPN, pick the `no-download-vpn` variant.
@@ -759,7 +759,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 72 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 73 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
