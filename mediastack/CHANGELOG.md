@@ -3,6 +3,20 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.5 — 2026-11-23
+
+### Fixed
+- **`sudo mediastack-installer` ran an older version** than the copy you just started. The installed copy
+  (`/usr/local/sbin/mediastack-installer`) was only refreshed by a full install or restore. Now any run of a newer
+  copy updates it, and an older copy never overwrites a newer installed one. The certificate timer/watcher and the
+  push receiver use the installed copy, so they stay current too.
+
+### Added
+- The WireGuard probe shows Gluetun's **source port**. When it equals the server port (51820), the probe warns
+  that a router/firewall forwarding inbound UDP 51820 (e.g. its own WireGuard server) or rewriting source ports
+  can swallow the server's answer, while a `wg-quick` test from the host uses a random port and works.
+- Self-test: 76 checks.
+
 ## v2.5.4 — 2026-11-23
 
 ### Added
