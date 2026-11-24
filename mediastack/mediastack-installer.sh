@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.5"
+readonly SCRIPT_VERSION="2.5.6"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2134,10 +2134,10 @@ wg_dump_eval() {
                  NF >= 9 && $1 == ifc && !done {print pub, $4, $6, $7, $8, $2, lp; done = 1}' <<<"$1"
 }
 
-# docker_egress_test -> ok | fail | unknown : can a plain container on Docker's default bridge reach the internet?
+# docker_egress_test [NETWORK] -> ok | fail | unknown : can a throwaway container on NETWORK reach the internet?
 docker_egress_test() {
-    local out
-    out=$(timeout 30 docker run --rm --network bridge --entrypoint /bin/sh "$(gluetun_image)" -c \
+    local out net=${1:-bridge}
+    out=$(timeout 30 docker run --rm --network "$net" --entrypoint /bin/sh "$(gluetun_image)" -c \
           'command -v nslookup >/dev/null || { echo unknown; exit 0; }; nslookup github.com 1.1.1.1 >/dev/null 2>&1 && echo ok || echo fail' 2>/dev/null | tail -n1)
     printf '%s' "${out:-unknown}"
 }
@@ -2167,19 +2167,35 @@ vpn_wg_probe() {
         log_warn "  1) Interface public key: compare with the 'public key' 'wg show' printed for a working config;"
         log_warn "     different -> re-import the working wg0.conf (Settings -> VPN, answer y to replace)."
         log_warn "  2) Server key: must equal [Peer] PublicKey in that wg0.conf."
-        log_info "Testing whether containers can reach the internet at all (DNS to 1.1.1.1 from a throwaway container)..."
-        eg=$(docker_egress_test)
+        local snet sbr eg2
+        snet=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' gluetun 2>/dev/null | awk '{print $1}')
+        log_info "Testing whether containers can reach the internet (DNS to 1.1.1.1 from throwaway containers)..."
+        eg=$(docker_egress_test bridge)
+        eg2=unknown
+        [[ -n "$snet" && "$snet" != bridge ]] && eg2=$(docker_egress_test "$snet")
+        if [[ "$eg" == ok && "$eg2" == fail ]]; then
+            sbr="br-$(docker network inspect -f '{{.Id}}' "$snet" 2>/dev/null | cut -c1-12)"
+            log_warn "  3) Containers on Docker's default bridge (docker0) reach the internet, but containers on the stack's network"
+            log_warn "     '$snet' (host interface $sbr) do not: replies come back to the host and are not forwarded to $sbr."
+            log_warn "     This is a HOST FIREWALL rule that allows docker0 only. Allow forwarding for Docker's bridges, e.g. in nftables:"
+            log_warn "       iifname \"br-*\" accept; oifname \"br-*\" ct state established,related accept"
+            log_warn "     Find it with: sudo nft list ruleset | grep -nE 'hook forward|policy|docker0|br-'"
+            return 0
+        fi
+        [[ "$eg2" == fail ]] && eg=fail
         case "$eg" in
             fail) log_warn "  3) Containers on Docker's bridge cannot reach the internet: Docker forwarding/NAT on this host is broken, not the VPN."
                   log_warn "     Check: sysctl net.ipv4.ip_forward (must be 1); sudo iptables -t nat -S | grep MASQUERADE (Docker's NAT rule);"
                   log_warn "     a host nftables/firewall forward chain dropping docker0 traffic; then: sudo systemctl restart docker" ;;
-            ok)   log_warn "  3) Other containers reach the internet, so Docker NAT works. Watch where the handshake goes:"
+            ok)   log_warn "  3) Other containers (also on the stack's network) reach the internet, so Docker NAT works. Watch where the handshake goes:"
                   if [[ -n "$lport" && "$lport" == "${ep##*:}" ]]; then
                       log_warn "     Gluetun sends FROM UDP port $lport (the same as the server port). If your router/firewall forwards inbound"
                       log_warn "     UDP $lport (e.g. its own WireGuard server or a port forward), or rewrites the source port, the server's answer"
                       log_warn "     never reaches Gluetun. A host test with wg-quick uses a random source port, which is why it works."
                   fi
-                  log_warn "     sudo tcpdump -ni any udp port ${ep##*:}   (requests should leave on docker0/veth AND your LAN interface, and answers come back)"
+                  log_warn "     sudo tcpdump -ni any udp and host ${ep%:*}   (requests should leave on the veth/br- AND your LAN interface, and the"
+                  log_warn "     answers (92 bytes) should come back the same way; answers that arrive on the LAN interface but never appear on the"
+                  log_warn "     br-/veth interface are dropped by this host's firewall/conntrack)"
                   log_warn "     Leaves the LAN interface without answers -> a firewall between this host and the internet treats NATed container"
                   log_warn "     UDP differently from the host's own (e.g. per-port rules, or a policy only allowing the host's WireGuard port)." ;;
             *)    log_info "  3) Could not test container egress here; run: docker run --rm alpine nslookup github.com 1.1.1.1" ;;
