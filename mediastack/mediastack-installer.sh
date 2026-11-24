@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.0.1"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -115,9 +115,10 @@ ENV_MANAGED=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA TIMEZONE LOCAL_SUBNET LOCAL_DOCKE
 SECRET_KEYS=( VPN_USERNAME VPN_PASSWORD PLEX_CLAIM CLOUDFLARE_DNS_API_TOKEN EMAIL_PASSWORD TAILSCALE_AUTHKEY
               WIREGUARD_PRIVATE_KEY WIREGUARD_PRESHARED_KEY POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY
               HEADPLANE_COOKIE_SECRET SONARR_API_TOKEN RADARR_API_TOKEN LIDARR_API_TOKEN READARR_API_TOKEN
-              WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD SECRET_ENCRYPTION_KEY )
+              WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD SECRET_ENCRYPTION_KEY
+              TLS_KEY_PASSPHRASE )
 # Vault entries that are not .env variables
-SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD )
+SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE )
 SECRET_PROMPTED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY EMAIL_PASSWORD PLEX_CLAIM )
 SECRET_WIREGUARD=( WIREGUARD_PRIVATE_KEY WIREGUARD_PRESHARED_KEY )
 SECRET_REQUIRED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY )   # compose :?err
@@ -1812,13 +1813,35 @@ leaf_needs_reissue() {   # leaf_needs_reissue CERT -> 0 when missing, expiring, 
     return 1
 }
 
+key_is_encrypted() {   # PKCS#8 "ENCRYPTED PRIVATE KEY" or traditional "Proc-Type: 4,ENCRYPTED"
+    grep -qE -- '-----BEGIN ENCRYPTED PRIVATE KEY-----|^Proc-Type: *4,ENCRYPTED' "$1" 2>/dev/null
+}
+
+# tls_key_plain KEYFILE [PASSPHRASE] -> unencrypted PEM key on stdout (passphrase via fd, never argv)
+tls_key_plain() {
+    local k=$1 pass=${2-${SECRETS[TLS_KEY_PASSPHRASE]:-}}
+    if key_is_encrypted "$k"; then
+        [[ -n "$pass" ]] || return 2
+        openssl pkey -in "$k" -passin fd:3 3<<<"$pass" 2>/dev/null
+    else
+        openssl pkey -in "$k" 2>/dev/null
+    fi
+}
+
 tls_validate_pair() {   # tls_validate_pair CERT KEY -> 0 if usable (warnings for minor issues)
     local c=$1 k=$2 a b z san
     [[ -r "$c" && -r "$k" ]] || { log_error "Cannot read $c / $k"; return 1; }
     a=$(openssl x509 -in "$c" -noout -pubkey 2>/dev/null) || a=""
     [[ -n "$a" ]] || { log_error "$c is not a PEM certificate"; return 1; }
-    b=$(openssl pkey -in "$k" -pubout 2>/dev/null) || b=""
-    [[ -n "$b" ]] || { log_error "$k is not a readable unencrypted PEM private key"; return 1; }
+    b=$(tls_key_plain "$k" | openssl pkey -pubout 2>/dev/null) || b=""
+    if [[ -z "$b" ]]; then
+        if key_is_encrypted "$k"; then
+            log_error "$k is encrypted and the stored passphrase is missing or wrong (Settings -> Access/certs, or Secrets -> TLS_KEY_PASSPHRASE)"
+        else
+            log_error "$k is not a readable PEM private key"
+        fi
+        return 1
+    fi
     [[ "$a" == "$b" ]] || { log_error "The private key does not match the certificate"; return 1; }
     openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1 || { log_error "The certificate has expired"; return 1; }
     openssl x509 -in "$c" -noout -checkend 1209600 >/dev/null 2>&1 || log_warn "The certificate expires within 14 days"
@@ -1898,7 +1921,9 @@ ensure_tls() {
             if (( DRY_RUN )); then log_info "[dry-run] would copy the manual certificate into $out"; return 0; fi
             install -d -m 2775 "$out"
             install -m 644 "${CFG[TLS_CERT_FILE]}" "$out/cert.pem"
-            install -m 600 "${CFG[TLS_KEY_FILE]}" "$out/key.pem"
+            ( umask 077; tls_key_plain "${CFG[TLS_KEY_FILE]}" >"$out/key.pem.new" ) || { rm -f "$out/key.pem.new"; die "Decrypting ${CFG[TLS_KEY_FILE]} failed."; }
+            chmod 600 "$out/key.pem.new"; mv -f "$out/key.pem.new" "$out/key.pem"
+            key_is_encrypted "${CFG[TLS_KEY_FILE]}" && log_ok "Encrypted key decrypted with the vault passphrase (Traefik's copy is root-only, 0600)"
             log_ok "Manual certificate installed (expires $(openssl x509 -in "$out/cert.pem" -noout -enddate | cut -d= -f2))" ;;
     esac
     local st="$FOLDER_FOR_DATA/traefik/traefik.yaml" dy="$FOLDER_FOR_DATA/traefik/dynamic.yaml"
@@ -2335,17 +2360,106 @@ cfg_access() {
     ask_valid "CFG[CERT_MODE]" "Certificate source (letsencrypt/selfsigned/manual)" "${CFG[CERT_MODE]}" v_cert "letsencrypt, selfsigned or manual"
 }
 
+# read_pem KIND OUT -- paste a PEM block into OUT. KIND=cert ends at a blank line after a certificate,
+# a line "END" or Ctrl-D (chains may span several blocks); KIND=key ends at its -----END ... KEY----- line.
+read_pem() {
+    local kind=$1 out=$2 line n=0 ends=0 prev=""
+    : >"$out"
+    if [[ "$kind" == key ]]; then
+        log_info "Paste the private key (input is hidden; it ends automatically at its -----END ...----- line):"
+    else
+        log_info "Paste the certificate chain, then press Enter on an empty line (or type END, or Ctrl-D):"
+    fi
+    while :; do
+        if [[ "$kind" == key ]]; then IFS= read -rs line || break; else IFS= read -r line || break; fi
+        line=${line%$'\r'}
+        [[ "$line" == END || "$line" == end ]] && break
+        if [[ -z "$line" ]]; then
+            [[ "$kind" == cert && "$prev" == "-----END CERTIFICATE-----" ]] && break
+            # traditional encrypted keys need the blank line after their DEK-Info header
+            if [[ "$kind" == key && -s "$out" ]]; then printf '\n' >>"$out"; fi
+            continue
+        fi
+        printf '%s\n' "$line" >>"$out"; n=$((n + 1)); prev=$line
+        [[ "$line" == "-----END CERTIFICATE-----" ]] && ends=$((ends + 1))
+        [[ "$kind" == key && "$line" =~ ^-----END\ .*PRIVATE\ KEY-----$ ]] && break
+    done
+    [[ "$kind" == key ]] && echo
+    if [[ "$kind" == cert ]]; then
+        (( ends > 0 )) || { log_error "No -----BEGIN/END CERTIFICATE----- block found in the pasted text"; return 1; }
+        log_ok "Read $ends certificate(s) ($n lines)"
+    else
+        grep -qE -- '-----BEGIN .*PRIVATE KEY-----' "$out" || { log_error "No private key block found in the pasted text"; return 1; }
+        log_ok "Read the private key ($n lines)$(key_is_encrypted "$out" && printf ' -- encrypted')"
+    fi
+}
+
+# pick_pem KIND CFGKEY STOREFILE -- ask for a path, or 'paste' to paste the PEM (stored in STOREFILE)
+pick_pem() {
+    local kind=$1 key=$2 store=$3 v label tmp
+    label=$([[ $kind == cert ]] && echo "Certificate (full chain)" || echo "Private key")
+    while :; do
+        ask v "$label: file path, or 'paste' to paste it" "${CFG[$key]:-paste}"
+        if [[ "${v,,}" == paste ]]; then
+            if (( ASSUME_YES )) || ! is_tty; then die "Pasting needs a terminal; set $key to a file path instead."; fi
+            tmp=$(mktemp); chmod 600 "$tmp"
+            if read_pem "$kind" "$tmp"; then
+                if (( DRY_RUN )); then CFG[$key]=$tmp; log_info "[dry-run] would store it as $store"; return 0; fi
+                mkdir -p "$(dirname "$store")"; chmod 700 "$(dirname "$store")"
+                install -m "$([[ $kind == key ]] && echo 600 || echo 644)" "$tmp" "$store"; rm -f "$tmp"
+                CFG[$key]=$store
+                log_ok "Stored in $store"
+                return 0
+            fi
+            rm -f "$tmp"; continue
+        fi
+        if v_file "$v"; then CFG[$key]=$v; return 0; fi
+        log_warn "Not an existing file (absolute path): '$v'"
+    done
+}
+
+# ask_key_passphrase KEYFILE -- encrypted keys: verify/ask the passphrase and keep it in the vault
+ask_key_passphrase() {
+    local k=$1 p tries=0
+    if ! key_is_encrypted "$k"; then
+        if secret_is_set TLS_KEY_PASSPHRASE; then SECRETS[TLS_KEY_PASSPHRASE]=""; SECRETS_DIRTY=1; fi
+        return 0
+    fi
+    if secret_is_set TLS_KEY_PASSPHRASE && tls_key_plain "$k" >/dev/null; then
+        log_ok "The key is encrypted; the stored passphrase opens it"; return 0
+    fi
+    log_info "The key is encrypted. Its passphrase is stored in the vault so every apply can decrypt it for Traefik."
+    while (( tries < 3 )); do
+        ask_secret p "Key passphrase"
+        [[ -n "$p" ]] || break
+        if tls_key_plain "$k" "$p" >/dev/null; then
+            SECRETS[TLS_KEY_PASSPHRASE]=$p; SECRETS_DIRTY=1; log_ok "Passphrase OK"; return 0
+        fi
+        log_warn "That passphrase does not open the key."; tries=$((tries + 1))
+    done
+    log_warn "No working passphrase stored; apply will refuse until one is set."
+    return 1
+}
+
 cfg_manual_cert() {
     [[ "${CFG[CERT_MODE]}" == manual ]] || return 0
     section "Manual certificate"
-    log_info "Full-chain PEM certificate covering $(tls_zone) and *.$(tls_zone), plus its unencrypted PEM key."
-    log_info "Keep the files where your renewal job writes them; every apply validates and re-copies them."
+    log_info "Full-chain PEM certificate covering $(tls_zone) and *.$(tls_zone), plus its PEM private key"
+    log_info "(encrypted keys are fine: you are asked for the passphrase). Give file paths -- e.g. where your"
+    log_info "renewal job writes them, re-copied on every apply -- or paste the PEM text (stored in $(tls_dir))."
+    [[ -f "$SECRETS_FILE" ]] && load_secrets || SECRETS_LOADED=1
     while :; do
-        ask_valid "CFG[TLS_CERT_FILE]" "Certificate file" "${CFG[TLS_CERT_FILE]}" v_file "an existing file"
-        ask_valid "CFG[TLS_KEY_FILE]"  "Private key file" "${CFG[TLS_KEY_FILE]}" v_file "an existing file"
+        if (( ASSUME_YES )) || ! is_tty; then
+            ask_valid "CFG[TLS_CERT_FILE]" "Certificate file" "${CFG[TLS_CERT_FILE]}" v_file "an existing file"
+            ask_valid "CFG[TLS_KEY_FILE]"  "Private key file" "${CFG[TLS_KEY_FILE]}" v_file "an existing file"
+        else
+            pick_pem cert TLS_CERT_FILE "$(tls_dir)/manual-cert.pem"
+            pick_pem key  TLS_KEY_FILE  "$(tls_dir)/manual-key.pem"
+            ask_key_passphrase "${CFG[TLS_KEY_FILE]}" || true
+        fi
         tls_validate_pair "${CFG[TLS_CERT_FILE]}" "${CFG[TLS_KEY_FILE]}" && { log_ok "Certificate and key match"; break; }
         { (( ASSUME_YES )) || ! is_tty; } && die "The manual certificate failed validation."
-        confirm "Keep these files anyway (apply will refuse until they validate)?" n && break
+        confirm "Keep these anyway (apply will refuse until they validate)?" n && break
     done
 }
 
@@ -3487,6 +3601,19 @@ FIX
         ! leaf_needs_reissue "$t/leaf/cert.pem" && CFG[LOCAL_DOCKER_IP]=10.0.0.6 && leaf_needs_reissue "$t/leaf/cert.pem" &&
         [[ $(stat -c %a "$t/leaf/key.pem") == 600 && $(stat -c %a "$t/conf2/tls/ca.key") == 600 ]] )'
     st "manual cert: pair check"            '( MS_CONF_DIR="$t/conf2"; CFG[CLOUDFLARE_DNS_ZONE]=media.example.org; tls_validate_pair "$t/leaf/cert.pem" "$t/leaf/key.pem" && openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$t/other.key" 2>/dev/null && ! tls_validate_pair "$t/leaf/cert.pem" "$t/other.key" && ! tls_validate_pair "$t/leaf/key.pem" "$t/leaf/key.pem" )'
+    st "encrypted key: detect, decrypt, validate" '( MS_CONF_DIR="$t/conf2"; CFG[CLOUDFLARE_DNS_ZONE]=media.example.org
+        openssl pkey -in "$t/leaf/key.pem" -aes256 -passout pass:s3cret-pass -out "$t/enc8.pem" 2>/dev/null &&
+        openssl ec -in "$t/leaf/key.pem" -aes256 -passout pass:s3cret-pass -out "$t/encl.pem" 2>/dev/null && grep -q "^Proc-Type: 4,ENCRYPTED" "$t/encl.pem" &&
+        key_is_encrypted "$t/enc8.pem" && key_is_encrypted "$t/encl.pem" && ! key_is_encrypted "$t/leaf/key.pem" &&
+        SECRETS[TLS_KEY_PASSPHRASE]="" && ! tls_validate_pair "$t/leaf/cert.pem" "$t/enc8.pem" &&
+        SECRETS[TLS_KEY_PASSPHRASE]="wrong" && ! tls_validate_pair "$t/leaf/cert.pem" "$t/enc8.pem" &&
+        SECRETS[TLS_KEY_PASSPHRASE]="s3cret-pass" && tls_validate_pair "$t/leaf/cert.pem" "$t/enc8.pem" && tls_validate_pair "$t/leaf/cert.pem" "$t/encl.pem" &&
+        k=$(tls_key_plain "$t/encl.pem") && [[ "$k" == *"BEGIN PRIVATE KEY"* && "$k" != *ENCRYPTED* ]] )'
+    st "paste: chain + key readers (CRLF, traditional)" '( { cat "$t/leaf/cert.pem"; echo; echo "ignored"; } | read_pem cert "$t/p.crt" && cmp -s "$t/p.crt" "$t/leaf/cert.pem" &&
+        { cat "$t/enc8.pem"; echo "after"; } | read_pem key "$t/p.key" && cmp -s "$t/p.key" "$t/enc8.pem" &&
+        { sed "s/\$/\r/" "$t/encl.pem"; echo "after"; } | read_pem key "$t/p2.key" && cmp -s "$t/p2.key" "$t/encl.pem" &&
+        SECRETS[TLS_KEY_PASSPHRASE]=s3cret-pass && tls_validate_pair "$t/leaf/cert.pem" "$t/p2.key" &&
+        ! echo "garbage" | read_pem cert "$t/g.crt" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
     st "--set validation"                   'validate_key CERT_MODE selfsigned && ! validate_key CERT_MODE self && validate_key ACCESS_MODE lan && ! validate_key DATA_STORAGE smb && validate_key MEDIA_REMOTE "//nas/media" && validate_key BACKUP_KEEP 7 && ! validate_key BACKUP_KEEP x && ! validate_key NOPE 1 && ! validate_key DOMAIN "a b"'
     st "v1.x config keeps old behaviour"    '( MS_CONF_DIR="$t/c3"; CONF_FILE="$t/c3/m.conf"; mkdir -p "$t/c3"; printf "%s\n" "DOMAIN='"'"'x.org'"'"'" >"$CONF_FILE"; REF_OVERRIDE=""; load_config; [[ ${CFG[ACCESS_MODE]} == internet && ${CFG[CERT_MODE]} == letsencrypt && ${CFG[SERVICE_PRESET]} == custom && ${CFG[TAILSCALE_CONTROL]} == headscale ]] )'
