@@ -387,7 +387,9 @@ left by an earlier run, gets its own host route for the same subnet. Replies to 
 wrong bridge: outgoing traffic works, but Gluetun's WireGuard handshake answers are lost. If the duplicates belong
 to MediaStack or are unused, Apply stops the stack, removes them and lets Compose recreate the network. A network
 from something else that is in use stops Apply, with the choice of removing it or moving MediaStack to another
-subnet.
+subnet. The same goes for host interfaces. A bridge left behind by a Docker network that no longer exists
+(`br-<12 hex>`, no ports, often shown as `linkdown`) still has a route for the subnet. Linux keeps using a linkdown
+route, so Apply deletes such a bridge. Any other interface on that subnet stops Apply.
 
 With WireGuard, the diagnosis (and Post-install helpers → 6, `--helper vpn-check`) also reads WireGuard's own state
 inside Gluetun: the interface public key, the peer, the bytes sent and received, and whether a handshake happened.
@@ -779,7 +781,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 77 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 78 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
