@@ -381,6 +381,14 @@ still fail to start, for example because the VPN rejected the login, the install
 
 Only Gluetun's own `ERROR`/`WARN` lines are used for this, and each line is judged on its own.
 
+**One Docker network per subnet.** Before starting, Apply checks that only one Docker network uses the stack's
+subnet (`DOCKER_SUBNET`, `172.28.10.0/24` upstream). A second one, for example a duplicate `mediastack` network
+left by an earlier run, gets its own host route for the same subnet. Replies to the containers then go to the
+wrong bridge: outgoing traffic works, but Gluetun's WireGuard handshake answers are lost. If the duplicates belong
+to MediaStack or are unused, Apply stops the stack, removes them and lets Compose recreate the network. A network
+from something else that is in use stops Apply, with the choice of removing it or moving MediaStack to another
+subnet.
+
 With WireGuard, the diagnosis (and Post-install helpers → 6, `--helper vpn-check`) also reads WireGuard's own state
 inside Gluetun: the interface public key, the peer, the bytes sent and received, and whether a handshake happened.
 This needs `wireguard-tools` on the host. WireGuard itself never reports errors, so this tells apart three cases:
@@ -771,7 +779,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 76 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 77 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
