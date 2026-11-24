@@ -753,7 +753,7 @@ password**.
                                          line by line, without the per-layer byte counters. The console shows a
                                          single updating status line instead, plus any errors.
 /var/log/mediastack/cert-*.log           certificate refresh/push runs (own rotation, newest 20 kept)
-/usr/local/sbin/mediastack-installer     installed copy
+/usr/local/sbin/mediastack-installer     installed copy (updated whenever a newer copy is run)
 <FOLDER_FOR_YAML>/                       docker-compose.yaml, docker-compose.override.yaml, .env,
                                          templates, wrappers, *.upstream originals, .backup/
 ```
@@ -771,7 +771,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 75 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 76 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
