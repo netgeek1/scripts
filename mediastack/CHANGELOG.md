@@ -3,6 +3,17 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.4 — 2026-11-23
+
+### Added
+- The WireGuard probe also shows the **server key** Gluetun uses (compare with `[Peer] PublicKey`). When there is no
+  handshake, it runs a **container egress test** (DNS to 1.1.1.1 from a throwaway container on Docker's bridge) to
+  tell a broken Docker forwarding/NAT setup apart from something upstream treating NATed container UDP differently,
+  and says what to check for each.
+
+### Changed
+- The "passes no traffic" hint no longer suggests ProtonVPN `FREE_ONLY` or server-list updates for provider `custom`.
+
 ## v2.5.3 — 2026-11-23
 
 ### Added
