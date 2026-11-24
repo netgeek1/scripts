@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.2"
+readonly SCRIPT_VERSION="2.5.3"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2053,6 +2053,25 @@ gluetun_image() {
     printf '%s' "${img:-qmcgaw/gluetun:latest}"
 }
 
+# vpn_check -- on-demand VPN diagnosis (settings, Gluetun health, log errors with hints, WireGuard state)
+vpn_check() {
+    require_config; resolve_runtime; load_secrets
+    log_step "VPN check (${CFG[VPN_SERVICE_PROVIDER]:-?} / ${CFG[VPN_TYPE]})"
+    local probs l st lg ex
+    probs=$(vpn_problems)
+    if [[ -n "$probs" ]]; then while IFS= read -r l; do log_warn "Settings: $l"; done <<<"$probs"; else log_ok "Settings complete"; fi
+    docker_up || die "Docker is not running."
+    st=$(docker inspect -f '{{.State.Status}}{{if .State.Health}} / {{.State.Health.Status}}{{end}}' gluetun 2>/dev/null || echo "not created")
+    log_info "Gluetun: $st"
+    lg=$(docker logs --tail 300 gluetun 2>&1 || true)
+    ex=$(grep -E '(^|[[:space:]])(ERROR|WARN|FATAL)[[:space:]]' <<<"$lg" | tail -n 12 || true)
+    [[ -n "$ex" ]] && { log_info "Recent errors/warnings:"; printf '%s\n' "$ex" | sed 's/^/    /'; }
+    while IFS= read -r l; do [[ -n "$l" ]] && log_warn "$l"; done <<<"$(vpn_log_hints "${ex:-$(tail -n 20 <<<"$lg")}")"
+    vpn_wg_probe
+    [[ "$st" == *healthy* && "$st" != *unhealthy* ]] && log_ok "Gluetun is healthy"
+    return 0
+}
+
 # vpn_update_servers -- refresh Gluetun's server list now (CLI updater, outside the tunnel), restart Gluetun
 vpn_update_servers() {
     require_config; resolve_runtime; load_secrets
@@ -2086,6 +2105,42 @@ vpn_update_servers() {
     fi
 }
 
+# wg_dump_eval DUMP -> "PUBKEY ENDPOINT HANDSHAKE RX TX" from 'wg show all dump' (first interface + its first peer)
+wg_dump_eval() {
+    awk -F'\t' 'NF == 5 && !ifc {ifc = $1; pub = $3; next}
+                 NF >= 9 && $1 == ifc && !done {print pub, $4, $6, $7, $8; done = 1}' <<<"$1"
+}
+
+# vpn_wg_probe -- read WireGuard's own state inside Gluetun's network namespace (handshake, bytes)
+vpn_wg_probe() {
+    [[ "${CFG[VPN_TYPE]}" == wireguard ]] || return 0
+    local pid dump r pub ep hs rx tx i
+    if ! command -v wg >/dev/null 2>&1; then
+        log_info "Install wireguard-tools on the host (apt-get install wireguard-tools) to see Gluetun's WireGuard handshake state here."
+        return 0
+    fi
+    pid=$(docker inspect -f '{{.State.Pid}}' gluetun 2>/dev/null || echo 0)
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { log_info "Gluetun is not running, so its WireGuard state cannot be read."; return 0; }
+    log_info "Watching Gluetun's WireGuard interface for up to 15 s..."
+    for (( i = 0; i < 8; i++ )); do
+        dump=$(nsenter -t "$pid" -n wg show all dump 2>/dev/null || true)
+        r=$(wg_dump_eval "$dump")
+        read -r pub ep hs rx tx <<<"$r"
+        [[ -n "$hs" && "$hs" != 0 ]] && break
+        sleep 2
+    done
+    if [[ -z "$r" ]]; then log_info "No WireGuard interface found in Gluetun (it may be between restarts)."; return 0; fi
+    log_info "Gluetun WireGuard: interface public key $pub, peer $ep, sent ${tx:-0} B, received ${rx:-0} B, handshake $([[ "$hs" != 0 ]] && date -d "@$hs" '+%T' || echo never)"
+    if [[ "$hs" == 0 ]]; then
+        log_warn "No WireGuard handshake from inside Gluetun. Compare the public key above with the 'public key' that 'wg show' printed for a working config:"
+        log_warn "  different -> the stored private key is not the one in your working wg0.conf: re-import it (Settings -> VPN, answer y to replace)."
+        log_warn "  same      -> packets from the container get no answer: check the endpoint/server public key, then the host's Docker forwarding/NAT"
+        log_warn "              (sysctl net.ipv4.ip_forward must be 1; watch with: sudo tcpdump -ni any udp port ${ep##*:})."
+    elif [[ "${rx:-0}" -gt 0 ]]; then
+        log_warn "WireGuard is connected (handshake and data), so the failure is above it: Gluetun's DNS (DNS over TLS, port 853) or its health-check targets. Read: sudo $MS_INSTALL_BIN --logs 200 gluetun"
+    fi
+}
+
 diagnose_start_failure() {
     log_step "Why containers did not start"
     local bad lg ex hints
@@ -2102,6 +2157,7 @@ diagnose_start_failure() {
             printf '%s\n' "$ex" | sed 's/^/    /'
         fi
         hints=$(vpn_log_hints "${ex:-$(tail -n 20 <<<"$lg")}")
+        vpn_wg_probe
         if [[ -n "$hints" ]]; then
             while IFS= read -r ex; do log_warn "$ex"; done <<<"$hints"
         else
@@ -4651,6 +4707,7 @@ FIX
 2026-11-24T03:45:25Z WARN [dns] downloading block lists failed, skipping: lookup raw.githubusercontent.com on 127.0.0.1:53: i/o timeout
 2026-11-24T03:48:54Z WARN [vpn] restarting VPN because it failed to pass the healthcheck: startup check: all check tries failed: dialing: dial tcp4: lookup github.com: i/o timeout"; ex=$(grep -E "(^|[[:space:]])(ERROR|WARN|FATAL)[[:space:]]" <<<"$lg"); [[ "$ex" != *Authentication* ]] && h=$(vpn_log_hints "$lg") && [[ "$h" != *username/password* && "$h" == *"passes no traffic"* && "$h" == *FREE_ONLY* && $(grep -c . <<<"$h") == 1 ]] )'
     st "custom WireGuard: new names, no filters" '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[VPN_TYPE]=wireguard; CFG[VPN_ENDPOINT_IP]=37.120.137.194; CFG[VPN_ENDPOINT_PORT]=51820; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"WIREGUARD_ENDPOINT_IP=37.120.137.194"* && "$o" == *"WIREGUARD_ENDPOINT_PORT=51820"* && "$o" != *UPDATER_PERIOD* ]] && h=$(vpn_log_hints "ERROR VPN settings: provider settings: server selection: for VPN service provider custom: the country specified is not valid: one or more values is set but there is no possible value available") && [[ "$h" == *"must be blank"* && $(grep -c . <<<"$h") == 1 ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && vpn_normalize && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *WIREGUARD_ENDPOINT* && "$o" == *UPDATER_PERIOD=480h* ]] )'
+    st "WireGuard dump parsing"           '( d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t37.120.137.194:51820\t0.0.0.0/0\t0\t0\t1480\toff\n"); [[ "$(wg_dump_eval "$d")" == "PUBX= 37.120.137.194:51820 0 0 1480" ]] && d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t1.2.3.4:51820\t0.0.0.0/0\t1764000000\t9000\t3000\toff\n") && [[ "$(wg_dump_eval "$d")" == "PUBX= 1.2.3.4:51820 1764000000 9000 3000" ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
@@ -4693,7 +4750,7 @@ menu_helpers() {
     printf '\n  %sPost-install helpers%s\n' "$B" "$NC"
     printf '  1) Secure Authentik database (grants)\n  2) Create Guacamole database + schema\n'
     printf '  3) Reset Authentik akadmin password\n  4) Show *ARR API keys (optionally store in vault)\n'
-    printf '  5) Update Gluetun VPN server list now\n  0) Back\n'
+    printf '  5) Update Gluetun VPN server list now\n  6) VPN check (Gluetun health, errors, WireGuard handshake)\n  0) Back\n'
     local ch; read -rp "  Choice: " ch || return 0
     case "$ch" in
         1) menu_action helper_authentik_db ;;
@@ -4701,6 +4758,7 @@ menu_helpers() {
         3) menu_action helper_akadmin ;;
         4) menu_action helper_apikeys ;;
         5) menu_action vpn_update_servers ;;
+        6) menu_action vpn_check ;;
     esac
 }
 
@@ -4787,7 +4845,7 @@ Actions (default: interactive menu)
   --cert-push-setup [F|-] Set up the push receiver (user, forced-command key, sudoers); public key
                          from file F, stdin (-) or a prompt (CERT_MODE=push)
   --cert-receive         Push receiver: read chain + key on stdin (run by the forced SSH command)
-  --helper NAME          authentik-db | guacamole | akadmin | apikeys | vpn-servers
+  --helper NAME          authentik-db | guacamole | akadmin | apikeys | vpn-servers | vpn-check
   --settings             Settings menu (paths, network, storage, services, ...)
   --test-storage T       Trial-mount MEDIA or DATA share; check write + hardlinks
   --secrets              Secrets menu
@@ -4916,7 +4974,8 @@ main() {
                 akadmin)      helper_akadmin ;;
                 apikeys)      helper_apikeys ;;
                 vpn-servers)  vpn_update_servers ;;
-                *)            die "Unknown helper '$helper' (authentik-db|guacamole|akadmin|apikeys|vpn-servers)" ;;
+                vpn-check)    vpn_check ;;
+                *)            die "Unknown helper '$helper' (authentik-db|guacamole|akadmin|apikeys|vpn-servers|vpn-check)" ;;
             esac ;;
     esac
     _log_file INFO "Finished action=$action"
