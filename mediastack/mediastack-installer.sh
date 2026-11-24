@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -98,7 +98,10 @@ CONF_KEYS=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA FOLDER_FOR_YAML DOMAIN CLOUDFLARE_D
             MEDIA_STORAGE MEDIA_REMOTE MEDIA_SMB_DOMAIN MEDIA_SMB_VERSION MEDIA_NFS_VERSION MEDIA_MOUNT_OPTS
             MEDIA_MOUNT_REQUIRED DATA_STORAGE DATA_REMOTE DATA_NFS_VERSION DATA_MOUNT_OPTS DATA_MOUNT_REQUIRED
             ACCESS_MODE CERT_MODE TLS_CERT_FILE TLS_KEY_FILE SERVICE_PRESET PLAYER TAILSCALE_CONTROL
-            BACKUP_DIR BACKUP_KEEP BACKUP_FORMAT BACKUP_PASSPHRASE_FILE BACKUP_STOP_STACK )
+            BACKUP_DIR BACKUP_KEEP BACKUP_FORMAT BACKUP_PASSPHRASE_FILE BACKUP_STOP_STACK
+            VPN_CUSTOM_OVPN_FILE VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES )
+# .env keys written only when the setting has a value (never blanked, so hand edits survive)
+ENV_OPTIONAL=( VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES )
 # Settings that did not exist before v2.0.0: an existing config without them keeps its old behaviour
 declare -A CONF_LEGACY=( [ACCESS_MODE]=internet [CERT_MODE]=letsencrypt [SERVICE_PRESET]=custom
                          [TAILSCALE_CONTROL]=headscale [PLAYER]=both )
@@ -350,7 +353,7 @@ set_default_config() {
         [SERVICE_GID]=""
         [ADMIN_DOCKER_GROUP]="no"
         [VPN_TYPE]="openvpn"
-        [VPN_SERVICE_PROVIDER]="custom"
+        [VPN_SERVICE_PROVIDER]=""
         [SERVER_REGIONS]=""
         [EMAIL_SERVER_HOST]=""
         [EMAIL_SERVER_PORT]="587"
@@ -389,6 +392,11 @@ set_default_config() {
         [BACKUP_FORMAT]="host"
         [BACKUP_PASSPHRASE_FILE]=""
         [BACKUP_STOP_STACK]="yes"
+        [VPN_CUSTOM_OVPN_FILE]=""
+        [VPN_ENDPOINT_IP]=""
+        [VPN_ENDPOINT_PORT]=""
+        [WIREGUARD_PUBLIC_KEY]=""
+        [WIREGUARD_ADDRESSES]=""
     )
 }
 
@@ -541,7 +549,8 @@ secret_is_set() { local v=${SECRETS[$1]:-}; [[ -n "$v" && "$v" != "$SECRET_UNSET
 # secret_needed KEY -- does the current selection of services actually use this secret?
 secret_needed() {
     case "$1" in
-        VPN_USERNAME|VPN_PASSWORD) svc_enabled gluetun ;;
+        VPN_USERNAME|VPN_PASSWORD) svc_enabled gluetun && [[ "${CFG[VPN_TYPE]}" == openvpn ]] \
+                                   && { [[ "${CFG[VPN_SERVICE_PROVIDER]}" != custom ]] || grep -qE '^[[:space:]]*auth-user-pass' "${CFG[VPN_CUSTOM_OVPN_FILE]:-/dev/null}" 2>/dev/null; } ;;
         WIREGUARD_PRIVATE_KEY|WIREGUARD_PRESHARED_KEY) svc_enabled gluetun && [[ "${CFG[VPN_TYPE]}" == wireguard ]] ;;
         CLOUDFLARE_DNS_API_TOKEN) svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == letsencrypt ]] ;;
         TAILSCALE_AUTHKEY) svc_enabled tailscale ;;
@@ -1056,6 +1065,12 @@ render_env() {
     done
     env_set "$envf" PUID "$PUID"
     env_set "$envf" PGID "$PGID"
+    for k in "${ENV_OPTIONAL[@]}"; do
+        [[ -n "${CFG[$k]:-}" ]] && env_set "$envf" "$k" "${CFG[$k]}"
+    done
+    if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom && "${CFG[VPN_TYPE]}" == openvpn ]]; then
+        env_set "$envf" OPENVPN_CUSTOM_CONFIG "$GLUETUN_OVPN_PATH"
+    fi
     local a kv
     while IFS= read -r a; do
         [[ -n "$a" ]] || continue
@@ -1752,6 +1767,11 @@ copy_app_configs() {
         run chown "$PUID:$PGID" "$acme" 2>/dev/null || true
         run chmod 600 "$acme" 2>/dev/null || { (( DRY_RUN )) || svc_run chmod 600 "$acme"; }
     fi
+    if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom && "${CFG[VPN_TYPE]}" == openvpn && -f "${CFG[VPN_CUSTOM_OVPN_FILE]}" \
+          && -d "$FOLDER_FOR_DATA/gluetun" ]]; then
+        put_file "${CFG[VPN_CUSTOM_OVPN_FILE]}" "$FOLDER_FOR_DATA/gluetun/${GLUETUN_OVPN_PATH#/gluetun/}" 600
+        log_ok "Custom OpenVPN config placed for Gluetun ($GLUETUN_OVPN_PATH)"
+    fi
     log_ok "App config files placed (traefik, headscale, headplane, crowdsec); acme.json 600"
 }
 
@@ -1829,12 +1849,10 @@ tls_key_plain() {
 }
 
 tls_validate_pair() {   # tls_validate_pair CERT KEY -> 0 if usable (warnings for minor issues)
-    local c=$1 k=$2 a b z san
+    local c=$1 k=$2 kp d ord rc=0 leaf z san i=0 f n first
     [[ -r "$c" && -r "$k" ]] || { log_error "Cannot read $c / $k"; return 1; }
-    a=$(openssl x509 -in "$c" -noout -pubkey 2>/dev/null) || a=""
-    [[ -n "$a" ]] || { log_error "$c is not a PEM certificate"; return 1; }
-    b=$(tls_key_plain "$k" | openssl pkey -pubout 2>/dev/null) || b=""
-    if [[ -z "$b" ]]; then
+    kp=$(tls_key_plain "$k" | openssl pkey -pubout 2>/dev/null) || kp=""
+    if [[ -z "$kp" ]]; then
         if key_is_encrypted "$k"; then
             log_error "$k is encrypted and the stored passphrase is missing or wrong (Settings -> Access/certs, or Secrets -> TLS_KEY_PASSPHRASE)"
         else
@@ -1842,16 +1860,237 @@ tls_validate_pair() {   # tls_validate_pair CERT KEY -> 0 if usable (warnings fo
         fi
         return 1
     fi
-    [[ "$a" == "$b" ]] || { log_error "The private key does not match the certificate"; return 1; }
-    openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1 || { log_error "The certificate has expired"; return 1; }
-    openssl x509 -in "$c" -noout -checkend 1209600 >/dev/null 2>&1 || log_warn "The certificate expires within 14 days"
+    d=$(mktemp -d)
+    ord=$(tls_chain_order "$c" "$kp" "$d") || rc=$?
+    n=$(grep -c -- '-----END CERTIFICATE-----' "$c" 2>/dev/null || true)
+    if (( rc == 2 )); then rm -rf "$d"; log_error "$c contains no PEM certificate"; return 1; fi
+    if (( rc == 1 )); then rm -rf "$d"; log_error "The private key matches none of the $n certificate(s) in $c"; return 1; fi
+    leaf=$(head -n1 <<<"$ord"); first="$d/cert-001.pem"
+    log_info "Certificate chain ($n):"
+    while IFS= read -r f; do
+        i=$((i + 1))
+        log_info "  $i) $(cert_field subject "$f")   <- issued by $(cert_field issuer "$f")"
+    done <<<"$ord"
+    [[ "$leaf" == "$first" ]] || log_warn "The server certificate was not first; it is put first when installed."
+    if (( n == 1 )) && [[ "$(cert_field subject "$leaf")" != "$(cert_field issuer "$leaf")" ]]; then
+        log_warn "Only the server certificate is present; add the intermediate certificate(s) or some clients will reject it."
+    fi
+    if ! openssl x509 -in "$leaf" -noout -checkend 0 >/dev/null 2>&1; then rm -rf "$d"; log_error "The certificate has expired"; return 1; fi
+    openssl x509 -in "$leaf" -noout -checkend 1209600 >/dev/null 2>&1 || log_warn "The certificate expires within 14 days"
     z=$(tls_zone)
-    san=$(openssl x509 -in "$c" -noout -ext subjectAltName 2>/dev/null || true)
+    san=$(openssl x509 -in "$leaf" -noout -ext subjectAltName 2>/dev/null || true)
     if [[ -n "$z" && "$san" != *"DNS:*.$z"* ]]; then
         log_warn "The certificate has no DNS:*.$z entry; app hostnames such as sonarr.$z will not match it."
     fi
+    rm -rf "$d"
     return 0
 }
+
+# -----------------------------------------------------------------------------
+# VPN (Gluetun): settings checks, custom configs, start diagnostics
+# -----------------------------------------------------------------------------
+GLUETUN_PROVIDERS=( airvpn cyberghost expressvpn fastestvpn giganews hidemyass ipvanish ivpn mullvad nordvpn
+                    "perfect privacy" privado "private internet access" privatevpn protonvpn purevpn slickvpn
+                    surfshark torguard vpnsecure "vpn unlimited" vyprvpn wevpn windscribe custom )
+vpn_dir() { printf '%s/vpn' "$MS_CONF_DIR"; }
+readonly GLUETUN_OVPN_PATH="/gluetun/custom.ovpn"
+
+# vpn_problems -> one line per reason Gluetun cannot connect with the current settings
+vpn_problems() {
+    svc_enabled gluetun || return 0
+    local p=${CFG[VPN_SERVICE_PROVIDER]:-} f=${CFG[VPN_CUSTOM_OVPN_FILE]:-}
+    [[ -n "$p" ]] || echo "VPN_SERVICE_PROVIDER is not set"
+    if [[ "${CFG[VPN_TYPE]}" == wireguard ]]; then
+        secret_is_set WIREGUARD_PRIVATE_KEY || echo "WIREGUARD_PRIVATE_KEY is not set (import your provider's wg0.conf)"
+        [[ -n "${CFG[WIREGUARD_ADDRESSES]:-}" ]] || echo "WIREGUARD_ADDRESSES is not set (the Address line of your wg0.conf)"
+        if [[ "$p" == custom ]] && [[ -z "${CFG[VPN_ENDPOINT_IP]:-}" || -z "${CFG[VPN_ENDPOINT_PORT]:-}" || -z "${CFG[WIREGUARD_PUBLIC_KEY]:-}" ]]; then
+            echo "provider 'custom' + WireGuard needs the server endpoint and public key (import your wg0.conf)"
+        fi
+    elif [[ "$p" == custom ]]; then
+        if [[ -z "$f" || ! -f "$f" ]]; then
+            echo "provider 'custom' + OpenVPN needs your .ovpn file"
+        elif grep -qE '^[[:space:]]*auth-user-pass' "$f" && ! { secret_is_set VPN_USERNAME && secret_is_set VPN_PASSWORD; }; then
+            echo "the .ovpn uses auth-user-pass but VPN_USERNAME / VPN_PASSWORD are not set"
+        fi
+    elif [[ -n "$p" ]] && ! { secret_is_set VPN_USERNAME && secret_is_set VPN_PASSWORD; }; then
+        echo "VPN_USERNAME / VPN_PASSWORD are not set (most providers use separate OpenVPN/service credentials, not your account login)"
+    fi
+    [[ -e /dev/net/tun ]] || echo "/dev/net/tun is missing on this host (load the tun module: modprobe tun)"
+    return 0
+}
+
+vpn_dependents() {   # enabled services that run behind / depend on gluetun
+    local f a b; f=$(compose_for_listing)
+    [[ -n "$f" ]] || return 0
+    compose_deps "$f" | while read -r a b; do
+        if [[ "$b" == gluetun && "$(eff_state "$a")" == on ]]; then echo "$a"; fi
+    done | sort -u
+}
+
+vpn_preflight() {
+    local probs l n
+    probs=$(vpn_problems)
+    [[ -z "$probs" ]] && return 0
+    n=$(vpn_dependents | wc -l)
+    log_warn "Gluetun (the VPN that $n app(s) run behind) cannot connect with the current settings:"
+    while IFS= read -r l; do log_warn "  - $l"; done <<<"$probs"
+    log_info "Fix: Settings -> 8) VPN / email (and the Secrets menu). Without a VPN at all, choose the"
+    log_info "no-download-vpn variant (Settings -> 9) or set the apps that need Gluetun to disabled."
+    if is_tty && ! (( ASSUME_YES )) && confirm "Start anyway (Gluetun stays unhealthy and those apps are skipped)?" n; then return 0; fi
+    die "Not started: VPN settings incomplete."
+}
+
+# vpn_log_hints TEXT -> likely causes for a Gluetun log excerpt
+vpn_log_hints() {
+    local l=${1,,}
+    [[ "$l" =~ auth_failed|auth.*fail|authentication\ fail|wrong\ (username|password) ]] && \
+        echo "The VPN rejected the username/password. Many providers use separate OpenVPN/service credentials (e.g. NordVPN 'service credentials', Surfshark 'manual setup'); set them in the Secrets menu."
+    [[ "$l" =~ no\ server|server.*not\ found|no\ .*server.*match|filter ]] && \
+        echo "No server matches the filter. Clear or correct SERVER_REGIONS (Settings -> VPN), or SERVER_COUNTRIES/CITIES in .env."
+    [[ "$l" =~ provider.*(not\ valid|invalid|unknown)|vpn_service_provider ]] && \
+        echo "VPN_SERVICE_PROVIDER is not a Gluetun provider name (see the list in Settings -> VPN)."
+    [[ "$l" =~ custom.*config|openvpn_custom_config|\.ovpn ]] && \
+        echo "The custom OpenVPN config could not be used; check the .ovpn (Settings -> VPN)."
+    [[ "$l" =~ wireguard|wg0 ]] && \
+        echo "WireGuard settings problem: re-import the provider's wg0.conf (Settings -> VPN)."
+    [[ "$l" =~ /dev/net/tun|tun\ device ]] && \
+        echo "The TUN device is unavailable: run 'modprobe tun' on the host (and add 'tun' to /etc/modules)."
+    [[ "$l" =~ tls\ key\ negotiation|tls\ handshake|connection\ timed\ out|no\ route\ to\ host|network\ is\ unreachable ]] && \
+        echo "The VPN server could not be reached: the firewall may block outbound UDP/TCP to it; try another server/protocol."
+    return 0
+}
+
+diagnose_start_failure() {
+    log_step "Why containers did not start"
+    local bad lg ex hints
+    bad=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format '{{.Names}}\t{{.Status}}' 2>/dev/null \
+          | awk -F'\t' '$2 !~ /^Up/ || $2 ~ /unhealthy/' || true)
+    [[ -n "$bad" ]] && printf '%s\n' "$bad" | sed 's/^/    /' | head -n 20
+    if [[ -n "$(docker ps -aq --filter name='^gluetun$' 2>/dev/null)" ]] && \
+       [[ "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' gluetun 2>/dev/null)" != healthy ]]; then
+        lg=$(docker logs --tail 200 gluetun 2>&1 || true)
+        ex=$(grep -iE 'error|fatal|fail|warn|auth' <<<"$lg" | tail -n 12 || true)
+        if [[ -n "$ex" ]]; then
+            log_info "Gluetun log (last errors/warnings):"
+            printf '%s\n' "$ex" | sed 's/^/    /'
+        fi
+        hints=$(vpn_log_hints "$lg")
+        if [[ -n "$hints" ]]; then
+            while IFS= read -r ex; do log_warn "$ex"; done <<<"$hints"
+        else
+            log_info "No known cause matched; read the full log: sudo $MS_INSTALL_BIN --logs 200 gluetun"
+        fi
+    fi
+    return 0
+}
+
+# wg_import FILE -- take PrivateKey/Address (+ PublicKey/Endpoint/PresharedKey) from a wg0.conf
+wg_import() {
+    local f=$1 pk addr pub psk ep host port ip
+    pk=$(wg_value Interface PrivateKey "$f"); addr=$(wg_value Interface Address "$f")
+    pub=$(wg_value Peer PublicKey "$f"); psk=$(wg_value Peer PresharedKey "$f"); ep=$(wg_value Peer Endpoint "$f")
+    [[ -n "$pk" && -n "$addr" ]] || { log_error "No [Interface] PrivateKey/Address found; is this a WireGuard config?"; return 1; }
+    SECRETS[WIREGUARD_PRIVATE_KEY]=$pk; SECRETS_DIRTY=1
+    [[ -n "$psk" ]] && SECRETS[WIREGUARD_PRESHARED_KEY]=$psk
+    if [[ "$addr" == *,* ]]; then
+        log_info "Address has several entries ($addr); Gluetun uses them as given (IPv6 needs IPv6 enabled in Docker)."
+    fi
+    CFG[WIREGUARD_ADDRESSES]=${addr// /}
+    if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]]; then
+        [[ -n "$pub" && -n "$ep" ]] || { log_error "A custom WireGuard server needs [Peer] PublicKey and Endpoint"; return 1; }
+        host=${ep%:*}; port=${ep##*:}; host=${host#[}; host=${host%]}
+        if valid_ipv4 "$host"; then ip=$host
+        else ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1 {print $1}' || true)
+             [[ -n "$ip" ]] || { log_error "Cannot resolve the endpoint host '$host'"; return 1; }
+             log_warn "Endpoint $host resolved to $ip; Gluetun needs an IP, so update it if the server's address changes."
+        fi
+        CFG[VPN_ENDPOINT_IP]=$ip; CFG[VPN_ENDPOINT_PORT]=$port; CFG[WIREGUARD_PUBLIC_KEY]=$pub
+    fi
+    log_ok "WireGuard settings imported (private key$( [[ -n "$psk" ]] && printf ' + preshared key') stored in the vault)"
+}
+wg_value() {   # wg_value SECTION KEY FILE
+    awk -v s="[$1]" -v k="$2" '
+        { line = $0; sub(/[#;].*/, "", line); gsub(/^[ \t]+|[ \t]+$/, "", line) }
+        line ~ /^\[.*\]$/ { cur = line; next }
+        cur == s && index(line, "=") { key = substr(line, 1, index(line, "=") - 1); gsub(/[ \t]/, "", key)
+            if (tolower(key) == tolower(k)) { v = substr(line, index(line, "=") + 1); gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit } }' "$3"
+}
+
+# pick_conf KIND CFGKEY STOREFILE -- path, or 'paste' (KIND: ovpn | wg)
+pick_conf() {
+    local kind=$1 key=$2 store=$3 v tmp label
+    label=$([[ $kind == ovpn ]] && echo "OpenVPN config (.ovpn)" || echo "WireGuard config (wg0.conf)")
+    while :; do
+        ask v "$label: file path, or 'paste' to paste it" "${CFG[$key]:-paste}"
+        tmp=$(mktemp); chmod 600 "$tmp"
+        if [[ "${v,,}" == paste ]]; then
+            if (( ASSUME_YES )) || ! is_tty; then rm -f "$tmp"; die "Pasting needs a terminal; give a file path instead."; fi
+            log_info "Paste the $label. Input ends 3 seconds after the paste, or type END / press Ctrl-D:"
+            read_paste "$tmp" 1
+        elif v_file "$v"; then
+            cat "$v" >"$tmp"
+        else
+            log_warn "Not an existing file (absolute path): '$v'"; rm -f "$tmp"; continue
+        fi
+        if [[ "$kind" == ovpn ]] && ! grep -qE '^[[:space:]]*remote[[:space:]]' "$tmp"; then
+            log_error "No 'remote' line found; that is not an OpenVPN client config."; rm -f "$tmp"; continue
+        fi
+        if [[ "$kind" == wg ]]; then
+            if wg_import "$tmp"; then rm -f "$tmp"; return 0; fi
+            rm -f "$tmp"; continue
+        fi
+        if (( DRY_RUN )); then CFG[$key]=$tmp; log_info "[dry-run] would store it as $store"; return 0; fi
+        mkdir -p "$(dirname "$store")"; chmod 700 "$(dirname "$store")"
+        install -m 600 "$tmp" "$store"; rm -f "$tmp"
+        CFG[$key]=$store
+        log_ok "Stored in $store (copied to Gluetun as $GLUETUN_OVPN_PATH on apply)"
+        return 0
+    done
+}
+
+cfg_vpn() {
+    section "VPN (Gluetun)"
+    local v u
+    log_info "Gluetun provider names: ${GLUETUN_PROVIDERS[*]}"
+    ask_valid "CFG[VPN_TYPE]" "VPN type (openvpn/wireguard)" "${CFG[VPN_TYPE]}" v_vpn "openvpn or wireguard"
+    while :; do
+        ask v "VPN provider" "${CFG[VPN_SERVICE_PROVIDER]}"
+        v=${v,,}
+        if [[ -z "$v" ]]; then
+            { (( ASSUME_YES )) || ! is_tty; } && die "VPN_SERVICE_PROVIDER is not set. Set it in $CONF_FILE or run interactively."
+            log_warn "A provider is required (or 'custom' with your own config)"; continue
+        fi
+        in_list "$v" "${GLUETUN_PROVIDERS[@]}" || log_warn "'$v' is not in the provider list above; Gluetun will refuse it unless it is newer than this list."
+        CFG[VPN_SERVICE_PROVIDER]=$v; break
+    done
+    [[ -f "$SECRETS_FILE" ]] && load_secrets || SECRETS_LOADED=1
+    if [[ "${CFG[VPN_TYPE]}" == wireguard ]]; then
+        log_info "WireGuard: download a wg0.conf for this host from your provider; the installer takes the"
+        log_info "private key (vault), address$( [[ $v == custom ]] && printf ', server endpoint and public key') from it."
+        if secret_is_set WIREGUARD_PRIVATE_KEY && [[ -n "${CFG[WIREGUARD_ADDRESSES]}" ]] && ! confirm "Replace the stored WireGuard settings?" n; then :
+        elif is_tty && ! (( ASSUME_YES )); then
+            pick_conf wg VPN_WG_IMPORT_UNUSED "" || true
+        fi
+    elif [[ "$v" == custom ]]; then
+        log_info "Custom OpenVPN: give your provider's .ovpn client config (inline certificates are fine)."
+        if is_tty && ! (( ASSUME_YES )); then pick_conf ovpn VPN_CUSTOM_OVPN_FILE "$(vpn_dir)/custom.ovpn"
+        else ask_valid "CFG[VPN_CUSTOM_OVPN_FILE]" "OpenVPN config file" "${CFG[VPN_CUSTOM_OVPN_FILE]}" v_file "an existing file"; fi
+    fi
+    if [[ "${CFG[VPN_TYPE]}" == openvpn ]] && is_tty && ! (( ASSUME_YES )); then
+        if [[ "$v" != custom ]] || grep -qE '^[[:space:]]*auth-user-pass' "${CFG[VPN_CUSTOM_OVPN_FILE]:-/dev/null}" 2>/dev/null; then
+            log_info "OpenVPN credentials: most providers issue separate OpenVPN/service credentials (not your account login)."
+            ask u "OpenVPN username" "$( secret_is_set VPN_USERNAME && printf '%s' "${SECRETS[VPN_USERNAME]}")"
+            if [[ -n "$u" && "$u" != "${SECRETS[VPN_USERNAME]:-}" ]]; then SECRETS[VPN_USERNAME]=$u; SECRETS_DIRTY=1; fi
+            secret_is_set VPN_PASSWORD && log_info "A password is stored; press Enter to keep it."
+            ask_secret u "OpenVPN password"
+            if [[ -n "$u" ]]; then SECRETS[VPN_PASSWORD]=$u; SECRETS_DIRTY=1; fi
+        fi
+    fi
+    ask "CFG[SERVER_REGIONS]" "VPN server regions (blank = provider default)" "${CFG[SERVER_REGIONS]}"
+    local probs l; probs=$(vpn_problems)
+    if [[ -n "$probs" ]]; then while IFS= read -r l; do log_warn "VPN: $l"; done <<<"$probs"; else log_ok "VPN settings complete"; fi
+}
+
 
 # traefik_static_no_acme FILE -- drop the ACME resolver and the entrypoint's certResolver/domains
 traefik_static_no_acme() {
@@ -1920,7 +2159,8 @@ ensure_tls() {
             tls_validate_pair "${CFG[TLS_CERT_FILE]}" "${CFG[TLS_KEY_FILE]}" || die "The manual certificate failed validation."
             if (( DRY_RUN )); then log_info "[dry-run] would copy the manual certificate into $out"; return 0; fi
             install -d -m 2775 "$out"
-            install -m 644 "${CFG[TLS_CERT_FILE]}" "$out/cert.pem"
+            tls_write_chain "${CFG[TLS_CERT_FILE]}" "${CFG[TLS_KEY_FILE]}" "$out/cert.pem" || die "Writing the certificate chain failed."
+            chmod 644 "$out/cert.pem"
             ( umask 077; tls_key_plain "${CFG[TLS_KEY_FILE]}" >"$out/key.pem.new" ) || { rm -f "$out/key.pem.new"; die "Decrypting ${CFG[TLS_KEY_FILE]} failed."; }
             chmod 600 "$out/key.pem.new"; mv -f "$out/key.pem.new" "$out/key.pem"
             key_is_encrypted "${CFG[TLS_KEY_FILE]}" && log_ok "Encrypted key decrypted with the vault passphrase (Traefik's copy is root-only, 0600)"
@@ -2005,11 +2245,17 @@ stack_apply() {
         run compose_run up -d --remove-orphans
         return 0
     fi
+    vpn_preflight
     compose_run config --quiet || die "docker compose config failed (missing variables or invalid YAML)."
     log_ok "Compose configuration valid"
     stop_excluded_containers
-    if [[ "$mode" == pull ]]; then run_logged compose_run pull; fi
-    run_logged compose_run up -d --remove-orphans
+    if [[ "$mode" == pull ]]; then
+        run_logged compose_run pull || die "Pulling images failed (network or registry problem); nothing was changed."
+    fi
+    if ! run_logged compose_run up -d --remove-orphans; then
+        diagnose_start_failure
+        die "Some containers could not start (causes above). Fix them, then run Apply again."
+    fi
     verify_services 180 || true
 }
 
@@ -2041,6 +2287,10 @@ show_status() {
         printf '  %-22s %s\n' "Certificate expires" "$(openssl x509 -in "$(traefik_cert_dir)/cert.pem" -noout -enddate 2>/dev/null | cut -d= -f2)"
     fi
     report_dependencies warn
+    if svc_enabled gluetun; then
+        printf '  %-22s %s\n' "VPN" "${CFG[VPN_SERVICE_PROVIDER]:-<not set>} / ${CFG[VPN_TYPE]}"
+        local vl; while IFS= read -r vl; do [[ -n "$vl" ]] && log_warn "VPN: $vl"; done <<<"$(vpn_problems)"
+    fi
     local t p
     for t in MEDIA DATA; do
         p=$(target_path "$t")
@@ -2256,7 +2506,8 @@ detect_defaults() {
         CFG[FOLDER_FOR_YAML]=$found
         LEGACY_ENV="$found/.env"
         for k in FOLDER_FOR_MEDIA FOLDER_FOR_DATA TIMEZONE VPN_TYPE VPN_SERVICE_PROVIDER SERVER_REGIONS \
-                 CLOUDFLARE_EMAIL CLOUDFLARE_DNS_ZONE EMAIL_SERVER_HOST EMAIL_SERVER_PORT EMAIL_ADDRESS EMAIL_SENDER; do
+                 CLOUDFLARE_EMAIL CLOUDFLARE_DNS_ZONE EMAIL_SERVER_HOST EMAIL_SERVER_PORT EMAIL_ADDRESS EMAIL_SENDER \
+                 VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES; do
             v=$(env_get "$LEGACY_ENV" "$k" || true)
             [[ -z "$v" ]] && continue
             looks_placeholder "$k" "$v" && continue
@@ -2360,39 +2611,105 @@ cfg_access() {
     ask_valid "CFG[CERT_MODE]" "Certificate source (letsencrypt/selfsigned/manual)" "${CFG[CERT_MODE]}" v_cert "letsencrypt, selfsigned or manual"
 }
 
-# read_pem KIND OUT -- paste a PEM block into OUT. KIND=cert ends at a blank line after a certificate,
-# a line "END" or Ctrl-D (chains may span several blocks); KIND=key ends at its -----END ... KEY----- line.
-read_pem() {
-    local kind=$1 out=$2 line n=0 ends=0 prev=""
+# read_paste OUT [hidden] -- pasted text until a line "END", Ctrl-D, or 3 s without input once
+# something has arrived (a terminal paste arrives in one burst, so multi-block chains and config
+# files with blank lines are read whole). CR line endings are stripped.
+read_paste() {
+    local out=$1 hid=${2:-0} line n=0
+    local -a ro
     : >"$out"
-    if [[ "$kind" == key ]]; then
-        log_info "Paste the private key (input is hidden; it ends automatically at its -----END ...----- line):"
-    else
-        log_info "Paste the certificate chain, then press Enter on an empty line (or type END, or Ctrl-D):"
-    fi
     while :; do
-        if [[ "$kind" == key ]]; then IFS= read -rs line || break; else IFS= read -r line || break; fi
+        ro=(-r); (( hid )) && ro+=(-s); (( n )) && ro+=(-t 3)
+        IFS= read "${ro[@]}" line || break
+        line=${line%$'\r'}
+        [[ "$line" == END || "$line" == end ]] && break
+        printf '%s\n' "$line" >>"$out"; n=$((n + 1))
+    done
+    (( hid )) && echo
+    local body; body=$(cat "$out")            # drop trailing blank lines
+    if [[ -n "$body" ]]; then printf '%s\n' "$body" >"$out"; else : >"$out"; fi
+    return 0
+}
+
+# read_pem KIND OUT -- KIND=cert: the whole chain (any number of certificates, blank lines allowed);
+#                      KIND=key : one private key, hidden, ends at its -----END ... KEY----- line
+read_pem() {
+    local kind=$1 out=$2 line n=0 ends
+    if [[ "$kind" == cert ]]; then
+        log_info "Paste the certificate chain (server certificate + intermediates, any order). Input ends"
+        log_info "3 seconds after the paste, or type END / press Ctrl-D:"
+        read_paste "$out"
+        ends=$(grep -c -- '-----END CERTIFICATE-----' "$out" || true)
+        (( ends > 0 )) || { log_error "No -----BEGIN/END CERTIFICATE----- block found in the pasted text"; return 1; }
+        log_ok "Read $ends certificate(s)"
+        return 0
+    fi
+    : >"$out"
+    log_info "Paste the private key (input is hidden; it ends automatically at its -----END ...----- line):"
+    while :; do
+        IFS= read -rs line || break
         line=${line%$'\r'}
         [[ "$line" == END || "$line" == end ]] && break
         if [[ -z "$line" ]]; then
-            [[ "$kind" == cert && "$prev" == "-----END CERTIFICATE-----" ]] && break
             # traditional encrypted keys need the blank line after their DEK-Info header
-            if [[ "$kind" == key && -s "$out" ]]; then printf '\n' >>"$out"; fi
+            if [[ -s "$out" ]]; then printf '\n' >>"$out"; fi
             continue
         fi
-        printf '%s\n' "$line" >>"$out"; n=$((n + 1)); prev=$line
-        [[ "$line" == "-----END CERTIFICATE-----" ]] && ends=$((ends + 1))
-        [[ "$kind" == key && "$line" =~ ^-----END\ .*PRIVATE\ KEY-----$ ]] && break
+        printf '%s\n' "$line" >>"$out"; n=$((n + 1))
+        [[ "$line" =~ ^-----END\ .*PRIVATE\ KEY-----$ ]] && break
     done
-    [[ "$kind" == key ]] && echo
-    if [[ "$kind" == cert ]]; then
-        (( ends > 0 )) || { log_error "No -----BEGIN/END CERTIFICATE----- block found in the pasted text"; return 1; }
-        log_ok "Read $ends certificate(s) ($n lines)"
-    else
-        grep -qE -- '-----BEGIN .*PRIVATE KEY-----' "$out" || { log_error "No private key block found in the pasted text"; return 1; }
-        log_ok "Read the private key ($n lines)$(key_is_encrypted "$out" && printf ' -- encrypted')"
-    fi
+    echo
+    grep -qE -- '-----BEGIN .*PRIVATE KEY-----' "$out" || { log_error "No private key block found in the pasted text"; return 1; }
+    log_ok "Read the private key ($n lines)$(key_is_encrypted "$out" && printf ' -- encrypted')"
 }
+
+cert_field() { openssl x509 -in "$2" -noout -"$1" -nameopt RFC2253 2>/dev/null | sed 's/^[a-z]* *= *//'; }
+
+# tls_chain_order CERTFILE KEYPUB DIR -> ordered cert files (leaf first, then each issuer)
+#   rc 2: no certificate in the file; rc 1: none of the certificates matches the key
+tls_chain_order() {
+    local c=$1 kp=$2 d=$3 f leaf="" cur iss nxt n
+    n=$(awk -v d="$d" '/-----BEGIN CERTIFICATE-----/ {n++; f = sprintf("%s/cert-%03d.pem", d, n)}
+                       f {print > f}
+                       /-----END CERTIFICATE-----/ {close(f); f = ""}
+                       END {print n + 0}' "$c")
+    (( n > 0 )) || return 2
+    local -a all order rest
+    all=("$d"/cert-*.pem)
+    for f in "${all[@]}"; do
+        if [[ "$(openssl x509 -in "$f" -noout -pubkey 2>/dev/null)" == "$kp" ]]; then leaf=$f; break; fi
+    done
+    [[ -n "$leaf" ]] || return 1
+    order=("$leaf"); rest=()
+    for f in "${all[@]}"; do [[ "$f" == "$leaf" ]] || rest+=("$f"); done
+    cur=$leaf
+    while (( ${#rest[@]} )); do
+        iss=$(cert_field issuer "$cur")
+        [[ "$iss" == "$(cert_field subject "$cur")" ]] && break        # self-signed: end of chain
+        nxt=""
+        for f in "${rest[@]}"; do [[ "$(cert_field subject "$f")" == "$iss" ]] && { nxt=$f; break; }; done
+        [[ -n "$nxt" ]] || break
+        order+=("$nxt")
+        local -a keep=(); for f in "${rest[@]}"; do [[ "$f" == "$nxt" ]] || keep+=("$f"); done; rest=("${keep[@]}")
+        cur=$nxt
+    done
+    printf '%s\n' "${order[@]}" "${rest[@]}"
+}
+
+# tls_write_chain CERT KEY OUT -- write the chain leaf-first (as Traefik expects)
+tls_write_chain() {
+    local d kp rc=0 ord
+    d=$(mktemp -d)
+    kp=$(tls_key_plain "$2" | openssl pkey -pubout 2>/dev/null) || kp=""
+    ord=$(tls_chain_order "$1" "$kp" "$d") || rc=$?
+    if (( rc == 0 )); then
+        # shellcheck disable=SC2046
+        cat $(printf '%s\n' "$ord") >"$3"
+    fi
+    rm -rf "$d"
+    return $rc
+}
+
 
 # pick_pem KIND CFGKEY STOREFILE -- ask for a path, or 'paste' to paste the PEM (stored in STOREFILE)
 pick_pem() {
@@ -2444,7 +2761,8 @@ ask_key_passphrase() {
 cfg_manual_cert() {
     [[ "${CFG[CERT_MODE]}" == manual ]] || return 0
     section "Manual certificate"
-    log_info "Full-chain PEM certificate covering $(tls_zone) and *.$(tls_zone), plus its PEM private key"
+    log_info "Certificate chain (server certificate + intermediates, any order) covering $(tls_zone) and *.$(tls_zone),"
+    log_info "plus its PEM private key"
     log_info "(encrypted keys are fine: you are asked for the passphrase). Give file paths -- e.g. where your"
     log_info "renewal job writes them, re-copied on every apply -- or paste the PEM text (stored in $(tls_dir))."
     [[ -f "$SECRETS_FILE" ]] && load_secrets || SECRETS_LOADED=1
@@ -2640,11 +2958,7 @@ services_toggle_ui() {
 
 cfg_vpn_email() {
     section "VPN and email"
-    if svc_exists gluetun; then
-        ask_valid "CFG[VPN_TYPE]" "VPN type (openvpn/wireguard)" "${CFG[VPN_TYPE]}" v_vpn "openvpn or wireguard"
-        ask "CFG[VPN_SERVICE_PROVIDER]" "VPN provider (Gluetun name, e.g. mullvad, protonvpn, custom)" "${CFG[VPN_SERVICE_PROVIDER]}"
-        ask "CFG[SERVER_REGIONS]" "VPN server regions (blank = provider default)" "${CFG[SERVER_REGIONS]}"
-    fi
+    if svc_enabled gluetun; then cfg_vpn; elif svc_exists gluetun; then log_info "Gluetun is off: VPN settings skipped."; fi
     if svc_enabled authentik; then
         ask "CFG[EMAIL_SERVER_HOST]" "SMTP host for Authentik (blank = none)" "${CFG[EMAIL_SERVER_HOST]}"
         if [[ -n "${CFG[EMAIL_SERVER_HOST]}" ]]; then
@@ -3040,6 +3354,11 @@ declare -A CONF_HELP=(
     [BACKUP_FORMAT]="host | portable (passphrase-encrypted)"
     [BACKUP_PASSPHRASE_FILE]="file whose first line is the portable-backup passphrase"
     [BACKUP_STOP_STACK]="yes | no: stop containers while backing up"
+    [VPN_CUSTOM_OVPN_FILE]="provider custom + OpenVPN: your .ovpn (copied to Gluetun)"
+    [VPN_ENDPOINT_IP]="provider custom + WireGuard: server IP"
+    [VPN_ENDPOINT_PORT]="provider custom + WireGuard: server port"
+    [WIREGUARD_PUBLIC_KEY]="provider custom + WireGuard: server public key"
+    [WIREGUARD_ADDRESSES]="WireGuard: interface address(es) from wg0.conf"
 )
 
 validate_key() {   # validate_key KEY VALUE
@@ -3074,7 +3393,13 @@ validate_key() {   # validate_key KEY VALUE
         PLAYER) v_player "$v" ;;
         TAILSCALE_CONTROL) v_tscontrol "$v" ;;
         BACKUP_FORMAT) v_bformat "$v" ;;
-        CLOUDFLARE_EMAIL|VPN_SERVICE_PROVIDER|SERVER_REGIONS|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
+        VPN_CUSTOM_OVPN_FILE) [[ -z "$v" ]] || v_path "$v" ;;
+        VPN_ENDPOINT_IP) [[ -z "$v" ]] || valid_ipv4 "$v" ;;
+        VPN_ENDPOINT_PORT) [[ -z "$v" ]] || v_num "$v" ;;
+        WIREGUARD_PUBLIC_KEY) [[ -z "$v" || "$v" =~ ^[A-Za-z0-9+/]{42,43}=?$ ]] ;;
+        WIREGUARD_ADDRESSES) return 0 ;;
+        VPN_SERVICE_PROVIDER) [[ -n "$v" ]] ;;
+        CLOUDFLARE_EMAIL|SERVER_REGIONS|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
         DISABLED_SERVICES|REMOVED_SERVICES|EXTRA_PACKAGES|MEDIA_SMB_DOMAIN|MEDIA_MOUNT_OPTS|DATA_MOUNT_OPTS) return 0 ;;
         *) return 1 ;;
     esac
@@ -3609,11 +3934,32 @@ FIX
         SECRETS[TLS_KEY_PASSPHRASE]="wrong" && ! tls_validate_pair "$t/leaf/cert.pem" "$t/enc8.pem" &&
         SECRETS[TLS_KEY_PASSPHRASE]="s3cret-pass" && tls_validate_pair "$t/leaf/cert.pem" "$t/enc8.pem" && tls_validate_pair "$t/leaf/cert.pem" "$t/encl.pem" &&
         k=$(tls_key_plain "$t/encl.pem") && [[ "$k" == *"BEGIN PRIVATE KEY"* && "$k" != *ENCRYPTED* ]] )'
-    st "paste: chain + key readers (CRLF, traditional)" '( { cat "$t/leaf/cert.pem"; echo; echo "ignored"; } | read_pem cert "$t/p.crt" && cmp -s "$t/p.crt" "$t/leaf/cert.pem" &&
+    st "paste: chain + key readers (CRLF, traditional)" '( { cat "$t/leaf/cert.pem"; echo; echo END; echo "ignored"; } | read_pem cert "$t/p.crt" && cmp -s "$t/p.crt" "$t/leaf/cert.pem" &&
         { cat "$t/enc8.pem"; echo "after"; } | read_pem key "$t/p.key" && cmp -s "$t/p.key" "$t/enc8.pem" &&
         { sed "s/\$/\r/" "$t/encl.pem"; echo "after"; } | read_pem key "$t/p2.key" && cmp -s "$t/p2.key" "$t/encl.pem" &&
         SECRETS[TLS_KEY_PASSPHRASE]=s3cret-pass && tls_validate_pair "$t/leaf/cert.pem" "$t/p2.key" &&
         ! echo "garbage" | read_pem cert "$t/g.crt" )'
+    st "chain paste: 3 certs, blank lines, END" '( printf "%s\n\n\n" "$(sed -n "/BEGIN/,/END/p" "$t/leaf/cert.pem" | head -n 999)" >"$t/two.txt"; { cat "$t/two.txt"; cat "$t/conf2/tls/ca.crt"; echo; echo END; echo after; } | read_pem cert "$t/p3.crt" && [[ $(grep -c "END CERTIFICATE" "$t/p3.crt") == 3 ]] && ! grep -q after "$t/p3.crt" )'
+    st "chain order: leaf first, issuer next" '( MS_CONF_DIR="$t/conf2"; d=$(mktemp -d)
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$d/root.key" -out "$d/root.pem" -subj /CN=TestRoot -days 5 2>/dev/null &&
+        openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$d/int.key" -out "$d/int.csr" -subj /CN=TestInt 2>/dev/null &&
+        printf "basicConstraints=critical,CA:TRUE\n" >"$d/ca.ext" && openssl x509 -req -in "$d/int.csr" -CA "$d/root.pem" -CAkey "$d/root.key" -set_serial 2 -days 5 -extfile "$d/ca.ext" -out "$d/int.pem" 2>/dev/null &&
+        openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$d/leaf.key" -out "$d/leaf.csr" -subj /CN=media.example.org 2>/dev/null &&
+        printf "subjectAltName=DNS:media.example.org,DNS:*.media.example.org\n" >"$d/l.ext" && openssl x509 -req -in "$d/leaf.csr" -CA "$d/int.pem" -CAkey "$d/int.key" -set_serial 3 -days 5 -extfile "$d/l.ext" -out "$d/leaf.pem" 2>/dev/null &&
+        { cat "$d/root.pem"; echo; cat "$d/leaf.pem"; echo; cat "$d/int.pem"; } >"$d/mixed.pem" &&
+        CFG[CLOUDFLARE_DNS_ZONE]=media.example.org && SECRETS[TLS_KEY_PASSPHRASE]="" && tls_validate_pair "$d/mixed.pem" "$d/leaf.key" &&
+        tls_write_chain "$d/mixed.pem" "$d/leaf.key" "$d/out.pem" && sed -n "/BEGIN/,/END/p" "$d/out.pem" | awk "/BEGIN/{n++} n==1" >"$d/first.pem" &&
+        [[ "$(openssl x509 -in "$d/first.pem" -noout -subject)" == *media.example.org* ]] &&
+        [[ "$(openssl crl2pkcs7 -nocrl -certfile "$d/out.pem" | openssl pkcs7 -print_certs -noout | grep -c "^subject")" == 3 ]] &&
+        [[ "$(openssl crl2pkcs7 -nocrl -certfile "$d/out.pem" | openssl pkcs7 -print_certs -noout | sed -n "s/^subject=//p" | tr -d " " | xargs)" == "CN=media.example.org CN=TestInt CN=TestRoot" ]] &&
+        ! tls_validate_pair "$d/mixed.pem" "$d/root.key.missing" ; rc=$?; rm -rf "$d"; exit $rc )'
+    st "wg0.conf import (custom)"         '( printf "[Interface]\nPrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=\nAddress = 10.64.1.2/32\nDNS = 10.64.0.1\n\n[Peer]\nPublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=\nPresharedKey = ccc=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.7:51820 # srv\n" >"$t/wg0.conf"; CFG[VPN_SERVICE_PROVIDER]=custom; wg_import "$t/wg0.conf" && [[ "${SECRETS[WIREGUARD_PRIVATE_KEY]}" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa= && "${CFG[WIREGUARD_ADDRESSES]}" == 10.64.1.2/32 && "${CFG[VPN_ENDPOINT_IP]}" == 198.51.100.7 && "${CFG[VPN_ENDPOINT_PORT]}" == 51820 && "${CFG[WIREGUARD_PUBLIC_KEY]}" == bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb= && "${SECRETS[WIREGUARD_PRESHARED_KEY]}" == ccc= ]] && validate_key WIREGUARD_PUBLIC_KEY "${CFG[WIREGUARD_PUBLIC_KEY]}" )'
+    st "VPN problems detected"             '( st_prep lan jellyfin tailscale core selfsigned; CFG[VPN_TYPE]=openvpn; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[VPN_CUSTOM_OVPN_FILE]=""; p=$(vpn_problems); [[ "$p" == *".ovpn"* ]] &&
+        CFG[VPN_SERVICE_PROVIDER]=nordvpn && SECRETS[VPN_USERNAME]=""; p=$(vpn_problems); [[ "$p" == *"VPN_USERNAME"* ]] &&
+        SECRETS[VPN_USERNAME]=u && SECRETS[VPN_PASSWORD]=p && p=$(vpn_problems) && [[ "$p" != *VPN_USERNAME* ]] &&
+        CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=mullvad && SECRETS[WIREGUARD_PRIVATE_KEY]="" && p=$(vpn_problems) && [[ "$p" == *WIREGUARD_PRIVATE_KEY* && "$p" == *WIREGUARD_ADDRESSES* ]] &&
+        CFG[VPN_SERVICE_PROVIDER]="" && p=$(vpn_problems) && [[ "$p" == *"VPN_SERVICE_PROVIDER is not set"* ]] )'
+    st "Gluetun log hints"                 '( h=$(vpn_log_hints "2026 ERROR [openvpn] AUTH: Received control message: AUTH_FAILED"); [[ "$h" == *username/password* ]] && h=$(vpn_log_hints "ERROR no server found: for VPN openvpn; protocol udp; region Narnia"); [[ "$h" == *SERVER_REGIONS* ]] && [[ -z "$(vpn_log_hints "INFO all good")" ]] )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
     st "--set validation"                   'validate_key CERT_MODE selfsigned && ! validate_key CERT_MODE self && validate_key ACCESS_MODE lan && ! validate_key DATA_STORAGE smb && validate_key MEDIA_REMOTE "//nas/media" && validate_key BACKUP_KEEP 7 && ! validate_key BACKUP_KEEP x && ! validate_key NOPE 1 && ! validate_key DOMAIN "a b"'
     st "v1.x config keeps old behaviour"    '( MS_CONF_DIR="$t/c3"; CONF_FILE="$t/c3/m.conf"; mkdir -p "$t/c3"; printf "%s\n" "DOMAIN='"'"'x.org'"'"'" >"$CONF_FILE"; REF_OVERRIDE=""; load_config; [[ ${CFG[ACCESS_MODE]} == internet && ${CFG[CERT_MODE]} == letsencrypt && ${CFG[SERVICE_PRESET]} == custom && ${CFG[TAILSCALE_CONTROL]} == headscale ]] )'
