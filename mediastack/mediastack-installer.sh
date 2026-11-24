@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.3.0"
+readonly SCRIPT_VERSION="2.4.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -99,7 +99,8 @@ CONF_KEYS=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA FOLDER_FOR_YAML DOMAIN CLOUDFLARE_D
             MEDIA_MOUNT_REQUIRED DATA_STORAGE DATA_REMOTE DATA_NFS_VERSION DATA_MOUNT_OPTS DATA_MOUNT_REQUIRED
             ACCESS_MODE CERT_MODE TLS_CERT_FILE TLS_KEY_FILE SERVICE_PRESET PLAYER TAILSCALE_CONTROL
             BACKUP_DIR BACKUP_KEEP BACKUP_FORMAT BACKUP_PASSPHRASE_FILE BACKUP_STOP_STACK
-            VPN_CUSTOM_OVPN_FILE VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES )
+            VPN_CUSTOM_OVPN_FILE VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES
+            CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY CERT_PUSH_USER CERT_PUSH_FROM )
 # .env keys written only when the setting has a value (never blanked, so hand edits survive)
 ENV_OPTIONAL=( VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES )
 # Settings that did not exist before v2.0.0: an existing config without them keeps its old behaviour
@@ -173,15 +174,15 @@ on_err() {
 }
 trap on_err ERR
 
-init_logging() {
+init_logging() {   # init_logging [PREFIX]  -- cert timer/push runs use their own prefix so they never rotate out install logs
+    local pre=${1:-installer} old
     mkdir -p "$MS_LOG_DIR"
     chmod 750 "$MS_LOG_DIR"
-    LOG_FILE="$MS_LOG_DIR/installer-$(date +%F_%H-%M-%S).log"
+    LOG_FILE="$MS_LOG_DIR/$pre-$(date +%F_%H-%M-%S).log"
     : >"$LOG_FILE"
     chmod 640 "$LOG_FILE"
-    # Rotation: keep the newest $LOG_KEEP run logs
-    local old
-    while IFS= read -r old; do rm -f -- "$old"; done < <(ls -1t "$MS_LOG_DIR"/installer-*.log 2>/dev/null | tail -n +$((LOG_KEEP + 1)))
+    # Rotation: keep the newest $LOG_KEEP run logs of this kind
+    while IFS= read -r old; do rm -f -- "$old"; done < <(ls -1t "$MS_LOG_DIR/$pre"-*.log 2>/dev/null | tail -n +$((LOG_KEEP + 1)))
 }
 
 # -----------------------------------------------------------------------------
@@ -397,6 +398,11 @@ set_default_config() {
         [VPN_ENDPOINT_PORT]=""
         [WIREGUARD_PUBLIC_KEY]=""
         [WIREGUARD_ADDRESSES]=""
+        [CERT_FETCH_SOURCE]=""
+        [CERT_FETCH_CERT]="fullchain.pem"
+        [CERT_FETCH_KEY]="privkey.pem"
+        [CERT_PUSH_USER]="mscertpush"
+        [CERT_PUSH_FROM]=""
     )
 }
 
@@ -2145,6 +2151,33 @@ yaml_edit() {   # yaml_edit FILE AWKPROGRAM  (in place, keeps mode/owner)
     mv -f "$tmp" "$f"
 }
 
+tls_install_selfsigned() {   # tls_install_selfsigned OUTDIR -- local CA + leaf, reissued when needed
+    local out=$1
+    ensure_local_ca
+    if (( DRY_RUN )); then log_info "[dry-run] would issue/refresh the self-signed certificate in $out"; return 0; fi
+    install -d -m 2775 "$out"
+    if leaf_needs_reissue "$out/cert.pem"; then
+        issue_leaf "$out"; state_set tls_sans "$(tls_sans)"
+        log_ok "Self-signed certificate issued for $(tls_sans) (397 days; renewed automatically 30 days before expiry)"
+    else
+        log_ok "Self-signed certificate current ($(openssl x509 -in "$out/cert.pem" -noout -enddate | cut -d= -f2))"
+    fi
+}
+
+tls_install_pair() {   # tls_install_pair CERT KEY OUTDIR -- validate, then install chain (leaf first) + plain key
+    local c=$1 k=$2 out=$3
+    tls_validate_pair "$c" "$k" || die "The certificate ($c) failed validation."
+    if (( DRY_RUN )); then log_info "[dry-run] would install $c into $out"; return 0; fi
+    install -d -m 2775 "$out"
+    tls_write_chain "$c" "$k" "$out/cert.pem.new" || { rm -f "$out/cert.pem.new"; die "Writing the certificate chain failed."; }
+    chmod 644 "$out/cert.pem.new"
+    ( umask 077; tls_key_plain "$k" >"$out/key.pem.new" ) || { rm -f "$out/key.pem.new" "$out/cert.pem.new"; die "Decrypting $k failed."; }
+    chmod 600 "$out/key.pem.new"
+    mv -f "$out/key.pem.new" "$out/key.pem"; mv -f "$out/cert.pem.new" "$out/cert.pem"
+    key_is_encrypted "$k" && log_ok "Encrypted key decrypted with the vault passphrase (Traefik's copy is root-only, 0600)"
+    log_ok "Certificate installed: $(cert_field subject "$out/cert.pem"), expires $(openssl x509 -in "$out/cert.pem" -noout -enddate | cut -d= -f2)"
+}
+
 # ensure_tls -- run after copy_app_configs (which re-copies the upstream Traefik templates)
 ensure_tls() {
     svc_enabled traefik || return 0
@@ -2155,28 +2188,24 @@ ensure_tls() {
         letsencrypt)
             log_ok "Let's Encrypt wildcard for $(tls_zone) via Cloudflare DNS-01 (issued by Traefik)"
             return 0 ;;
-        selfsigned)
-            ensure_local_ca
-            if (( DRY_RUN )); then log_info "[dry-run] would issue/refresh the self-signed certificate in $out"; return 0; fi
-            install -d -m 2775 "$out"
-            if leaf_needs_reissue "$out/cert.pem"; then
-                issue_leaf "$out"; state_set tls_sans "$(tls_sans)"
-                log_ok "Self-signed certificate issued for $(tls_sans) (397 days; renewed automatically 30 days before expiry)"
-            else
-                log_ok "Self-signed certificate current ($(openssl x509 -in "$out/cert.pem" -noout -enddate | cut -d= -f2))"
-            fi ;;
+        selfsigned) tls_install_selfsigned "$out" ;;
         manual)
             [[ -n "${CFG[TLS_CERT_FILE]}" && -n "${CFG[TLS_KEY_FILE]}" ]] \
                 || die "CERT_MODE=manual needs TLS_CERT_FILE and TLS_KEY_FILE (Settings -> Access and certificates)."
-            tls_validate_pair "${CFG[TLS_CERT_FILE]}" "${CFG[TLS_KEY_FILE]}" || die "The manual certificate failed validation."
-            if (( DRY_RUN )); then log_info "[dry-run] would copy the manual certificate into $out"; return 0; fi
-            install -d -m 2775 "$out"
-            tls_write_chain "${CFG[TLS_CERT_FILE]}" "${CFG[TLS_KEY_FILE]}" "$out/cert.pem" || die "Writing the certificate chain failed."
-            chmod 644 "$out/cert.pem"
-            ( umask 077; tls_key_plain "${CFG[TLS_KEY_FILE]}" >"$out/key.pem.new" ) || { rm -f "$out/key.pem.new"; die "Decrypting ${CFG[TLS_KEY_FILE]} failed."; }
-            chmod 600 "$out/key.pem.new"; mv -f "$out/key.pem.new" "$out/key.pem"
-            key_is_encrypted "${CFG[TLS_KEY_FILE]}" && log_ok "Encrypted key decrypted with the vault passphrase (Traefik's copy is root-only, 0600)"
-            log_ok "Manual certificate installed (expires $(openssl x509 -in "$out/cert.pem" -noout -enddate | cut -d= -f2))" ;;
+            tls_install_pair "${CFG[TLS_CERT_FILE]}" "${CFG[TLS_KEY_FILE]}" "$out" ;;
+        fetch|push)
+            if [[ "$mode" == fetch ]] && ! cert_fetch; then
+                CERT_FETCH_FAILED=1
+                [[ -n "$(cert_source_pair)" ]] && log_warn "Using the last fetched certificate."
+            fi
+            local pair c k; pair=$(cert_source_pair)
+            if [[ -z "$pair" ]]; then
+                log_warn "No $([[ "$mode" == push ]] && echo pushed || echo fetched) certificate yet: Traefik serves a temporary self-signed one until it arrives."
+                tls_install_selfsigned "$out"
+            else
+                read -r c k <<<"$pair"
+                tls_install_pair "$c" "$k" "$out"
+            fi ;;
     esac
     local st="$FOLDER_FOR_DATA/traefik/traefik.yaml" dy="$FOLDER_FOR_DATA/traefik/dynamic.yaml"
     if [[ -f "$st" && -f "$dy" ]]; then
@@ -2186,6 +2215,375 @@ ensure_tls() {
     else
         log_warn "Traefik config files missing in $FOLDER_FOR_DATA/traefik; certificate not wired"
     fi
+}
+
+# -----------------------------------------------------------------------------
+# CERTIFICATE PULL (CERT_MODE=fetch) and PUSH (CERT_MODE=push) -- same model as docker-dashboard
+#   fetch: scp the pair from CERT_FETCH_SOURCE (e.g. OPNsense acme.sh) daily, via a systemd timer
+#   push : another host streams "chain + key" on stdin to a forced SSH command:
+#            cat fullchain.pem privkey.pem | ssh mscertpush@host
+#          The push user's key may only run "sudo -n mediastack-installer --cert-receive", and sudoers
+#          allows only that exact command. The last stdout line is machine-readable and uses the same
+#          protocol as docker-dashboard, so the same deployer can push to both:
+#            DD-CERT-RECEIVE OK changed|unchanged sha256=<FP> notafter=<DATE> live=yes|no|n/a
+#            DD-CERT-RECEIVE FAIL <reason>
+# -----------------------------------------------------------------------------
+cert_fetch_dir()   { printf '%s/certs-fetched' "$MS_CONF_DIR"; }
+cert_push_dir()    { printf '%s/certs-pushed' "$MS_CONF_DIR"; }
+cert_fetch_keyf()  { printf '%s/certfetch_ed25519' "$MS_CONF_DIR"; }
+cert_fetch_hosts() { printf '%s/certfetch_known_hosts' "$MS_CONF_DIR"; }
+readonly PUSH_MAX_BYTES=65536
+readonly UNIT_CERT="mediastack-cert"
+readonly CERT_RECEIVE_TAG="DD-CERT-RECEIVE"
+CERT_FETCH_FAILED=0
+
+# cert_source_pair -> "CERT KEY" for the file-based modes (blank when none is available yet)
+cert_source_pair() {
+    local d
+    case "${CFG[CERT_MODE]}" in
+        manual) printf '%s %s' "${CFG[TLS_CERT_FILE]}" "${CFG[TLS_KEY_FILE]}" ;;
+        fetch)  d=$(cert_fetch_dir); [[ -s "$d/fullchain.pem" && -s "$d/privkey.pem" ]] && printf '%s %s' "$d/fullchain.pem" "$d/privkey.pem" ;;
+        push)   d=$(cert_push_dir);  [[ -s "$d/fullchain.pem" && -s "$d/privkey.pem" ]] && printf '%s %s' "$d/fullchain.pem" "$d/privkey.pem" ;;
+    esac
+    return 0
+}
+
+cert_fetch() {   # scp the pair from CERT_FETCH_SOURCE into $(cert_fetch_dir)
+    local src=${CFG[CERT_FETCH_SOURCE]%/} dst t k
+    dst=$(cert_fetch_dir); k=$(cert_fetch_keyf)
+    [[ -n "$src" ]] || { log_error "CERT_FETCH_SOURCE is not set (Settings -> Access / certs)."; return 1; }
+    [[ -f "$k" ]] || { log_error "No fetch key yet: Certificate menu -> create fetch key (or --cert-fetch-key)."; return 1; }
+    if (( DRY_RUN )); then run scp "$src/${CFG[CERT_FETCH_CERT]}" "$src/${CFG[CERT_FETCH_KEY]}" "$dst/"; return 0; fi
+    t=$(mktemp -d)
+    if ! scp -q -i "$k" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile="$(cert_fetch_hosts)" "$src/${CFG[CERT_FETCH_CERT]}" "$src/${CFG[CERT_FETCH_KEY]}" "$t/" 2>"$t/err"; then
+        log_error "Fetching the certificate from $src failed: $(tr '\n' ' ' <"$t/err")"
+        rm -rf "$t"; return 1
+    fi
+    if key_is_encrypted "$t/${CFG[CERT_FETCH_KEY]}"; then
+        rm -rf "$t"; log_error "The fetched private key is encrypted; fetch/push need an unencrypted key (use manual mode for encrypted keys)."; return 1
+    fi
+    install -d -m 700 "$dst"
+    if cmp -s "$t/${CFG[CERT_FETCH_CERT]}" "$dst/fullchain.pem" && cmp -s "$t/${CFG[CERT_FETCH_KEY]}" "$dst/privkey.pem"; then
+        rm -rf "$t"; log_ok "Fetched from $src (unchanged)"; return 0
+    fi
+    install -m 600 "$t/${CFG[CERT_FETCH_KEY]}" "$dst/privkey.pem.new"
+    install -m 644 "$t/${CFG[CERT_FETCH_CERT]}" "$dst/fullchain.pem.new"
+    mv -f "$dst/privkey.pem.new" "$dst/privkey.pem"; mv -f "$dst/fullchain.pem.new" "$dst/fullchain.pem"
+    rm -rf "$t"
+    log_ok "Certificate fetched from $src"
+}
+
+cert_fetch_key() {
+    local k; k=$(cert_fetch_keyf)
+    if [[ ! -f "$k" ]]; then
+        install -d -m 700 "$MS_CONF_DIR"
+        run ssh-keygen -q -t ed25519 -N "" -C "mediastack@$(hostname -s)" -f "$k"
+        log_ok "Created $k"
+    fi
+    log_info "Public key -- add it to the account named in CERT_FETCH_SOURCE (OPNsense: System -> Access -> Users -> Authorized keys):"
+    printf '\n    %s\n\n' "$(cat "$k.pub" 2>/dev/null)"
+}
+
+pem_split() {   # pem_split IN CRT_OUT KEY_OUT -> certificates (in order) and the one private key
+    awk -v c="$2" -v k="$3" '
+        /^-----BEGIN CERTIFICATE-----/                       { o = c; nc++ }
+        /^-----BEGIN ([A-Z]+ )?(ENCRYPTED )?PRIVATE KEY-----/ { o = k; nk++ }
+        o != ""                                              { print > o }
+        /^-----END /                                         { o = "" }
+        END { exit (nc >= 1 && nk == 1) ? 0 : 1 }' "$1"
+}
+
+tls_fp() { openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//'; }
+tls_https_port() {
+    local p=""
+    [[ -n "$FOLDER_FOR_YAML" && -f "$FOLDER_FOR_YAML/.env" ]] && p=$(env_get "$FOLDER_FOR_YAML/.env" REVERSE_PROXY_PORT_HTTPS || true)
+    [[ "$p" =~ ^[0-9]+$ ]] || p=443
+    printf '%s' "$p"
+}
+tls_live_fp() {   # what Traefik serves right now (SNI = the zone: Traefik uses strict SNI)
+    echo | timeout 5 openssl s_client -connect "127.0.0.1:$(tls_https_port)" -servername "$(tls_zone)" 2>/dev/null \
+        | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//'
+}
+traefik_running() { have_docker && docker ps -q --filter 'name=^traefik$' 2>/dev/null | grep -q .; }
+
+# tls_ensure_live -- make Traefik serve cert.pem: it reloads on a dynamic-config change; if it still
+# serves something else, restart it. Prints yes | no | n/a (Traefik not running).
+tls_ensure_live() {
+    local want i
+    { [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && traefik_running; } || { echo n/a; return 0; }
+    (( DRY_RUN )) && { echo n/a; return 0; }
+    want=$(tls_fp "$(traefik_cert_dir)/cert.pem")
+    [[ -n "$want" ]] || { echo no; return 0; }
+    [[ "$(tls_live_fp)" == "$want" ]] && { echo yes; return 0; }
+    touch "$FOLDER_FOR_DATA/traefik/dynamic.yaml" 2>/dev/null || true     # file provider watch -> reload
+    for (( i = 0; i < 10; i++ )); do sleep 1; [[ "$(tls_live_fp)" == "$want" ]] && { echo yes; return 0; }; done
+    log_info "Traefik did not pick up the new certificate on its own; restarting it" >&2
+    docker restart traefik </dev/null >/dev/null 2>&1 3>&- 9>&- || true   # no inherited fds (ssh channel, lock)
+    for (( i = 0; i < 30; i++ )); do sleep 1; [[ "$(tls_live_fp)" == "$want" ]] && { echo yes; return 0; }; done
+    echo no
+}
+
+cert_receive_fail() { printf '%s FAIL %s\n' "$CERT_RECEIVE_TAG" "$*" >&3; _log_file ERROR "cert-receive: $*"; exit 1; }
+
+cert_receive() {
+    exec 3>&1 1>&2          # only the status line goes to stdout; diagnostics go to stderr
+    [[ -f "$CONF_FILE" ]] || cert_receive_fail "not installed (no $CONF_FILE)"
+    ensure_config; resolve_runtime
+    [[ "${CFG[CERT_MODE]}" == push ]] || cert_receive_fail "CERT_MODE is ${CFG[CERT_MODE]}, not push"
+    svc_enabled traefik || cert_receive_fail "Traefik is not enabled on this host (nothing serves the certificate)"
+    (( DRY_RUN )) && { log_info "Dry run: would validate stdin and install it into $(cert_push_dir)"; return 0; }
+    local t n before after state=unchanged d live notafter
+    d=$(cert_push_dir)
+    t=$(mktemp -d); chmod 700 "$t"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$t'" EXIT
+    # bounded read: a stalled or wrong client (scp/sftp) must not hold the lock
+    timeout 30 head -c $((PUSH_MAX_BYTES + 1)) >"$t/in" || [[ $? != 124 ]] || cert_receive_fail "timed out waiting for input"
+    n=$(wc -c <"$t/in")
+    (( n > 0 )) || cert_receive_fail "nothing received on stdin"
+    (( n <= PUSH_MAX_BYTES )) || cert_receive_fail "input larger than $PUSH_MAX_BYTES bytes"
+    sed -i 's/\r$//' "$t/in"
+    pem_split "$t/in" "$t/crt" "$t/key" || cert_receive_fail "expected certificate(s) followed by exactly one private key (PEM)"
+    key_is_encrypted "$t/key" && cert_receive_fail "the private key is encrypted (push an unencrypted key)"
+    openssl x509 -in "$t/crt" -noout 2>/dev/null || cert_receive_fail "certificate does not parse"
+    tls_validate_pair "$t/crt" "$t/key" || cert_receive_fail "certificate rejected (key mismatch, no matching certificate or expired)"
+    install -d -m 700 "$d"
+    if ! cmp -s "$t/crt" "$d/fullchain.pem" || ! cmp -s "$t/key" "$d/privkey.pem"; then
+        install -m 600 -o root -g root "$t/key" "$d/privkey.pem.new"
+        install -m 644 -o root -g root "$t/crt" "$d/fullchain.pem.new"
+        mv -f "$d/privkey.pem.new" "$d/privkey.pem"; mv -f "$d/fullchain.pem.new" "$d/fullchain.pem"
+        log_ok "Stored the pushed certificate in $d"
+    fi
+    before=$(tls_fp "$(traefik_cert_dir)/cert.pem")
+    ( ensure_tls ) || cert_receive_fail "installing the certificate for Traefik failed"
+    after=$(tls_fp "$(traefik_cert_dir)/cert.pem")
+    [[ "$before" != "$after" ]] && state=changed
+    live=$(tls_ensure_live)
+    [[ "$live" != no ]] || log_warn "Traefik is not serving the new certificate yet (is the traefik container running?)"
+    notafter=$(openssl x509 -in "$(traefik_cert_dir)/cert.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//; s/ /_/g')
+    printf '%s OK %s sha256=%s notafter=%s live=%s\n' "$CERT_RECEIVE_TAG" "$state" "$after" "$notafter" "$live" >&3
+    _log_file INFO "cert-receive: $state $after live=$live"
+}
+
+push_authorized_line() {   # push_authorized_line PUBKEY_LINE [FROM]
+    local opts="restrict"
+    [[ -n "${2:-}" ]] && opts+=",from=\"$2\""
+    printf '%s,command="sudo -n %s --cert-receive" %s\n' "$opts" "$MS_INSTALL_BIN" "$1"
+}
+push_sudoers_line() { printf '%s ALL=(root) NOPASSWD: %s --cert-receive\n' "$1" "$MS_INSTALL_BIN"; }
+push_sudoers_file() { printf '%s/mediastack-certpush' "${MS_SUDOERS_DIR:-/etc/sudoers.d}"; }
+
+cert_push_setup() {   # cert_push_setup [PUBKEY_FILE|-]  -- create the push user, forced command and sudoers rule
+    require_config; resolve_runtime
+    local u=${CFG[CERT_PUSH_USER]} from=${CFG[CERT_PUSH_FROM]} src=${1:-} key="" home sud tmp au
+    log_step "Certificate push receiver (user $u)"
+    if [[ -n "$src" && "$src" != - ]]; then key=$(grep -m1 -E '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9-]+) ' "$src" 2>/dev/null || true)
+    elif [[ "$src" == - ]] || ! is_tty; then key=$(grep -m1 -E '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9-]+) ' || true)
+    else
+        log_info "Paste the pushing machine's PUBLIC key (one line: ssh-ed25519 AAAA... comment)."
+        log_info "On OPNsense, create it with: ssh-keygen -t ed25519 -N '' -f /root/ssl_certs/mediastack_push_ed25519"
+        read -rp "  Public key: " key || true
+    fi
+    key=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$key")
+    [[ -n "$key" ]] && ssh-keygen -l -f /dev/stdin <<<"$key" >/dev/null 2>&1 || die "That is not an SSH public key."
+    command -v sshd >/dev/null 2>&1 || [[ -x /usr/sbin/sshd ]] || log_warn "openssh-server is not installed: install it (apt-get install openssh-server) or pushes cannot arrive."
+    command -v sudo >/dev/null 2>&1 || { log_info "Installing sudo"; run apt-get install -y -qq sudo; }
+    [[ -x "$MS_INSTALL_BIN" ]] || install_self
+    if ! id "$u" >/dev/null 2>&1; then
+        run useradd --system --create-home --shell /bin/sh --comment "mediastack certificate push" "$u"
+        log_ok "Created system user $u (no password; key login only)"
+    fi
+    # "!" (locked) makes sshd refuse even key logins when UsePAM is off; "*" = no password, keys still work
+    [[ "$(getent shadow "$u" 2>/dev/null | cut -d: -f2)" == "*" ]] || run usermod -p '*' "$u"
+    home=$(getent passwd "$u" | cut -d: -f6); [[ -n "$home" ]] || home="/home/$u"
+    run install -d -m 700 -o "$u" -g "$u" "$home/.ssh"
+    push_authorized_line "$key" "$from" | write_file "$home/.ssh/authorized_keys" 600 "$u:$u"
+    sud=$(push_sudoers_file)
+    if (( DRY_RUN )); then run write "$sud"
+    else
+        tmp=$(mktemp)
+        push_sudoers_line "$u" >"$tmp"
+        visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "visudo rejected the sudoers rule."; }
+        install -d -m 750 "$(dirname "$sud")"; install -m 440 -o root -g root "$tmp" "$sud"; rm -f "$tmp"
+        log_ok "Wrote $sud"
+    fi
+    au=$(sshd -T 2>/dev/null | awk 'tolower($1) == "allowusers" {$1 = ""; print}' || true)
+    if [[ -n "${au// }" && " $au " != *" $u "* ]]; then
+        log_warn "sshd has AllowUsers ($au): add $u there or the push is refused."
+    fi
+    [[ "${CFG[CERT_MODE]}" == push ]] || log_warn "CERT_MODE is ${CFG[CERT_MODE]}: pushes are refused until it is 'push' (Settings -> Access / certs)."
+    log_info "Pushing side: user $u, host $(eff_local_ip), key = the private half of the key above."
+    log_info "Test it from there:  cat fullchain.pem privkey.pem | ssh -i KEY $u@$(eff_local_ip)"
+    log_info "Its TLS check must use a hostname under $(tls_zone) (Traefik uses strict SNI, so a probe by IP fails)."
+    [[ -n "$from" ]] || log_info "Tip: set CERT_PUSH_FROM to the pushing machine's IP so the key only works from there."
+}
+
+cert_push_remove() {   # undo cert_push_setup (uninstall)
+    local u=${CFG[CERT_PUSH_USER]:-mscertpush} sud
+    sud=$(push_sudoers_file)
+    [[ -f "$sud" ]] && run rm -f "$sud"
+    if id "$u" >/dev/null 2>&1 && [[ "$(getent passwd "$u" | cut -d: -f5)" == "mediastack certificate push" ]]; then
+        run userdel -r "$u" 2>/dev/null || true
+        log_ok "Removed certificate push user $u"
+    fi
+    return 0
+}
+
+# cert_refresh -- timer/path-unit/menu entry point: fetch or re-read, install, reload Traefik if it changed
+cert_refresh() {
+    require_config; resolve_runtime
+    [[ "${CFG[CERT_MODE]}" == manual ]] && load_secrets
+    svc_enabled traefik || { log_info "Traefik is not enabled: nothing serves a certificate."; return 0; }
+    [[ "${CFG[CERT_MODE]}" == letsencrypt ]] && { log_info "Let's Encrypt certificates are renewed by Traefik itself."; return 0; }
+    local before after live
+    before=$(tls_fp "$(traefik_cert_dir)/cert.pem")
+    ensure_tls
+    after=$(tls_fp "$(traefik_cert_dir)/cert.pem")
+    live=$(tls_ensure_live)
+    if [[ "$before" != "$after" ]]; then log_ok "New certificate installed (live: $live)"
+    else log_info "Certificate unchanged (live: $live)"; fi
+    [[ "$live" != no ]] || log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem"
+    if (( CERT_FETCH_FAILED )); then   # non-zero for the timer's journal when the fetch itself failed
+        log_error "The fetch failed; Traefik keeps serving the previous certificate."
+        return 1
+    fi
+    return 0
+}
+
+cert_show() {
+    require_config; resolve_runtime
+    local f; f="$(traefik_cert_dir)/cert.pem"
+    printf '  Mode: %s\n' "${CFG[CERT_MODE]}"
+    case "${CFG[CERT_MODE]}" in
+        fetch) printf '  Source: %s (%s, %s); last fetched copy: %s\n' "${CFG[CERT_FETCH_SOURCE]:-<unset>}" "${CFG[CERT_FETCH_CERT]}" "${CFG[CERT_FETCH_KEY]}" \
+                      "$(date -r "$(cert_fetch_dir)/fullchain.pem" '+%F %T' 2>/dev/null || echo never)" ;;
+        push)  printf '  Push user: %s (from: %s); last push stored: %s\n' "${CFG[CERT_PUSH_USER]}" "${CFG[CERT_PUSH_FROM]:-any}" \
+                      "$(date -r "$(cert_push_dir)/fullchain.pem" '+%F %T' 2>/dev/null || echo 'never (temporary self-signed in use)')" ;;
+    esac
+    if [[ -f "$f" ]]; then
+        openssl x509 -in "$f" -noout -subject -issuer -enddate -ext subjectAltName 2>&1 | sed 's/^/  /'
+        printf '  sha256 %s\n  Served now: %s\n' "$(tls_fp "$f")" "$(tls_live_fp || true)"
+    else
+        log_info "No file-based certificate deployed (${CFG[CERT_MODE]})."
+    fi
+}
+
+# cert_units -- systemd units: fetch = daily timer; manual = path watcher on the two files
+cert_units() {
+    local ud=${MS_UNIT_DIR:-/etc/systemd/system} want="" svc timer pathu
+    svc="[Unit]
+Description=mediastack-installer: refresh the Traefik TLS certificate
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$MS_INSTALL_BIN --cert-refresh --yes"
+    timer="[Unit]
+Description=mediastack-installer: fetch the TLS certificate daily
+
+[Timer]
+OnCalendar=*-*-* 05:23:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target"
+    pathu="[Unit]
+Description=mediastack-installer: deploy the TLS certificate when its files change
+
+[Path]
+PathChanged=${CFG[TLS_CERT_FILE]}
+PathChanged=${CFG[TLS_KEY_FILE]}
+
+[Install]
+WantedBy=multi-user.target"
+    if svc_enabled traefik; then
+        case "${CFG[CERT_MODE]}" in
+            fetch)  want=timer ;;
+            manual) [[ -n "${CFG[TLS_CERT_FILE]}" && -n "${CFG[TLS_KEY_FILE]}" ]] && want=path ;;
+        esac
+    fi
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local kind other changed
+    for kind in timer path; do
+        [[ "$kind" == "$want" ]] && continue
+        if [[ -f "$ud/$UNIT_CERT.$kind" ]]; then
+            run systemctl disable --now "$UNIT_CERT.$kind" 2>/dev/null || true
+            run rm -f "$ud/$UNIT_CERT.$kind"
+            [[ -z "$want" ]] && run rm -f "$ud/$UNIT_CERT.service"
+            run systemctl daemon-reload 2>/dev/null || true
+            log_ok "Removed $UNIT_CERT.$kind"
+        fi
+    done
+    [[ -n "$want" ]] || return 0
+    [[ "$want" == timer ]] && other=$timer || other=$pathu
+    changed=0
+    if [[ "$(cat "$ud/$UNIT_CERT.service" 2>/dev/null)" != "$svc" ]]; then printf '%s\n' "$svc" | write_file "$ud/$UNIT_CERT.service" 644 root:root; changed=1; fi
+    if [[ "$(cat "$ud/$UNIT_CERT.$want" 2>/dev/null)" != "$other" ]]; then printf '%s\n' "$other" | write_file "$ud/$UNIT_CERT.$want" 644 root:root; changed=1; fi
+    if (( changed )); then
+        run systemctl daemon-reload
+        run systemctl enable "$UNIT_CERT.$want"
+        run systemctl restart "$UNIT_CERT.$want"
+    elif ! systemctl is-active --quiet "$UNIT_CERT.$want" 2>/dev/null; then
+        run systemctl enable --now "$UNIT_CERT.$want"
+    fi
+    [[ "$want" == timer ]] && log_ok "Daily certificate fetch: $UNIT_CERT.timer" || log_ok "Certificate file watcher: $UNIT_CERT.path"
+    return 0
+}
+
+cfg_cert_transfer() {   # fetch / push details (Settings -> Access / certs)
+    local c k
+    case "${CFG[CERT_MODE]}" in
+        fetch)
+            section "Certificate fetch (pull)"
+            log_info "The pair is copied daily over scp (and on every apply) from another machine, e.g. OPNsense acme.sh."
+            ask_valid "CFG[CERT_FETCH_SOURCE]" "Source user@host:/folder (e.g. certsync@192.168.1.1:/var/etc/acme-client/certs/ID)" "${CFG[CERT_FETCH_SOURCE]}" v_fetchsrc "user@host:/absolute/folder"
+            ask_valid "CFG[CERT_FETCH_CERT]" "Certificate (full chain) file name in that folder" "${CFG[CERT_FETCH_CERT]}" v_fname "a file name"
+            ask_valid "CFG[CERT_FETCH_KEY]" "Private key file name in that folder" "${CFG[CERT_FETCH_KEY]}" v_fname "a file name"
+            if [[ ! -f "$(cert_fetch_keyf)" ]] && confirm "Create the SSH key used for fetching now?" y; then cert_fetch_key; fi
+            if [[ -f "$(cert_fetch_keyf)" ]] && is_tty && confirm "Try fetching now?" y; then
+                cert_fetch && { read -r c k <<<"$(cert_source_pair)"; tls_validate_pair "$c" "$k" && log_ok "Fetched certificate is valid"; } || true
+            fi ;;
+        push)
+            section "Certificate push"
+            log_info "Another machine (e.g. the OPNsense certificate deployer) pushes chain + key over SSH when it renews."
+            log_info "Until the first push, Traefik serves a temporary self-signed certificate."
+            ask_valid "CFG[CERT_PUSH_USER]" "Local user the pushing machine logs in as" "${CFG[CERT_PUSH_USER]}" v_user "a user name"
+            ask_valid "CFG[CERT_PUSH_FROM]" "Only accept pushes from (IP/CIDR list, blank = any)" "${CFG[CERT_PUSH_FROM]}" v_from_opt "IPs/CIDRs separated by commas"
+            if [[ -f "$CONF_FILE" ]] && confirm "Set up the push user and its key now?" y; then save_config; cert_push_setup; fi
+            [[ -f "$CONF_FILE" ]] || log_info "After the install, run Certificate menu -> set up push receiver (or --cert-push-setup)." ;;
+    esac
+    return 0
+}
+
+menu_cert() {
+    while :; do
+        load_config
+        printf '\n  %sCertificate%s (%s)\n' "$B" "$NC" "${CFG[CERT_MODE]}"
+        printf '   1) Refresh now          (fetch / re-read, reload Traefik if it changed)\n'
+        printf '   2) Show certificate     (what is deployed and what is served)\n'
+        printf '   3) Create / show fetch SSH key (pull mode)\n'
+        printf '   4) Set up push receiver (user, key, sudoers)\n'
+        printf '   5) Change mode / source (Settings -> Access / certs)\n'
+        printf '   0) Back\n'
+        local ch; read -rp "  Choice: " ch || return 0
+        case "${ch,,}" in
+            1) menu_action cert_refresh ;;
+            2) menu_action cert_show ;;
+            3) menu_action cert_fetch_key ;;
+            4) menu_action cert_push_setup ;;
+            5) cfg_access; cfg_manual_cert; cfg_cert_transfer
+               [[ "${CFG[CERT_MODE]}" == letsencrypt ]] || CFG[CLOUDFLARE_DNS_ZONE]=${CFG[DOMAIN]}
+               [[ "${CFG[SERVICE_PRESET]}" == custom ]] || apply_preset
+               save_config
+               confirm "Apply now so it takes effect?" y && menu_action stack_apply nopull ;;
+            0|q) return 0 ;;
+            *) continue ;;
+        esac
+        pause
+    done
 }
 
 # -----------------------------------------------------------------------------
@@ -2321,6 +2719,7 @@ stack_apply() {
     ensure_folders
     copy_app_configs
     ensure_tls
+    cert_units
     report_dependencies die
     log_step "Starting MediaStack ($mode)"
     if (( DRY_RUN )); then
@@ -2341,6 +2740,9 @@ stack_apply() {
         die "Some containers could not start (causes above). Fix them, then run Apply again."
     fi
     verify_services 180 || true
+    if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ "$(tls_ensure_live)" == no ]]; then
+        log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem yet; check: sudo $MS_INSTALL_BIN --cert-show"
+    fi
 }
 
 stack_stop() {
@@ -2370,6 +2772,10 @@ show_status() {
     if [[ "${CFG[CERT_MODE]}" != letsencrypt && -f "$(traefik_cert_dir)/cert.pem" ]]; then
         printf '  %-22s %s\n' "Certificate expires" "$(openssl x509 -in "$(traefik_cert_dir)/cert.pem" -noout -enddate 2>/dev/null | cut -d= -f2)"
     fi
+    case "${CFG[CERT_MODE]}" in
+        fetch) printf '  %-22s %s\n' "Certificate fetch" "${CFG[CERT_FETCH_SOURCE]:-<unset>}; last copy $(date -r "$(cert_fetch_dir)/fullchain.pem" '+%F %T' 2>/dev/null || echo never)" ;;
+        push)  printf '  %-22s %s\n' "Certificate push" "user ${CFG[CERT_PUSH_USER]} from ${CFG[CERT_PUSH_FROM]:-any}; last push $(date -r "$(cert_push_dir)/fullchain.pem" '+%F %T' 2>/dev/null || echo 'never (temporary self-signed)')" ;;
+    esac
     report_dependencies warn
     if svc_enabled gluetun; then
         printf '  %-22s %s\n' "VPN" "${CFG[VPN_SERVICE_PROVIDER]:-<not set>} / ${CFG[VPN_TYPE]}"
@@ -2655,7 +3061,10 @@ v_nfsver()   { [[ "$1" =~ ^(auto|3|4|4\.0|4\.1|4\.2)$ ]]; }
 v_smb_remote() { valid_remote smb "$(normalize_remote smb "$1")"; }
 v_nfs_remote() { valid_remote nfs "$(normalize_remote nfs "$1")"; }
 v_access()   { [[ "$1" =~ ^(internet|lan)$ ]]; }
-v_cert()     { [[ "$1" =~ ^(letsencrypt|selfsigned|manual)$ ]]; }
+v_cert()     { [[ "$1" =~ ^(letsencrypt|selfsigned|manual|fetch|push)$ ]]; }
+v_fetchsrc() { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.:_-]+:/[^[:space:]\']*$ ]]; }
+v_fname()    { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+v_from_opt() { [[ -z "$1" || "$1" =~ ^[0-9A-Fa-f.:/,*?]+$ ]]; }
 v_preset()   { [[ "$1" =~ ^(core|full|custom)$ ]]; }
 v_player()   { [[ "$1" =~ ^(jellyfin|plex|both)$ ]]; }
 v_tscontrol(){ [[ "$1" =~ ^(tailscale|headscale)$ ]]; }
@@ -2691,8 +3100,10 @@ cfg_access() {
     log_info "Traefik certificate (used whenever Traefik runs):"
     log_info "  letsencrypt = trusted wildcard via Cloudflare DNS-01 (Cloudflare-hosted domain + API token)"
     log_info "  selfsigned  = local CA created on this host; import its ca.crt on your devices once"
-    log_info "  manual      = your own certificate + key files (e.g. from acme.sh); re-copied on every apply"
-    ask_valid "CFG[CERT_MODE]" "Certificate source (letsencrypt/selfsigned/manual)" "${CFG[CERT_MODE]}" v_cert "letsencrypt, selfsigned or manual"
+    log_info "  manual      = your own certificate + key files (paths or pasted); re-copied on every apply"
+    log_info "  fetch       = pulled over scp daily from another machine (e.g. OPNsense acme.sh)"
+    log_info "  push        = another machine pushes it over SSH when it renews (e.g. the OPNsense deployer)"
+    ask_valid "CFG[CERT_MODE]" "Certificate source (letsencrypt/selfsigned/manual/fetch/push)" "${CFG[CERT_MODE]}" v_cert "letsencrypt, selfsigned, manual, fetch or push"
 }
 
 # read_paste OUT [hidden] -- pasted text until a line "END", Ctrl-D, or 3 s without input once
@@ -3099,7 +3510,7 @@ config_wizard() {
     load_config
     [[ -f "$CONF_FILE" ]] || detect_defaults
     [[ -f "$SECRETS_FILE" ]] && load_secrets || SECRETS_LOADED=1
-    cfg_paths; cfg_access; cfg_network; cfg_manual_cert; cfg_storage MEDIA; cfg_storage DATA
+    cfg_paths; cfg_access; cfg_network; cfg_manual_cert; cfg_cert_transfer; cfg_storage MEDIA; cfg_storage DATA
     cfg_account; cfg_services; cfg_vpn_email; cfg_stack
     config_summary
     confirm "Save this configuration?" y || die "Cancelled; nothing saved."
@@ -3128,7 +3539,7 @@ menu_settings() {
         read -rp "  Choice: " ch || return 0
         case "${ch,,}" in
             1) cfg_paths; dirty=1 ;;
-            2) cfg_access; cfg_manual_cert; [[ "${CFG[CERT_MODE]}" == letsencrypt ]] || CFG[CLOUDFLARE_DNS_ZONE]=${CFG[DOMAIN]}
+            2) cfg_access; cfg_manual_cert; cfg_cert_transfer; [[ "${CFG[CERT_MODE]}" == letsencrypt ]] || CFG[CLOUDFLARE_DNS_ZONE]=${CFG[DOMAIN]}
                [[ "${CFG[SERVICE_PRESET]}" == custom ]] || apply_preset; dirty=1 ;;
             3) cfg_network; dirty=1 ;;
             4) cfg_storage MEDIA; dirty=1 ;;
@@ -3328,6 +3739,8 @@ uninstall_stack() {
     if [[ -f "$MS_DROPIN_DIR/mediastack-mounts.conf" ]]; then
         run rm -f "$MS_DROPIN_DIR/mediastack-mounts.conf"; run systemctl daemon-reload 2>/dev/null || true
     fi
+    CFG[CERT_MODE]=letsencrypt; cert_units     # removes the certificate timer/watcher
+    cert_push_remove
     if id "${CFG[SERVICE_USER]}" >/dev/null 2>&1 && confirm "Remove service account '${CFG[SERVICE_USER]}'?" n; then
         run userdel "${CFG[SERVICE_USER]}" || true
         getent group "${CFG[SERVICE_USER]}" >/dev/null && run groupdel "${CFG[SERVICE_USER]}" || true
@@ -3438,7 +3851,12 @@ declare -A CONF_HELP=(
     [DATA_MOUNT_OPTS]="extra mount options"
     [DATA_MOUNT_REQUIRED]="yes | no: Docker waits for the mount at boot"
     [ACCESS_MODE]="internet | lan"
-    [CERT_MODE]="letsencrypt | selfsigned | manual"
+    [CERT_MODE]="letsencrypt | selfsigned | manual | fetch (pull over scp daily) | push (received over SSH)"
+    [CERT_FETCH_SOURCE]="fetch mode: user@host:/folder holding the certificate files"
+    [CERT_FETCH_CERT]="fetch mode: full-chain certificate file name in that folder"
+    [CERT_FETCH_KEY]="fetch mode: private key file name in that folder"
+    [CERT_PUSH_USER]="push mode: local user the pushing machine logs in as"
+    [CERT_PUSH_FROM]="push mode: IPs/CIDRs the push key is accepted from (blank = any)"
     [TLS_CERT_FILE]="manual mode: PEM full-chain certificate path"
     [TLS_KEY_FILE]="manual mode: PEM private key path"
     [SERVICE_PRESET]="core | full | custom"
@@ -3483,6 +3901,10 @@ validate_key() {   # validate_key KEY VALUE
         MEDIA_NFS_VERSION|DATA_NFS_VERSION) v_nfsver "$v" ;;
         ACCESS_MODE) v_access "$v" ;;
         CERT_MODE) v_cert "$v" ;;
+        CERT_FETCH_SOURCE) v_fetchsrc "$v" ;;
+        CERT_FETCH_CERT|CERT_FETCH_KEY) v_fname "$v" ;;
+        CERT_PUSH_USER) v_user "$v" ;;
+        CERT_PUSH_FROM) v_from_opt "$v" ;;
         TLS_CERT_FILE|TLS_KEY_FILE|BACKUP_PASSPHRASE_FILE) [[ -z "$v" ]] || v_path "$v" ;;
         SERVICE_PRESET) v_preset "$v" ;;
         PLAYER) v_player "$v" ;;
@@ -3532,6 +3954,9 @@ cli_set() {   # cli_set KEY VALUE
     esac
     [[ "$k" == CERT_MODE && "$v" == manual && ( -z "${CFG[TLS_CERT_FILE]}" || -z "${CFG[TLS_KEY_FILE]}" ) ]] \
         && log_warn "Also set TLS_CERT_FILE and TLS_KEY_FILE before applying."
+    [[ "$k" == CERT_MODE && "$v" == fetch && -z "${CFG[CERT_FETCH_SOURCE]}" ]] \
+        && log_warn "Also set CERT_FETCH_SOURCE, and create the fetch key (--cert-fetch-key), before applying."
+    [[ "$k" == CERT_MODE && "$v" == push ]] && log_info "Set up the receiver with --cert-push-setup PUBKEY_FILE."
     save_config
     log_ok "$k=$v saved. Run --apply (or --start) to put it into effect."
     report_dependencies warn
@@ -4054,6 +4479,10 @@ FIX
     st "Gluetun hint: invalid region"     '( h=$(vpn_log_hints "ERROR VPN settings: provider settings: server selection: for VPN service provider protonvpn: the region specified is not valid: one or more values is set but there is no possible value available"); [[ "$h" == *SERVER_REGIONS* && "$h" == *"no regions"* && "$h" != *"not a Gluetun provider"* ]] && h=$(vpn_log_hints "ERROR VPN_SERVICE_PROVIDER: provider foo is not valid") && [[ "$h" == *"not a Gluetun provider"* ]] )'
     st "SERVER_REGIONS rejects pasted text" '( validate_key SERVER_REGIONS "" && validate_key SERVER_REGIONS "US East,Netherlands" && ! validate_key SERVER_REGIONS "PersistentKeepalive = 25" && ! validate_key SERVER_REGIONS "[Peer]" && st_prep lan jellyfin tailscale core selfsigned && CFG[SERVER_REGIONS]="PersistentKeepalive = 25" && [[ "$(vpn_problems)" == *SERVER_REGIONS* ]] )'
     st "compose output: log vs console"   '( f="$t/stream.log"; : >"$f"; c=$(printf " sonarr Pulling\n a1289cb1b2e1 Downloading 138.4MB\n 7970ef2aa55e Extracting 7B\n a1289cb1b2e1 Pull complete\n sonarr Pulled\n Container sonarr Started\nError response from daemon: boom\n" | awk -v lf="$f" -v tty=0 "$STREAM_AWK"); [[ "$c" == *"pulled: sonarr"* && "$c" == *"Error response from daemon: boom"* && "$c" == *"Pulled 1 image(s)"* && "$c" != *Downloading* && "$c" != *Extracting* ]] && ! grep -q "Downloading\|Extracting" "$f" && grep -q "Pull complete" "$f" && grep -q "sonarr Pulled" "$f" && grep -q "Container sonarr Started" "$f" )'
+    st "cert fetch/push settings validate" '( validate_key CERT_MODE fetch && validate_key CERT_MODE push && ! validate_key CERT_MODE pull && validate_key CERT_FETCH_SOURCE "certsync@192.168.1.1:/var/etc/acme" && ! validate_key CERT_FETCH_SOURCE "192.168.1.1:/x" && ! validate_key CERT_FETCH_SOURCE "u@h:rel" && validate_key CERT_FETCH_CERT fullchain.pem && ! validate_key CERT_FETCH_KEY "a/b" && validate_key CERT_PUSH_FROM "192.168.1.1,10.0.0.0/8" && validate_key CERT_PUSH_FROM "" && ! validate_key CERT_PUSH_FROM "1.2.3.4 && id" && validate_key CERT_PUSH_USER mscertpush )'
+    st "push input split (chain + one key)" '( d="$t/ps"; mkdir -p "$d"; cat "$t/leaf/cert.pem" "$t/leaf/key.pem" >"$d/in" && pem_split "$d/in" "$d/c" "$d/k" && cmp -s "$d/c" "$t/leaf/cert.pem" && cmp -s "$d/k" "$t/leaf/key.pem" && ! pem_split "$t/leaf/cert.pem" "$d/c2" "$d/k2" && cat "$d/in" "$t/leaf/key.pem" >"$d/in2" && ! pem_split "$d/in2" "$d/c3" "$d/k3" && ! { echo hello >"$d/g"; pem_split "$d/g" "$d/c4" "$d/k4"; } )'
+    st "push key forced to --cert-receive" '( l=$(push_authorized_line "ssh-ed25519 AAAAkey c" "192.168.1.1"); [[ "$l" == "restrict,from=\"192.168.1.1\",command=\"sudo -n $MS_INSTALL_BIN --cert-receive\" ssh-ed25519 AAAAkey c" ]] && l=$(push_authorized_line "ssh-ed25519 AAAAkey c") && [[ "$l" == restrict,command=* ]] && [[ "$(push_sudoers_line mscertpush)" == "mscertpush ALL=(root) NOPASSWD: $MS_INSTALL_BIN --cert-receive" ]] && { ! command -v visudo >/dev/null || { push_sudoers_line mscertpush >"$t/sud" && visudo -cf "$t/sud" >/dev/null; }; } )'
+    st "fetched/pushed pair lookup"        '( MS_CONF_DIR="$t/cp"; mkdir -p "$t/cp/certs-pushed" "$t/cp/certs-fetched"; CFG[CERT_MODE]=push; [[ -z "$(cert_source_pair)" ]] && cp "$t/leaf/cert.pem" "$t/cp/certs-pushed/fullchain.pem" && cp "$t/leaf/key.pem" "$t/cp/certs-pushed/privkey.pem" && [[ "$(cert_source_pair)" == "$t/cp/certs-pushed/fullchain.pem $t/cp/certs-pushed/privkey.pem" ]] && CFG[CERT_MODE]=fetch && [[ -z "$(cert_source_pair)" ]] )'
     st "VPN problems detected"             '( st_prep lan jellyfin tailscale core selfsigned; CFG[VPN_TYPE]=openvpn; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[VPN_CUSTOM_OVPN_FILE]=""; p=$(vpn_problems); [[ "$p" == *".ovpn"* ]] &&
         CFG[VPN_SERVICE_PROVIDER]=nordvpn && SECRETS[VPN_USERNAME]=""; p=$(vpn_problems); [[ "$p" == *"VPN_USERNAME"* ]] &&
         SECRETS[VPN_USERNAME]=u && SECRETS[VPN_PASSWORD]=p && p=$(vpn_problems) && [[ "$p" != *VPN_USERNAME* ]] &&
@@ -4133,7 +4562,7 @@ main_menu() {
         printf '   5) Apply without pulling  (converge, up)\n'
         printf '   6) Stop stack             (containers down, data kept)\n'
         printf '   R) Restart containers     (no converge)\n'
-        printf '   7) Status\n   8) Post-install helpers\n   9) Logs\n'
+        printf '   7) Status\n   8) Post-install helpers\n   9) Logs\n   K) Certificate          (refresh, show, fetch key, push receiver)\n'
         printf '  %sMaintenance%s\n' "$B" "$NC"
         printf '   B) Backup / restore\n   C) Show settings (all keys)\n   U) Uninstall...\n   T) Toggle dry-run\n   S) Self-test\n   0) Quit\n\n'
         local ch; read -rp "  Choice: " ch || exit 0
@@ -4147,6 +4576,7 @@ main_menu() {
             7) menu_action show_status ;;
             8) menu_helpers ;;
             9) menu_logs ;;
+            k) menu_cert ;;
             r) menu_action stack_restart ;;
             b) menu_backup ;;
             c) menu_action show_config ;;
@@ -4185,6 +4615,12 @@ Actions (default: interactive menu)
   --restore FILE         Restore a backup (keyword RESTORE)
   --passphrase-file FILE Portable backup passphrase (first line), or set MS_BACKUP_PASSPHRASE
   --rekey                Re-encrypt the vault with the configured SECRETS_BACKEND
+  --cert-refresh         Fetch / re-read the certificate, install it, reload Traefik if it changed
+  --cert-show            Show the deployed certificate and what Traefik serves
+  --cert-fetch-key       Create / show the SSH key used to fetch the certificate (CERT_MODE=fetch)
+  --cert-push-setup [F|-] Set up the push receiver (user, forced-command key, sudoers); public key
+                         from file F, stdin (-) or a prompt (CERT_MODE=push)
+  --cert-receive         Push receiver: read chain + key on stdin (run by the forced SSH command)
   --helper NAME          authentik-db | guacamole | akadmin | apikeys
   --settings             Settings menu (paths, network, storage, services, ...)
   --test-storage T       Trial-mount MEDIA or DATA share; check write + hardlinks
@@ -4238,6 +4674,12 @@ main() {
             --restore)      action=restore; arg1=${2:-}; [[ -n "$arg1" ]] || die "--restore needs FILE"; shift ;;
             --passphrase-file) PASSPHRASE_FILE_OPT=${2:-}; [[ -n "$PASSPHRASE_FILE_OPT" ]] || die "--passphrase-file needs FILE"; shift ;;
             --rekey)        action=rekey ;;
+            --cert-refresh) action=certrefresh ;;
+            --cert-show)    action=certshow ;;
+            --cert-fetch-key) action=certkey ;;
+            --cert-push-setup) action=certpush
+                            if [[ -n "${2:-}" && ( "${2:-}" == - || "${2:-}" != -* ) ]]; then arg1=$2; shift; fi ;;
+            --cert-receive) action=certreceive ;;
             --status)       action=status ;;
             --helper)       action=helper; helper=${2:-}; shift ;;
             --secrets)      action=secrets ;;
@@ -4264,8 +4706,13 @@ main() {
     fi
 
     check_root "${orig[@]}"
-    init_logging
-    acquire_lock
+    case "$action" in certrefresh|certreceive) init_logging cert ;; *) init_logging ;; esac
+    if [[ "$action" == certreceive ]]; then   # a push waits for a menu/apply run instead of failing
+        exec 9>"$MS_LOCK_FILE"
+        flock -w 300 9 || { printf '%s FAIL busy: another run held the lock for 5 minutes\n' "$CERT_RECEIVE_TAG"; exit 1; }
+    else
+        acquire_lock
+    fi
     _log_file INFO "================================================"
     _log_file INFO "$SCRIPT_NAME v$SCRIPT_VERSION started action=$action dry_run=$DRY_RUN"
     _log_file INFO "User: $(id -un) (real: $REAL_USER)  PID: $$"
@@ -4284,6 +4731,11 @@ main() {
         backup)    do_backup ;;
         restore)   do_restore "$arg1" ;;
         rekey)     secrets_rekey ;;
+        certrefresh) cert_refresh || exit 1 ;;
+        certshow)  cert_show ;;
+        certkey)   ensure_config; cert_fetch_key ;;
+        certpush)  cert_push_setup "$arg1" ;;
+        certreceive) cert_receive ;;
         status)    show_status ;;
         secrets)   menu_secrets ;;
         settings)  is_tty || die "Settings menu needs a terminal."; menu_settings ;;
