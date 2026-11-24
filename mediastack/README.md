@@ -34,6 +34,7 @@ After installation it handles day-2 operations:
 - [Menu and CLI](#menu-and-cli)
 - [Settings reference](#settings-reference)
 - [Access mode and certificates](#access-mode-and-certificates)
+- [VPN (Gluetun)](#vpn-gluetun)
 - [Service presets](#service-presets)
 - [Storage: local, SMB, NFS, external](#storage-local-smb-nfs-external)
 - [Services: on / disabled / removed](#services-on--disabled--removed)
@@ -202,7 +203,9 @@ or by hand followed by **Apply**.
 | `TAILSCALE_CONTROL` | `tailscale` | `tailscale` (official service) or `headscale` (self-hosted, upstream's setup) |
 | `DISABLED_SERVICES` | from preset | Never started; folders kept. Editing it switches the preset to `custom` |
 | `REMOVED_SERVICES` | `readarr` | Never started; no app-data folder (also applies to add-ons) |
-| `VPN_TYPE` / `VPN_SERVICE_PROVIDER` / `SERVER_REGIONS` | `openvpn` / `custom` / blank | Gluetun provider names |
+| `VPN_TYPE` / `VPN_SERVICE_PROVIDER` / `SERVER_REGIONS` | `openvpn` / *required* / blank | Gluetun provider name (see [VPN](#vpn-gluetun)) |
+| `VPN_CUSTOM_OVPN_FILE` | blank | `custom` + OpenVPN: your `.ovpn` (path or pasted copy in `/etc/mediastack/vpn/`) |
+| `WIREGUARD_ADDRESSES` / `VPN_ENDPOINT_IP` / `VPN_ENDPOINT_PORT` / `WIREGUARD_PUBLIC_KEY` | blank | WireGuard values, normally imported from a `wg0.conf` |
 | `EMAIL_SERVER_HOST` / `_PORT` / `EMAIL_ADDRESS` / `EMAIL_SENDER` | blank / `587` | Authentik email |
 | `UPSTREAM_REPO` / `UPSTREAM_REF` / `UPSTREAM_VARIANT` | `geekau/mediastack` / pinned SHA / `full-download-vpn` | |
 | `SECRETS_MODE` / `SECRETS_BACKEND` | `vault` / `auto` | See [Secrets](#secrets) |
@@ -239,12 +242,16 @@ The certificate source applies whenever Traefik runs, in either mode:
   - The leaf is renewed automatically 30 days before expiry, or when the domain or IP changes.
   - **Import `ca.crt` once on each device** and every app hostname is trusted.
   - Point `*.<domain>` at the host in your local DNS (for example Pi-hole or your router).
-- **`manual`**: your own full-chain certificate and private key. For each one, the wizard (Settings →
-  Access/certs) asks for a **file path**, or you can type **`paste`** and paste the PEM text.
+- **`manual`**: your own certificate chain (server certificate + intermediates, **in any order**) and private key.
+  For each one, the wizard (Settings → Access/certs) asks for a **file path**, or you can type **`paste`** and paste
+  the PEM text.
+  - The chain is listed as `subject <- issued by`, with a warning when only the server certificate is present.
+  - The leaf is found by its key and installed first, followed by its issuers.
   - **Paths** suit files a renewal job such as acme.sh keeps replacing: every apply re-reads them.
   - **Pasted** PEMs are stored in `/etc/mediastack/tls/manual-cert.pem` (0644) and `manual-key.pem` (0600). The
-    certificate paste ends at a blank line, a line `END`, or Ctrl-D. The key paste is hidden and ends at its
-    `-----END … PRIVATE KEY-----` line. Windows line endings are fine.
+    chain paste reads every certificate, including blank lines between them. It ends 3 seconds after the paste,
+    at a line `END`, or at Ctrl-D. The key paste is hidden and ends at its `-----END … PRIVATE KEY-----` line.
+    Windows line endings are fine.
   - **Encrypted keys** (PKCS#8 `ENCRYPTED PRIVATE KEY`, or traditional `Proc-Type: 4,ENCRYPTED`) are detected and
     the wizard asks for the passphrase. It verifies the passphrase (3 tries) and stores it in the vault as
     `TLS_KEY_PASSPHRASE`. Traefik cannot read an encrypted key, so every apply decrypts it into Traefik's copy
@@ -259,6 +266,36 @@ In `selfsigned` and `manual` modes the installer rewires Traefik's config:
   `/etc/traefik/certs/cert.pem`.
 - It parks `traefik-certs-dumper` automatically. That container only reads Let's Encrypt's `acme.json`, and it shows
   as `auto-off` in the services list.
+
+---
+
+## VPN (Gluetun)
+
+In the Core and Full presets, the download apps run **behind Gluetun**. If Gluetun cannot connect it stays
+unhealthy, and Docker skips every app that waits for it. The installer therefore checks the VPN settings before
+starting anything:
+
+- **Provider:** `VPN_SERVICE_PROVIDER` must be one of Gluetun's names, which the wizard lists (for example
+  `mullvad`, `nordvpn`, `protonvpn`, `private internet access`, `surfshark`). There is no default.
+- **OpenVPN with a listed provider:** set `VPN_USERNAME` and `VPN_PASSWORD`. Most providers issue separate
+  OpenVPN/service credentials (for example NordVPN "service credentials"), not your account login.
+- **OpenVPN with `custom`:** give your `.ovpn` as a path or by pasting it. It is stored in `/etc/mediastack/vpn/`,
+  copied to Gluetun as `/gluetun/custom.ovpn`, and `OPENVPN_CUSTOM_CONFIG` is set for you. Credentials are asked
+  for only if the file uses `auth-user-pass`.
+- **WireGuard:** give your provider's `wg0.conf` as a path or by pasting it.
+  - The private key (and any preshared key) goes into the vault, and `Address` goes into `WIREGUARD_ADDRESSES`.
+  - For `custom`, the server's `Endpoint` (resolved to an IP) and `PublicKey` are also taken.
+- **Host:** `/dev/net/tun` must exist.
+
+If something is missing, Apply stops and says what. Interactively you can choose to start anyway. If containers
+still fail to start, for example because the VPN rejected the login, the installer:
+
+- lists the containers that are not running
+- shows Gluetun's last error lines
+- names the likely cause: wrong credentials, a server filter matching nothing, an unknown provider, a custom config
+  problem, WireGuard settings, a missing TUN device, or an unreachable server
+
+Read the full log with `--logs 200 gluetun`. To run without a VPN, pick the `no-download-vpn` variant.
 
 ---
 
@@ -435,8 +472,9 @@ Secrets live encrypted in `/etc/mediastack/secrets.enc`. They are never logged a
 
 - **Prompted:** VPN credentials, Cloudflare token, Tailscale key, SMTP password, Plex claim, and the WireGuard keys
   when `VPN_TYPE=wireguard`.
-- **Collected from Settings:** SMB username and password for the media share, and the passphrase of an encrypted
-  manual TLS key (`TLS_KEY_PASSPHRASE`).
+- **Collected from Settings:** OpenVPN username/password, WireGuard private/preshared keys (from `wg0.conf`),
+  the SMB username and password for the media share, and the passphrase of an encrypted manual TLS key
+  (`TLS_KEY_PASSPHRASE`).
 - **Generated once and reused:** the PostgreSQL password, Authentik secret key, headplane cookie secret and Homarr's
   `SECRET_ENCRYPTION_KEY`.
 - **Asked for only when used:** for example, the Cloudflare token only when Traefik runs with Let's Encrypt, and
@@ -575,6 +613,7 @@ password**.
 /etc/mediastack/media.smbcred            SMB credentials for mount.cifs (0600, regenerated from vault)
 /etc/mediastack/tls/ca.{crt,key}         local CA for CERT_MODE=selfsigned (import ca.crt on devices)
 /etc/mediastack/tls/manual-{cert,key}.pem  pasted manual certificate / key (key 0600, kept as pasted)
+/etc/mediastack/vpn/custom.ovpn          custom OpenVPN config (0600; copied to <data>/gluetun/custom.ovpn)
 <FOLDER_FOR_DATA>/traefik/certs/         certificate Traefik serves in selfsigned/manual mode
 /var/backups/mediastack/                 backups (BACKUP_DIR)
 /etc/fstab                               '# mediastack-installer:MEDIA|DATA' entries
@@ -590,7 +629,6 @@ password**.
 
 - The installer does **not** run upstream `restart.sh`. That script stops every container on the host and prunes
   all volumes, networks and images. The installer's apply is scoped to the `mediastack` project.
-- `VPN_SERVICE_PROVIDER=custom` also needs `OPENVPN_CUSTOM_CONFIG` in `.env` (see the Gluetun docs).
 - A `PLEX_CLAIM` token expires about 4 minutes after you request it, and Plex only uses it on first start.
 - Upstream's `.env` defines `WEBUI_PORT_HUNTARR`, but upstream has no Huntarr service. It is harmless.
 - Upstream hard-codes the CrowdSec bouncer key (`crowdsecLapiKey`) in `traefik-dynamic.yaml`. If you expose Traefik
@@ -600,7 +638,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 56 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 61 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
@@ -618,6 +656,8 @@ The self-test covers:
 - the local CA and leaf (SANs, chain, renewal triggers) and the manual cert/key match check
 - encrypted keys (PKCS#8 and traditional; with no, a wrong, and the right passphrase) and the paste readers
   (chains, CRLF, the blank line in traditional keys)
+- multi-certificate chains pasted with blank lines and reordered leaf → intermediate → root
+- `wg0.conf` import, VPN settings problems, and Gluetun log diagnosis
 - portable-backup encryption and `--set` validation
 
 Development testing ran these scenarios against the real upstream compose file, validated with `docker compose config`:
