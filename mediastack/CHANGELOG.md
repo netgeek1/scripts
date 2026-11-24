@@ -3,6 +3,19 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.3 — 2026-11-23
+
+### Added
+- **WireGuard handshake probe:** when Gluetun is unhealthy, the diagnosis reads `wg show` inside Gluetun's network
+  namespace (`nsenter`). It reports the interface public key, the peer endpoint, bytes sent/received and the last
+  handshake, then says what that means:
+  - no handshake: compare the public key with a working config's (a wrong stored key, or packets get no answer)
+  - handshake with data: the tunnel works and the problem is DNS or the health check
+  Needs `wireguard-tools` on the host.
+- **VPN check** helper (Post-install helpers → 6, `--helper vpn-check`): settings problems, Gluetun's state, recent
+  errors with hints, and the handshake probe, at any time.
+- Self-test: 75 checks.
+
 ## v2.5.2 — 2026-11-23
 
 ### Fixed
