@@ -298,6 +298,11 @@ still fail to start, for example because the VPN rejected the login, the install
 
 Read the full log with `--logs 200 gluetun`. To run without a VPN, pick the `no-download-vpn` variant.
 
+`SERVER_REGIONS` is optional. Some providers have no regions in Gluetun (ProtonVPN, for example), and any value
+then stops Gluetun with "the region specified is not valid". Leave it blank, or choose a country with
+`SERVER_COUNTRIES` in `.env`. Values that are clearly not region names are rejected, for example a line from a
+pasted `wg0.conf`.
+
 ---
 
 ## Service presets
@@ -620,7 +625,9 @@ password**.
 /etc/fstab                               '# mediastack-installer:MEDIA|DATA' entries
 /etc/systemd/system/docker.service.d/mediastack-mounts.conf
 /var/lib/mediastack-installer/           upstream cache, deployed ref/domain/IP state
-/var/log/mediastack/installer-*.log      run logs (newest 20 kept)
+/var/log/mediastack/installer-*.log      run logs (newest 20 kept). Image pulls and container starts are logged
+                                         line by line, without the per-layer byte counters. The console shows a
+                                         single updating status line instead, plus any errors.
 /usr/local/sbin/mediastack-installer     installed copy
 <FOLDER_FOR_YAML>/                       docker-compose.yaml, docker-compose.override.yaml, .env,
                                          templates, wrappers, *.upstream originals, .backup/
@@ -639,7 +646,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 62 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 65 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
