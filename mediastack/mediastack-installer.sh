@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.1"
+readonly SCRIPT_VERSION="2.5.2"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1077,6 +1077,9 @@ render_env() {
         case "$k" in
             LOCAL_SUBNET)    v=$(eff_local_subnet) ;;
             LOCAL_DOCKER_IP) v=$(eff_local_ip) ;;
+            SERVER_*)        v=${CFG[$k]}
+                             # 'custom' has no server list: any filter makes Gluetun refuse to start
+                             [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]] && v="" ;;
             *)               v=${CFG[$k]} ;;
         esac
         env_set "$envf" "$k" "$v"
@@ -1084,11 +1087,12 @@ render_env() {
     env_set "$envf" PUID "$PUID"
     env_set "$envf" PGID "$PGID"
     vpn_normalize
-    for k in VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY; do
-        # only provider 'custom' takes them; for listed providers they pin a server that is often not in
-        # Gluetun's list ("target IP address not found"), so a stale value is actively blanked
-        env_set "$envf" "$k" "${CFG[$k]:-}"
-    done
+    # Endpoint: only provider 'custom' takes it (for listed providers it pins a server that is often not in
+    # Gluetun's list: "target IP address not found"). Upstream passes the deprecated VPN_ENDPOINT_IP/PORT names,
+    # so they stay blank here and the override sets WIREGUARD_ENDPOINT_IP/PORT instead.
+    env_set "$envf" VPN_ENDPOINT_IP ""
+    env_set "$envf" VPN_ENDPOINT_PORT ""
+    env_set "$envf" WIREGUARD_PUBLIC_KEY "${CFG[WIREGUARD_PUBLIC_KEY]:-}"
     v=$(wg_addresses_usable "${CFG[WIREGUARD_ADDRESSES]:-}")
     [[ -n "$v" ]] && env_set "$envf" WIREGUARD_ADDRESSES "$v"
     if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom && "${CFG[VPN_TYPE]}" == openvpn ]]; then
@@ -1326,8 +1330,11 @@ render_patch() {   # render_patch NAME -> body that changes an upstream service
 EOF
             ;;
         gluetun)
-            printf '    # Gluetun: periodic VPN server-list update (VPN_SERVERS_UPDATE_PERIOD)\n    environment:\n'
-            printf '      - UPDATER_PERIOD=%s\n' "$(vpn_update_period)"
+            printf '    # Gluetun: server-list updates (VPN_SERVERS_UPDATE_PERIOD) / custom WireGuard endpoint\n    environment:\n'
+            [[ -n "$(vpn_update_period)" ]] && printf '      - UPDATER_PERIOD=%s\n' "$(vpn_update_period)"
+            if vpn_custom_wg_endpoint; then
+                printf '      - WIREGUARD_ENDPOINT_IP=%s\n      - WIREGUARD_ENDPOINT_PORT=%s\n' "${CFG[VPN_ENDPOINT_IP]}" "${CFG[VPN_ENDPOINT_PORT]}"
+            fi
             if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -n "${CFG[VPN_UPDATER_PROTON_EMAIL]}" ]]; then
                 printf '      - UPDATER_PROTONVPN_EMAIL=%s\n' "${CFG[VPN_UPDATER_PROTON_EMAIL]}"
                 printf '      - UPDATER_PROTONVPN_PASSWORD=${UPDATER_PROTONVPN_PASSWORD:-}\n'
@@ -1352,7 +1359,8 @@ active_patches() {   # upstream services this installer modifies
     local compose=$1
     [[ -f "$compose" ]] || return 0
     if grep -qE '^  homarr:[[:space:]]*$' "$compose" && ! is_removed homarr; then echo homarr; fi
-    if grep -qE '^  gluetun:[[:space:]]*$' "$compose" && ! is_removed gluetun && [[ -n "$(vpn_update_period)" ]]; then echo gluetun; fi
+    if grep -qE '^  gluetun:[[:space:]]*$' "$compose" && ! is_removed gluetun \
+        && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint; }; then echo gluetun; fi
     if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale \
         && [[ "${CFG[TAILSCALE_CONTROL]}" == tailscale ]]; then echo tailscale; fi
     return 0
@@ -1993,6 +2001,8 @@ vpn_line_hints() {
         echo "The VPN rejected the username/password. Many providers use separate OpenVPN/service credentials (e.g. NordVPN 'service credentials', Surfshark 'manual setup'); set them in the Secrets menu."
     if [[ "$l" =~ target\ ip\ address\ not\ found|endpoint\ ip\ is\ not\ set ]]; then
         echo "A fixed server endpoint (VPN_ENDPOINT_IP/PORT) only works with provider 'custom'. For a listed provider it must be blank (Apply blanks it now); choose servers with SERVER_COUNTRIES/CITIES/HOSTNAMES."
+    elif [[ "$l" =~ provider\ custom.*(country|region|city|hostname).*not\ valid ]]; then
+        echo "Provider 'custom' has no server list, so server filters (countries/cities/hostnames/regions) must be blank. Apply now leaves them out for 'custom'."
     elif [[ "$l" =~ server\ selection|no\ server|server.*not\ found|no\ .*server.*match|(region|country|city|hostname).*not\ valid ]]; then
         echo "No server matches the server filter. Clear or correct the filters (Settings -> VPN), or update Gluetun's server list (Post-install helpers -> 5)."
         [[ "$l" =~ region.*no\ possible\ value ]] && echo "This provider has no regions in Gluetun: leave SERVER_REGIONS blank and use SERVER_COUNTRIES."
@@ -2024,6 +2034,9 @@ wg_addresses_usable() {
     for x in ${1//,/ }; do [[ "$x" == *:* ]] || out+="${out:+,}$x"; done
     [[ -n "$out" ]] && a=$out || a=$1
     printf '%s' "$a"
+}
+vpn_custom_wg_endpoint() {
+    [[ "${CFG[VPN_SERVICE_PROVIDER]:-}" == custom && "${CFG[VPN_TYPE]:-}" == wireguard && -n "${CFG[VPN_ENDPOINT_IP]:-}" ]]
 }
 # vpn_update_period -> UPDATER_PERIOD value, blank when periodic updates are off/impossible
 vpn_update_period() {
@@ -2206,8 +2219,10 @@ cfg_vpn() {
     fi
     vpn_normalize
     local k lbl
-    log_info "Server filters (all optional, comma-separated; blank = any server of the provider):"
+    [[ "$v" == custom ]] && log_info "Provider 'custom' connects to the server in your config, so server filters are not used."
+    [[ "$v" == custom ]] || log_info "Server filters (all optional, comma-separated; blank = any server of the provider):"
     for k in SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES SERVER_REGIONS; do
+        [[ "$v" == custom ]] && break
         case "$k" in
             SERVER_COUNTRIES) lbl="Countries (e.g. Switzerland,Netherlands)" ;;
             SERVER_CITIES)    lbl="Cities (e.g. Zurich)" ;;
@@ -4635,6 +4650,7 @@ FIX
     |   └── Authentication file path: /gluetun/auth/config.toml
 2026-11-24T03:45:25Z WARN [dns] downloading block lists failed, skipping: lookup raw.githubusercontent.com on 127.0.0.1:53: i/o timeout
 2026-11-24T03:48:54Z WARN [vpn] restarting VPN because it failed to pass the healthcheck: startup check: all check tries failed: dialing: dial tcp4: lookup github.com: i/o timeout"; ex=$(grep -E "(^|[[:space:]])(ERROR|WARN|FATAL)[[:space:]]" <<<"$lg"); [[ "$ex" != *Authentication* ]] && h=$(vpn_log_hints "$lg") && [[ "$h" != *username/password* && "$h" == *"passes no traffic"* && "$h" == *FREE_ONLY* && $(grep -c . <<<"$h") == 1 ]] )'
+    st "custom WireGuard: new names, no filters" '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[VPN_TYPE]=wireguard; CFG[VPN_ENDPOINT_IP]=37.120.137.194; CFG[VPN_ENDPOINT_PORT]=51820; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"WIREGUARD_ENDPOINT_IP=37.120.137.194"* && "$o" == *"WIREGUARD_ENDPOINT_PORT=51820"* && "$o" != *UPDATER_PERIOD* ]] && h=$(vpn_log_hints "ERROR VPN settings: provider settings: server selection: for VPN service provider custom: the country specified is not valid: one or more values is set but there is no possible value available") && [[ "$h" == *"must be blank"* && $(grep -c . <<<"$h") == 1 ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && vpn_normalize && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *WIREGUARD_ENDPOINT* && "$o" == *UPDATER_PERIOD=480h* ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
