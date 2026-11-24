@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.8"
+readonly SCRIPT_VERSION="2.5.9"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2591,6 +2591,7 @@ tls_ensure_live() {
     want=$(tls_fp "$(traefik_cert_dir)/cert.pem")
     [[ -n "$want" ]] || { echo no; return 0; }
     [[ "$(tls_live_fp)" == "$want" ]] && { echo yes; return 0; }
+    log_info "Checking that Traefik serves the current certificate (up to ~45 s)..." >&2
     touch "$FOLDER_FOR_DATA/traefik/dynamic.yaml" 2>/dev/null || true     # file provider watch -> reload
     for (( i = 0; i < 10; i++ )); do sleep 1; [[ "$(tls_live_fp)" == "$want" ]] && { echo yes; return 0; }; done
     log_info "Traefik did not pick up the new certificate on its own; restarting it" >&2
@@ -3057,24 +3058,35 @@ stop_excluded_containers() {
     done < <(excluded_services)
 }
 
-verify_services() {   # verify_services TIMEOUT_SECONDS
-    local timeout=${1:-180} waited=0 s st
+verify_services() {   # verify_services TIMEOUT_SECONDS -- wait (visibly) until every enabled service runs
+    local timeout=${1:-180} waited=0 s st msg tty=0 settled
     local -a svcs bad
     local -A state
+    [[ -t 1 ]] && tty=1
     mapfile -t svcs < <(compose_run config --services 2>/dev/null)
+    log_info "Waiting up to ${timeout}s for ${#svcs[@]} services to be running..."
     while :; do
-        bad=(); state=()
+        bad=(); state=(); settled=1
         while IFS=$'\t' read -r s st; do [[ -n "$s" ]] && state[$s]=$st; done \
             < <(compose_run ps -a --format '{{.Service}}\t{{.State}}' 2>/dev/null)
         for s in "${svcs[@]}"; do
-            [[ "${state[$s]:-missing}" == running ]] || bad+=("$s:${state[$s]:-missing}")
+            st=${state[$s]:-missing}
+            [[ "$st" == running ]] && continue
+            bad+=("$s:$st")
+            [[ "$st" =~ ^(exited|dead|created)$ ]] || settled=0   # restarting/starting may still come up
         done
+        (( tty )) && printf '\r\033[K'
         (( ${#bad[@]} == 0 )) && { log_ok "All ${#svcs[@]} services running"; return 0; }
+        # containers that exited or were never started will not change by waiting
+        (( settled && waited >= 30 )) && break
         (( waited >= timeout )) && break
+        msg="$(( ${#svcs[@]} - ${#bad[@]} ))/${#svcs[@]} running after ${waited}s; waiting for: ${bad[*]}"
+        if (( tty )); then printf '  %s' "${msg:0:$(( ${COLUMNS:-120} - 4 ))}"
+        elif (( waited % 30 == 0 )); then log_info "$msg"; fi
         sleep 5; waited=$((waited + 5))
     done
-    log_warn "${#bad[@]} of ${#svcs[@]} services not running after ${timeout}s: ${bad[*]}"
-    log_warn "Check: sudo $MS_INSTALL_BIN --compose logs --tail 100 <service>"
+    log_warn "${#bad[@]} of ${#svcs[@]} services not running after ${waited}s: ${bad[*]}"
+    log_warn "Check: sudo $MS_INSTALL_BIN --logs 100 <service>"
     return 1
 }
 
