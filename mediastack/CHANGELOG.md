@@ -3,6 +3,38 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.0 — 2026-11-23 — Gluetun WireGuard fixes and server-list updates
+
+### Fixed
+- **Misleading "WireGuard settings problem: re-import the provider's wg0.conf".** The start-failure diagnosis
+  matched hints against Gluetun's **whole** log, so every normal `[wireguard]` line produced that hint, whatever the
+  real cause was. Hints now come only from Gluetun's error/warning lines, and the WireGuard hint needs an actual
+  key/address error.
+- **Stale fixed endpoint for listed providers.** `VPN_ENDPOINT_IP` / `_PORT` / `WIREGUARD_PUBLIC_KEY` were written to
+  `.env` only when set and never blanked. A value left from an earlier `custom` setup (the old default) or from an
+  existing `.env` stayed, and Gluetun then looks for exactly that server in its list ("target IP address not
+  found"). For every provider except `custom` they are now blanked on each apply. `OPENVPN_CUSTOM_CONFIG` is also
+  blanked when not using custom OpenVPN.
+- **IPv6 in `Address`** (newer ProtonVPN configs): Docker gives Gluetun no IPv6 by default, so only the IPv4
+  address(es) go to `WIREGUARD_ADDRESSES`.
+- Importing a `wg0.conf` for a listed provider says that its `Endpoint` is not used (Gluetun picks a server).
+
+### Added
+- **Automatic server-list updates:** `VPN_SERVERS_UPDATE_PERIOD` (default `480h`; `off` to disable) sets Gluetun's
+  `UPDATER_PERIOD` in the managed override.
+  - ProtonVPN needs an account to download its list. `VPN_UPDATER_PROTON_EMAIL` and the vault secret
+    `UPDATER_PROTONVPN_PASSWORD` become `UPDATER_PROTONVPN_EMAIL` / `_PASSWORD`. Without them, automatic updates
+    stay off for ProtonVPN.
+- **Update the server list now:** Post-install helpers → 5 / `--helper vpn-servers` runs Gluetun's CLI updater
+  (outside the tunnel) and restarts Gluetun. Credentials are passed as environment variables, not on the host's
+  command line.
+- **Server filters in the wizard:** `SERVER_COUNTRIES`, `SERVER_CITIES` and `SERVER_HOSTNAMES` (plus
+  `SERVER_REGIONS`) are config settings, validated and written to `.env`. Values hand-edited into `.env` before are
+  taken over.
+- New hints: fixed endpoint ("target IP address not found" / "endpoint IP is not set"), and a tunnel that is up but
+  unhealthy (key not accepted or an outdated server list → update the list).
+- Self-test: 72 checks.
+
 ## v2.4.0 — 2026-11-23 — Certificate pull and push
 
 ### Added
