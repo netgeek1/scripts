@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.3"
+readonly SCRIPT_VERSION="2.5.4"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2018,7 +2018,11 @@ vpn_line_hints() {
     [[ "$l" =~ tls\ key\ negotiation|tls\ handshake|connection\ timed\ out|no\ route\ to\ host|network\ is\ unreachable ]] && \
         echo "The VPN server could not be reached: the firewall may block outbound UDP/TCP to it; try another server/protocol."
     if [[ "$l" =~ healthcheck|unhealthy|handshake ]] && [[ ! "$l" =~ auth_failed|server\ selection|not\ valid|invalid ]]; then
-        echo "The tunnel is set up but passes no traffic (with WireGuard: the handshake never completes). Usual causes: the servers Gluetun picks do not accept the key (ProtonVPN free plan: only free servers do, so set FREE_ONLY=on in .env), a firewall blocking outbound UDP to port 51820, a revoked key, or an outdated server list (Post-install helpers -> 5)."
+        if [[ "${CFG[VPN_SERVICE_PROVIDER]:-}" == custom ]]; then
+            echo "The tunnel is set up but passes no traffic (with WireGuard: the handshake never completes). Usual causes: a firewall or Docker NAT problem for UDP from containers, a wrong server key/endpoint, or a revoked key."
+        else
+            echo "The tunnel is set up but passes no traffic (with WireGuard: the handshake never completes). Usual causes: the servers Gluetun picks do not accept the key (ProtonVPN free plan: only free servers do, so set FREE_ONLY=on in .env), a firewall blocking outbound UDP to port 51820, a revoked key, or an outdated server list (Post-install helpers -> 5)."
+        fi
     fi
     return 0
 }
@@ -2105,16 +2109,24 @@ vpn_update_servers() {
     fi
 }
 
-# wg_dump_eval DUMP -> "PUBKEY ENDPOINT HANDSHAKE RX TX" from 'wg show all dump' (first interface + its first peer)
+# wg_dump_eval DUMP -> "PUBKEY ENDPOINT HANDSHAKE RX TX PEERKEY" from 'wg show all dump' (first interface + first peer)
 wg_dump_eval() {
     awk -F'\t' 'NF == 5 && !ifc {ifc = $1; pub = $3; next}
-                 NF >= 9 && $1 == ifc && !done {print pub, $4, $6, $7, $8; done = 1}' <<<"$1"
+                 NF >= 9 && $1 == ifc && !done {print pub, $4, $6, $7, $8, $2; done = 1}' <<<"$1"
+}
+
+# docker_egress_test -> ok | fail | unknown : can a plain container on Docker's default bridge reach the internet?
+docker_egress_test() {
+    local out
+    out=$(timeout 30 docker run --rm --network bridge --entrypoint /bin/sh "$(gluetun_image)" -c \
+          'command -v nslookup >/dev/null || { echo unknown; exit 0; }; nslookup github.com 1.1.1.1 >/dev/null 2>&1 && echo ok || echo fail' 2>/dev/null | tail -n1)
+    printf '%s' "${out:-unknown}"
 }
 
 # vpn_wg_probe -- read WireGuard's own state inside Gluetun's network namespace (handshake, bytes)
 vpn_wg_probe() {
     [[ "${CFG[VPN_TYPE]}" == wireguard ]] || return 0
-    local pid dump r pub ep hs rx tx i
+    local pid dump r pub ep hs rx tx peer i eg
     if ! command -v wg >/dev/null 2>&1; then
         log_info "Install wireguard-tools on the host (apt-get install wireguard-tools) to see Gluetun's WireGuard handshake state here."
         return 0
@@ -2125,17 +2137,29 @@ vpn_wg_probe() {
     for (( i = 0; i < 8; i++ )); do
         dump=$(nsenter -t "$pid" -n wg show all dump 2>/dev/null || true)
         r=$(wg_dump_eval "$dump")
-        read -r pub ep hs rx tx <<<"$r"
+        read -r pub ep hs rx tx peer <<<"$r"
         [[ -n "$hs" && "$hs" != 0 ]] && break
         sleep 2
     done
     if [[ -z "$r" ]]; then log_info "No WireGuard interface found in Gluetun (it may be between restarts)."; return 0; fi
-    log_info "Gluetun WireGuard: interface public key $pub, peer $ep, sent ${tx:-0} B, received ${rx:-0} B, handshake $([[ "$hs" != 0 ]] && date -d "@$hs" '+%T' || echo never)"
+    log_info "Gluetun WireGuard: interface public key $pub, server $ep (server key $peer), sent ${tx:-0} B, received ${rx:-0} B, handshake $([[ "$hs" != 0 ]] && date -d "@$hs" '+%T' || echo never)"
     if [[ "$hs" == 0 ]]; then
-        log_warn "No WireGuard handshake from inside Gluetun. Compare the public key above with the 'public key' that 'wg show' printed for a working config:"
-        log_warn "  different -> the stored private key is not the one in your working wg0.conf: re-import it (Settings -> VPN, answer y to replace)."
-        log_warn "  same      -> packets from the container get no answer: check the endpoint/server public key, then the host's Docker forwarding/NAT"
-        log_warn "              (sysctl net.ipv4.ip_forward must be 1; watch with: sudo tcpdump -ni any udp port ${ep##*:})."
+        log_warn "No WireGuard handshake from inside Gluetun (sent handshake requests, no answer)."
+        log_warn "  1) Interface public key: compare with the 'public key' 'wg show' printed for a working config;"
+        log_warn "     different -> re-import the working wg0.conf (Settings -> VPN, answer y to replace)."
+        log_warn "  2) Server key: must equal [Peer] PublicKey in that wg0.conf."
+        log_info "Testing whether containers can reach the internet at all (DNS to 1.1.1.1 from a throwaway container)..."
+        eg=$(docker_egress_test)
+        case "$eg" in
+            fail) log_warn "  3) Containers on Docker's bridge cannot reach the internet: Docker forwarding/NAT on this host is broken, not the VPN."
+                  log_warn "     Check: sysctl net.ipv4.ip_forward (must be 1); sudo iptables -t nat -S | grep MASQUERADE (Docker's NAT rule);"
+                  log_warn "     a host nftables/firewall forward chain dropping docker0 traffic; then: sudo systemctl restart docker" ;;
+            ok)   log_warn "  3) Other containers reach the internet, so Docker NAT works. Watch where the handshake goes:"
+                  log_warn "     sudo tcpdump -ni any udp port ${ep##*:}   (requests should leave on docker0/veth AND your LAN interface, and answers come back)"
+                  log_warn "     Leaves the LAN interface without answers -> a firewall between this host and the internet treats NATed container"
+                  log_warn "     UDP differently from the host's own (e.g. per-port rules, or a policy only allowing the host's WireGuard port)." ;;
+            *)    log_info "  3) Could not test container egress here; run: docker run --rm alpine nslookup github.com 1.1.1.1" ;;
+        esac
     elif [[ "${rx:-0}" -gt 0 ]]; then
         log_warn "WireGuard is connected (handshake and data), so the failure is above it: Gluetun's DNS (DNS over TLS, port 853) or its health-check targets. Read: sudo $MS_INSTALL_BIN --logs 200 gluetun"
     fi
@@ -4707,7 +4731,7 @@ FIX
 2026-11-24T03:45:25Z WARN [dns] downloading block lists failed, skipping: lookup raw.githubusercontent.com on 127.0.0.1:53: i/o timeout
 2026-11-24T03:48:54Z WARN [vpn] restarting VPN because it failed to pass the healthcheck: startup check: all check tries failed: dialing: dial tcp4: lookup github.com: i/o timeout"; ex=$(grep -E "(^|[[:space:]])(ERROR|WARN|FATAL)[[:space:]]" <<<"$lg"); [[ "$ex" != *Authentication* ]] && h=$(vpn_log_hints "$lg") && [[ "$h" != *username/password* && "$h" == *"passes no traffic"* && "$h" == *FREE_ONLY* && $(grep -c . <<<"$h") == 1 ]] )'
     st "custom WireGuard: new names, no filters" '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[VPN_TYPE]=wireguard; CFG[VPN_ENDPOINT_IP]=37.120.137.194; CFG[VPN_ENDPOINT_PORT]=51820; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"WIREGUARD_ENDPOINT_IP=37.120.137.194"* && "$o" == *"WIREGUARD_ENDPOINT_PORT=51820"* && "$o" != *UPDATER_PERIOD* ]] && h=$(vpn_log_hints "ERROR VPN settings: provider settings: server selection: for VPN service provider custom: the country specified is not valid: one or more values is set but there is no possible value available") && [[ "$h" == *"must be blank"* && $(grep -c . <<<"$h") == 1 ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && vpn_normalize && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *WIREGUARD_ENDPOINT* && "$o" == *UPDATER_PERIOD=480h* ]] )'
-    st "WireGuard dump parsing"           '( d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t37.120.137.194:51820\t0.0.0.0/0\t0\t0\t1480\toff\n"); [[ "$(wg_dump_eval "$d")" == "PUBX= 37.120.137.194:51820 0 0 1480" ]] && d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t1.2.3.4:51820\t0.0.0.0/0\t1764000000\t9000\t3000\toff\n") && [[ "$(wg_dump_eval "$d")" == "PUBX= 1.2.3.4:51820 1764000000 9000 3000" ]] )'
+    st "WireGuard dump parsing"           '( d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t37.120.137.194:51820\t0.0.0.0/0\t0\t0\t1480\toff\n"); [[ "$(wg_dump_eval "$d")" == "PUBX= 37.120.137.194:51820 0 0 1480 PEERPUB=" ]] && d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t1.2.3.4:51820\t0.0.0.0/0\t1764000000\t9000\t3000\toff\n") && [[ "$(wg_dump_eval "$d")" == "PUBX= 1.2.3.4:51820 1764000000 9000 3000 PEERPUB=" ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
