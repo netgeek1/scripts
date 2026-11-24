@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.9"
+readonly SCRIPT_VERSION="2.5.10"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2576,8 +2576,11 @@ tls_https_port() {
     [[ "$p" =~ ^[0-9]+$ ]] || p=443
     printf '%s' "$p"
 }
-tls_live_fp() {   # what Traefik serves right now (SNI = the zone: Traefik uses strict SNI)
-    echo | timeout 5 openssl s_client -connect "127.0.0.1:$(tls_https_port)" -servername "$(tls_zone)" 2>/dev/null \
+# tls_probe_name -> SNI for local checks. Traefik uses strict SNI, so the name must be covered by the certificate:
+# a host under the zone matches a wildcard (*.zone); the bare zone is often NOT in a wildcard certificate.
+tls_probe_name() { printf 'mediastack-probe.%s' "$(tls_zone)"; }
+tls_live_fp() {   # what Traefik serves right now
+    echo | timeout 5 openssl s_client -connect "127.0.0.1:$(tls_https_port)" -servername "$(tls_probe_name)" 2>/dev/null \
         | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//'
 }
 traefik_running() { have_docker && docker ps -q --filter 'name=^traefik$' 2>/dev/null | grep -q .; }
@@ -2588,13 +2591,23 @@ tls_ensure_live() {
     local want i
     { [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && traefik_running; } || { echo n/a; return 0; }
     (( DRY_RUN )) && { echo n/a; return 0; }
+    local live
     want=$(tls_fp "$(traefik_cert_dir)/cert.pem")
     [[ -n "$want" ]] || { echo no; return 0; }
-    [[ "$(tls_live_fp)" == "$want" ]] && { echo yes; return 0; }
+    live=$(tls_live_fp)
+    [[ "$live" == "$want" ]] && { echo yes; return 0; }
     log_info "Checking that Traefik serves the current certificate (up to ~45 s)..." >&2
     touch "$FOLDER_FOR_DATA/traefik/dynamic.yaml" 2>/dev/null || true     # file provider watch -> reload
-    for (( i = 0; i < 10; i++ )); do sleep 1; [[ "$(tls_live_fp)" == "$want" ]] && { echo yes; return 0; }; done
-    log_info "Traefik did not pick up the new certificate on its own; restarting it" >&2
+    for (( i = 0; i < 10; i++ )); do
+        sleep 1; live=$(tls_live_fp); [[ "$live" == "$want" ]] && { echo yes; return 0; }
+    done
+    if [[ -z "$live" ]]; then
+        # no TLS answer at all: restarting would not help and only interrupts the apps
+        log_warn "No TLS answer from Traefik on 127.0.0.1:$(tls_https_port) for $(tls_probe_name); not restarting it." >&2
+        log_warn "Check: sudo $MS_INSTALL_BIN --logs 50 traefik" >&2
+        echo unknown; return 0
+    fi
+    log_info "Traefik still serves another certificate; restarting it" >&2
     docker restart traefik </dev/null >/dev/null 2>&1 3>&- 9>&- || true   # no inherited fds (ssh channel, lock)
     for (( i = 0; i < 30; i++ )); do sleep 1; [[ "$(tls_live_fp)" == "$want" ]] && { echo yes; return 0; }; done
     echo no
@@ -2636,7 +2649,7 @@ cert_receive() {
     after=$(tls_fp "$(traefik_cert_dir)/cert.pem")
     [[ "$before" != "$after" ]] && state=changed
     live=$(tls_ensure_live)
-    [[ "$live" != no ]] || log_warn "Traefik is not serving the new certificate yet (is the traefik container running?)"
+    [[ "$live" =~ ^(yes|n/a)$ ]] || log_warn "Could not confirm that Traefik serves the new certificate (live: $live)"
     notafter=$(openssl x509 -in "$(traefik_cert_dir)/cert.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//; s/ /_/g')
     printf '%s OK %s sha256=%s notafter=%s live=%s\n' "$CERT_RECEIVE_TAG" "$state" "$after" "$notafter" "$live" >&3
     _log_file INFO "cert-receive: $state $after live=$live"
@@ -2719,7 +2732,7 @@ cert_refresh() {
     live=$(tls_ensure_live)
     if [[ "$before" != "$after" ]]; then log_ok "New certificate installed (live: $live)"
     else log_info "Certificate unchanged (live: $live)"; fi
-    [[ "$live" != no ]] || log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem"
+    [[ "$live" =~ ^(yes|n/a)$ ]] || log_warn "Could not confirm that Traefik serves $(traefik_cert_dir)/cert.pem (live: $live)"
     if (( CERT_FETCH_FAILED )); then   # non-zero for the timer's journal when the fetch itself failed
         log_error "The fetch failed; Traefik keeps serving the previous certificate."
         return 1
@@ -2739,7 +2752,7 @@ cert_show() {
     esac
     if [[ -f "$f" ]]; then
         openssl x509 -in "$f" -noout -subject -issuer -enddate -ext subjectAltName 2>&1 | sed 's/^/  /'
-        printf '  sha256 %s\n  Served now: %s\n' "$(tls_fp "$f")" "$(tls_live_fp || true)"
+        printf '  sha256 %s\n  Served now: %s  (127.0.0.1:%s, SNI %s)\n' "$(tls_fp "$f")" "$(tls_live_fp || true)" "$(tls_https_port)" "$(tls_probe_name)"
     else
         log_info "No file-based certificate deployed (${CFG[CERT_MODE]})."
     fi
@@ -3126,7 +3139,7 @@ stack_apply() {
         die "Some containers could not start (causes above). Fix them, then run Apply again."
     fi
     verify_services 180 || true
-    if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ "$(tls_ensure_live)" == no ]]; then
+    if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ ! "$(tls_ensure_live)" =~ ^(yes|n/a)$ ]]; then
         log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem yet; check: sudo $MS_INSTALL_BIN --cert-show"
     fi
 }
@@ -4895,6 +4908,7 @@ FIX
     st "installed copy updated only upward" '( MS_INSTALL_BIN="$t/inst"; printf "readonly SCRIPT_VERSION=\"2.5.2\"\n" >"$t/inst"; [[ "$(installed_version)" == 2.5.2 ]] && [[ "$(printf "%s\n%s\n" 2.5.2 2.5.10 | sort -V | tail -n1)" == 2.5.10 ]] && printf "readonly SCRIPT_VERSION=\"9.0.0\"\n" >"$t/inst" && [[ "$(installed_version)" == 9.0.0 ]] )'
     st "subnet overlap check"             '( cidr_overlap 172.28.10.0/24 172.28.10.0/24 && cidr_overlap 172.28.0.0/16 172.28.10.0/24 && ! cidr_overlap 172.28.11.0/24 172.28.10.0/24 && ! cidr_overlap 172.17.0.0/16 172.28.10.0/24 && cidr_overlap 0.0.0.0/0 10.1.2.0/24 && ! cidr_overlap fd00::/64 172.28.10.0/24 )'
     st "orphaned bridge on stack subnet"  '( FOLDER_FOR_YAML="$t/fy"; mkdir -p "$t/fy"; echo DOCKER_SUBNET=172.28.10.0/24 >"$t/fy/.env"; docker() { case "$1 $2" in "network ls") echo 91b65f27405bfffffff;; "network inspect") echo "";; esac; }; ip() { echo "1: lo    inet 127.0.0.1/8 scope host lo"; echo "5: br-cef1f9fa439b    inet 172.28.10.1/24 brd 172.28.10.255 scope global br-cef1f9fa439b"; echo "6: br-91b65f27405b    inet 172.28.10.1/24 scope global br-91b65f27405b"; echo "2: eno1    inet 192.168.11.75/24 scope global eno1"; }; [[ "$(subnet_foreign_ifaces)" == "br-cef1f9fa439b 172.28.10.1/24" ]] )'
+    st "TLS probe name is under the zone"  '( CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; [[ "$(tls_probe_name)" == mediastack-probe.certifiedgeeks.net ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
