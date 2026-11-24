@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.0"
+readonly SCRIPT_VERSION="2.5.1"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1982,7 +1982,12 @@ vpn_preflight() {
 }
 
 # vpn_log_hints TEXT -> likely causes for a Gluetun log excerpt
-vpn_log_hints() {   # vpn_log_hints "ERROR/WARN LINES" -> one hint per recognised cause
+vpn_log_hints() {   # vpn_log_hints "LOG LINES" -> one hint per recognised cause (each line judged on its own)
+    local line
+    while IFS= read -r line; do [[ -n "$line" ]] && vpn_line_hints "$line"; done <<<"$1" | awk '!seen[$0]++'
+    return 0
+}
+vpn_line_hints() {
     local l=${1,,}
     [[ "$l" =~ auth_failed|auth.*fail|authentication\ fail|wrong\ (username|password) ]] && \
         echo "The VPN rejected the username/password. Many providers use separate OpenVPN/service credentials (e.g. NordVPN 'service credentials', Surfshark 'manual setup'); set them in the Secrets menu."
@@ -2003,7 +2008,7 @@ vpn_log_hints() {   # vpn_log_hints "ERROR/WARN LINES" -> one hint per recognise
     [[ "$l" =~ tls\ key\ negotiation|tls\ handshake|connection\ timed\ out|no\ route\ to\ host|network\ is\ unreachable ]] && \
         echo "The VPN server could not be reached: the firewall may block outbound UDP/TCP to it; try another server/protocol."
     if [[ "$l" =~ healthcheck|unhealthy|handshake ]] && [[ ! "$l" =~ auth_failed|server\ selection|not\ valid|invalid ]]; then
-        echo "The tunnel came up but passes no traffic. With WireGuard this usually means the key is not accepted by that server (revoked or for another account) or Gluetun's server list is out of date: update it (Post-install helpers -> 5), or re-download the provider's config."
+        echo "The tunnel is set up but passes no traffic (with WireGuard: the handshake never completes). Usual causes: the servers Gluetun picks do not accept the key (ProtonVPN free plan: only free servers do, so set FREE_ONLY=on in .env), a firewall blocking outbound UDP to port 51820, a revoked key, or an outdated server list (Post-install helpers -> 5)."
     fi
     return 0
 }
@@ -2077,7 +2082,8 @@ diagnose_start_failure() {
     if [[ -n "$(docker ps -aq --filter name='^gluetun$' 2>/dev/null)" ]] && \
        [[ "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' gluetun 2>/dev/null)" != healthy ]]; then
         lg=$(docker logs --tail 200 gluetun 2>&1 || true)
-        ex=$(grep -iE 'error|fatal|fail|warn|auth' <<<"$lg" | tail -n 12 || true)
+        # Gluetun's own level field only: words like "failure"/"Authentication" also occur in its settings dump
+        ex=$(grep -E '(^|[[:space:]])(ERROR|WARN|FATAL)[[:space:]]' <<<"$lg" | tail -n 12 || true)
         if [[ -n "$ex" ]]; then
             log_info "Gluetun log (last errors/warnings):"
             printf '%s\n' "$ex" | sed 's/^/    /'
@@ -4625,6 +4631,10 @@ FIX
         CFG[VPN_SERVICE_PROVIDER]="" && p=$(vpn_problems) && [[ "$p" == *"VPN_SERVICE_PROVIDER is not set"* ]] )'
     st "Gluetun log hints"                 '( h=$(vpn_log_hints "2026 ERROR [openvpn] AUTH: Received control message: AUTH_FAILED"); [[ "$h" == *username/password* ]] && h=$(vpn_log_hints "ERROR no server found: for VPN openvpn; protocol udp; region Narnia"); [[ "$h" == *"server filter"* ]] && [[ -z "$(vpn_log_hints "INFO all good")" ]] )'
     st "Gluetun hints: WireGuard + endpoint" '( [[ -z "$(vpn_log_hints "2026-11-24T03:01:02Z INFO [wireguard] Using available kernelspace implementation")" ]] && h=$(vpn_log_hints "ERROR [vpn] finding a VPN server: target IP address not found") && [[ "$h" == *"only works with provider '"'"'custom'"'"'"* && "$h" != *"server filter"* ]] && h=$(vpn_log_hints "INFO [healthcheck] program has been unhealthy for 21s: restarting VPN") && [[ "$h" == *"passes no traffic"* ]] && h=$(vpn_log_hints "ERROR VPN settings: wireguard settings: private key is not valid") && [[ "$h" == *"re-import"* ]] )'
+    st "Gluetun hints: settings dump is not an error" '( lg="    |   └── Restart VPN on healthcheck failure: yes
+    |   └── Authentication file path: /gluetun/auth/config.toml
+2026-11-24T03:45:25Z WARN [dns] downloading block lists failed, skipping: lookup raw.githubusercontent.com on 127.0.0.1:53: i/o timeout
+2026-11-24T03:48:54Z WARN [vpn] restarting VPN because it failed to pass the healthcheck: startup check: all check tries failed: dialing: dial tcp4: lookup github.com: i/o timeout"; ex=$(grep -E "(^|[[:space:]])(ERROR|WARN|FATAL)[[:space:]]" <<<"$lg"); [[ "$ex" != *Authentication* ]] && h=$(vpn_log_hints "$lg") && [[ "$h" != *username/password* && "$h" == *"passes no traffic"* && "$h" == *FREE_ONLY* && $(grep -c . <<<"$h") == 1 ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
