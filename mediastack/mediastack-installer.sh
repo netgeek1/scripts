@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.4"
+readonly SCRIPT_VERSION="2.5.5"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1044,8 +1044,27 @@ EOF
 
 install_self() {
     [[ "$SCRIPT_PATH" == "$MS_INSTALL_BIN" ]] && return 0
+    [[ -f "$MS_INSTALL_BIN" ]] && cmp -s "$SCRIPT_PATH" "$MS_INSTALL_BIN" && return 0
     run install -D -m 750 -o root -g root "$SCRIPT_PATH" "$MS_INSTALL_BIN"
     log_ok "Installer copied to $MS_INSTALL_BIN"
+}
+
+# installed_version -> SCRIPT_VERSION of the installed copy (blank when none)
+installed_version() { sed -n 's/^readonly SCRIPT_VERSION="\([0-9.]*\)".*/\1/p' "$MS_INSTALL_BIN" 2>/dev/null | head -n1; }
+
+# self_update_installed -- running a newer copy from elsewhere: refresh the installed one, so
+# 'sudo mediastack-installer', the certificate timer/watcher and the push receiver use the same version
+self_update_installed() {
+    local iv
+    [[ "$SCRIPT_PATH" == "$MS_INSTALL_BIN" || ! -f "$MS_INSTALL_BIN" ]] && return 0
+    iv=$(installed_version)
+    [[ -n "$iv" && "$iv" != "$SCRIPT_VERSION" ]] || return 0
+    if [[ "$(printf '%s\n%s\n' "$iv" "$SCRIPT_VERSION" | sort -V | tail -n1)" == "$SCRIPT_VERSION" ]]; then
+        run install -m 750 -o root -g root "$SCRIPT_PATH" "$MS_INSTALL_BIN"
+        log_ok "Updated $MS_INSTALL_BIN: v$iv -> v$SCRIPT_VERSION"
+    else
+        log_warn "$MS_INSTALL_BIN is newer (v$iv) than this copy (v$SCRIPT_VERSION); left alone."
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -2109,10 +2128,10 @@ vpn_update_servers() {
     fi
 }
 
-# wg_dump_eval DUMP -> "PUBKEY ENDPOINT HANDSHAKE RX TX PEERKEY" from 'wg show all dump' (first interface + first peer)
+# wg_dump_eval DUMP -> "PUBKEY ENDPOINT HANDSHAKE RX TX PEERKEY LISTENPORT" from 'wg show all dump' (first interface + first peer)
 wg_dump_eval() {
-    awk -F'\t' 'NF == 5 && !ifc {ifc = $1; pub = $3; next}
-                 NF >= 9 && $1 == ifc && !done {print pub, $4, $6, $7, $8, $2; done = 1}' <<<"$1"
+    awk -F'\t' 'NF == 5 && !ifc {ifc = $1; pub = $3; lp = $4; next}
+                 NF >= 9 && $1 == ifc && !done {print pub, $4, $6, $7, $8, $2, lp; done = 1}' <<<"$1"
 }
 
 # docker_egress_test -> ok | fail | unknown : can a plain container on Docker's default bridge reach the internet?
@@ -2126,7 +2145,7 @@ docker_egress_test() {
 # vpn_wg_probe -- read WireGuard's own state inside Gluetun's network namespace (handshake, bytes)
 vpn_wg_probe() {
     [[ "${CFG[VPN_TYPE]}" == wireguard ]] || return 0
-    local pid dump r pub ep hs rx tx peer i eg
+    local pid dump r pub ep hs rx tx peer lport i eg
     if ! command -v wg >/dev/null 2>&1; then
         log_info "Install wireguard-tools on the host (apt-get install wireguard-tools) to see Gluetun's WireGuard handshake state here."
         return 0
@@ -2137,12 +2156,12 @@ vpn_wg_probe() {
     for (( i = 0; i < 8; i++ )); do
         dump=$(nsenter -t "$pid" -n wg show all dump 2>/dev/null || true)
         r=$(wg_dump_eval "$dump")
-        read -r pub ep hs rx tx peer <<<"$r"
+        read -r pub ep hs rx tx peer lport <<<"$r"
         [[ -n "$hs" && "$hs" != 0 ]] && break
         sleep 2
     done
     if [[ -z "$r" ]]; then log_info "No WireGuard interface found in Gluetun (it may be between restarts)."; return 0; fi
-    log_info "Gluetun WireGuard: interface public key $pub, server $ep (server key $peer), sent ${tx:-0} B, received ${rx:-0} B, handshake $([[ "$hs" != 0 ]] && date -d "@$hs" '+%T' || echo never)"
+    log_info "Gluetun WireGuard: interface public key $pub, server $ep (server key $peer), source port ${lport:-?}, sent ${tx:-0} B, received ${rx:-0} B, handshake $([[ "$hs" != 0 ]] && date -d "@$hs" '+%T' || echo never)"
     if [[ "$hs" == 0 ]]; then
         log_warn "No WireGuard handshake from inside Gluetun (sent handshake requests, no answer)."
         log_warn "  1) Interface public key: compare with the 'public key' 'wg show' printed for a working config;"
@@ -2155,6 +2174,11 @@ vpn_wg_probe() {
                   log_warn "     Check: sysctl net.ipv4.ip_forward (must be 1); sudo iptables -t nat -S | grep MASQUERADE (Docker's NAT rule);"
                   log_warn "     a host nftables/firewall forward chain dropping docker0 traffic; then: sudo systemctl restart docker" ;;
             ok)   log_warn "  3) Other containers reach the internet, so Docker NAT works. Watch where the handshake goes:"
+                  if [[ -n "$lport" && "$lport" == "${ep##*:}" ]]; then
+                      log_warn "     Gluetun sends FROM UDP port $lport (the same as the server port). If your router/firewall forwards inbound"
+                      log_warn "     UDP $lport (e.g. its own WireGuard server or a port forward), or rewrites the source port, the server's answer"
+                      log_warn "     never reaches Gluetun. A host test with wg-quick uses a random source port, which is why it works."
+                  fi
                   log_warn "     sudo tcpdump -ni any udp port ${ep##*:}   (requests should leave on docker0/veth AND your LAN interface, and answers come back)"
                   log_warn "     Leaves the LAN interface without answers -> a firewall between this host and the internet treats NATed container"
                   log_warn "     UDP differently from the host's own (e.g. per-port rules, or a policy only allowing the host's WireGuard port)." ;;
@@ -4731,7 +4755,8 @@ FIX
 2026-11-24T03:45:25Z WARN [dns] downloading block lists failed, skipping: lookup raw.githubusercontent.com on 127.0.0.1:53: i/o timeout
 2026-11-24T03:48:54Z WARN [vpn] restarting VPN because it failed to pass the healthcheck: startup check: all check tries failed: dialing: dial tcp4: lookup github.com: i/o timeout"; ex=$(grep -E "(^|[[:space:]])(ERROR|WARN|FATAL)[[:space:]]" <<<"$lg"); [[ "$ex" != *Authentication* ]] && h=$(vpn_log_hints "$lg") && [[ "$h" != *username/password* && "$h" == *"passes no traffic"* && "$h" == *FREE_ONLY* && $(grep -c . <<<"$h") == 1 ]] )'
     st "custom WireGuard: new names, no filters" '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[VPN_TYPE]=wireguard; CFG[VPN_ENDPOINT_IP]=37.120.137.194; CFG[VPN_ENDPOINT_PORT]=51820; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"WIREGUARD_ENDPOINT_IP=37.120.137.194"* && "$o" == *"WIREGUARD_ENDPOINT_PORT=51820"* && "$o" != *UPDATER_PERIOD* ]] && h=$(vpn_log_hints "ERROR VPN settings: provider settings: server selection: for VPN service provider custom: the country specified is not valid: one or more values is set but there is no possible value available") && [[ "$h" == *"must be blank"* && $(grep -c . <<<"$h") == 1 ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && vpn_normalize && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *WIREGUARD_ENDPOINT* && "$o" == *UPDATER_PERIOD=480h* ]] )'
-    st "WireGuard dump parsing"           '( d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t37.120.137.194:51820\t0.0.0.0/0\t0\t0\t1480\toff\n"); [[ "$(wg_dump_eval "$d")" == "PUBX= 37.120.137.194:51820 0 0 1480 PEERPUB=" ]] && d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t1.2.3.4:51820\t0.0.0.0/0\t1764000000\t9000\t3000\toff\n") && [[ "$(wg_dump_eval "$d")" == "PUBX= 1.2.3.4:51820 1764000000 9000 3000 PEERPUB=" ]] )'
+    st "WireGuard dump parsing"           '( d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t37.120.137.194:51820\t0.0.0.0/0\t0\t0\t1480\toff\n"); [[ "$(wg_dump_eval "$d")" == "PUBX= 37.120.137.194:51820 0 0 1480 PEERPUB= 51820" ]] && d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t1.2.3.4:51820\t0.0.0.0/0\t1764000000\t9000\t3000\toff\n") && [[ "$(wg_dump_eval "$d")" == "PUBX= 1.2.3.4:51820 1764000000 9000 3000 PEERPUB= 51820" ]] )'
+    st "installed copy updated only upward" '( MS_INSTALL_BIN="$t/inst"; printf "readonly SCRIPT_VERSION=\"2.5.2\"\n" >"$t/inst"; [[ "$(installed_version)" == 2.5.2 ]] && [[ "$(printf "%s\n%s\n" 2.5.2 2.5.10 | sort -V | tail -n1)" == 2.5.10 ]] && printf "readonly SCRIPT_VERSION=\"9.0.0\"\n" >"$t/inst" && [[ "$(installed_version)" == 9.0.0 ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
@@ -4963,6 +4988,7 @@ main() {
     fi
     _log_file INFO "================================================"
     _log_file INFO "$SCRIPT_NAME v$SCRIPT_VERSION started action=$action dry_run=$DRY_RUN"
+    [[ "$action" == certreceive ]] || self_update_installed
     _log_file INFO "User: $(id -un) (real: $REAL_USER)  PID: $$"
     _log_file INFO "================================================"
 
