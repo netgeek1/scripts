@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.7"
+readonly SCRIPT_VERSION="2.5.8"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2173,7 +2173,8 @@ vpn_wg_probe() {
         if [[ -n "$sub" ]] && (( nroutes > 1 )); then
             log_warn "  3) The host has $nroutes routes for the stack's subnet $sub (two Docker networks share it):"
             ip -4 route show 2>/dev/null | grep "^${sub%/*}/" | sed 's/^/       /'
-            log_warn "     The server's answers are routed to the wrong bridge. Run Apply: it removes the duplicate network."
+            log_warn "     The server's answers are routed to the wrong bridge (a 'linkdown' route still counts). Run Apply: it removes"
+            log_warn "     the duplicate network or orphaned bridge."
             return 0
         fi
         snet=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' gluetun 2>/dev/null | awk '{print $1}')
@@ -2977,11 +2978,55 @@ network_conflicts() {
     return 0
 }
 
+# docker_bridge_ifaces -> host interface names of all Docker bridge networks (br-<id12> or a custom bridge.name)
+docker_bridge_ifaces() {
+    local id nm
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        nm=$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$id" 2>/dev/null || true)
+        if [[ -n "$nm" ]]; then echo "$nm"; else echo "br-${id:0:12}"; fi
+    done < <(docker network ls -q --no-trunc --filter driver=bridge 2>/dev/null)
+    return 0
+}
+
+# subnet_foreign_ifaces -> "IFACE CIDR" for host interfaces holding an address in the stack's subnet that are not
+# Docker bridges (e.g. a bridge left behind by a removed Docker network: its route still captures the replies)
+subnet_foreign_ifaces() {
+    local sub dev cidr; local -a known
+    sub=$(stack_subnet); [[ -n "$sub" ]] || return 0
+    mapfile -t known < <(docker_bridge_ifaces)
+    while read -r dev cidr; do
+        [[ -n "$dev" ]] || continue
+        cidr_overlap "$cidr" "$sub" || continue
+        in_list "$dev" "${known[@]}" || printf '%s %s\n' "$dev" "$cidr"
+    done < <(ip -4 -o addr show 2>/dev/null | awk '{print $2, $4}')
+    return 0
+}
+
+# ensure_no_foreign_subnet_iface -- remove orphaned Docker bridges (br-<12 hex>, no ports) on the stack's subnet;
+# anything else using that subnet is a real conflict
+ensure_no_foreign_subnet_iface() {
+    local dev cidr bad=""
+    while read -r dev cidr; do
+        [[ -n "$dev" ]] || continue
+        if [[ "$dev" =~ ^br-[0-9a-f]{12}$ && -d "/sys/class/net/$dev/bridge" ]] && [[ -z "$(ls -A "/sys/class/net/$dev/brif" 2>/dev/null)" ]]; then
+            log_warn "Host interface $dev ($cidr) is a bridge left by a Docker network that no longer exists; its route for the"
+            log_warn "stack's subnet sends replies (e.g. Gluetun's WireGuard handshake answers) into it. Removing it."
+            if run ip link delete "$dev"; then log_ok "Removed orphaned bridge $dev"; else bad+=" $dev"; fi
+        else
+            bad+=" $dev($cidr)"
+        fi
+    done < <(subnet_foreign_ifaces)
+    [[ -z "$bad" ]] || die "Host interface(s)${bad} use the stack's subnet $(stack_subnet). Move them, or give MediaStack another DOCKER_SUBNET/DOCKER_GATEWAY in $FOLDER_FOR_YAML/.env."
+    return 0
+}
+
 # ensure_stack_network -- exactly one Docker network may use the stack's subnet. A second one (left by an
 # earlier run, a different project name or a duplicate "mediastack" network) gets its own host route for the
 # same subnet, and replies to the containers (e.g. Gluetun's WireGuard handshake) are routed into it and lost.
 ensure_stack_network() {
     local -a nets=() keep=(); local n id name proj cn foreign=""
+    ensure_no_foreign_subnet_iface
     mapfile -t nets < <(network_conflicts)
     (( ${#nets[@]} > 1 )) || return 0
     log_warn "${#nets[@]} Docker networks use the stack's subnet $(stack_subnet); traffic back to the containers goes to the wrong one:"
@@ -4837,6 +4882,7 @@ FIX
     st "WireGuard dump parsing"           '( d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t37.120.137.194:51820\t0.0.0.0/0\t0\t0\t1480\toff\n"); [[ "$(wg_dump_eval "$d")" == "PUBX= 37.120.137.194:51820 0 0 1480 PEERPUB= 51820" ]] && d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t1.2.3.4:51820\t0.0.0.0/0\t1764000000\t9000\t3000\toff\n") && [[ "$(wg_dump_eval "$d")" == "PUBX= 1.2.3.4:51820 1764000000 9000 3000 PEERPUB= 51820" ]] )'
     st "installed copy updated only upward" '( MS_INSTALL_BIN="$t/inst"; printf "readonly SCRIPT_VERSION=\"2.5.2\"\n" >"$t/inst"; [[ "$(installed_version)" == 2.5.2 ]] && [[ "$(printf "%s\n%s\n" 2.5.2 2.5.10 | sort -V | tail -n1)" == 2.5.10 ]] && printf "readonly SCRIPT_VERSION=\"9.0.0\"\n" >"$t/inst" && [[ "$(installed_version)" == 9.0.0 ]] )'
     st "subnet overlap check"             '( cidr_overlap 172.28.10.0/24 172.28.10.0/24 && cidr_overlap 172.28.0.0/16 172.28.10.0/24 && ! cidr_overlap 172.28.11.0/24 172.28.10.0/24 && ! cidr_overlap 172.17.0.0/16 172.28.10.0/24 && cidr_overlap 0.0.0.0/0 10.1.2.0/24 && ! cidr_overlap fd00::/64 172.28.10.0/24 )'
+    st "orphaned bridge on stack subnet"  '( FOLDER_FOR_YAML="$t/fy"; mkdir -p "$t/fy"; echo DOCKER_SUBNET=172.28.10.0/24 >"$t/fy/.env"; docker() { case "$1 $2" in "network ls") echo 91b65f27405bfffffff;; "network inspect") echo "";; esac; }; ip() { echo "1: lo    inet 127.0.0.1/8 scope host lo"; echo "5: br-cef1f9fa439b    inet 172.28.10.1/24 brd 172.28.10.255 scope global br-cef1f9fa439b"; echo "6: br-91b65f27405b    inet 172.28.10.1/24 scope global br-91b65f27405b"; echo "2: eno1    inet 192.168.11.75/24 scope global eno1"; }; [[ "$(subnet_foreign_ifaces)" == "br-cef1f9fa439b 172.28.10.1/24" ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
