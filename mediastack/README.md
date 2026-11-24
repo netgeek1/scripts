@@ -182,7 +182,7 @@ or by hand followed by **Apply**.
 | `FOLDER_FOR_YAML` | `/mediastack/compose` | Compose file, `.env`, templates (always local) |
 | `ACCESS_MODE` | asked | `internet` or `lan` (see [Access mode](#access-mode-and-certificates)) |
 | `CERT_MODE` | `letsencrypt` (internet) / `selfsigned` (lan) | `letsencrypt`, `selfsigned` or `manual` |
-| `TLS_CERT_FILE` / `TLS_KEY_FILE` | blank | Manual mode: PEM full chain + unencrypted key, re-copied on every apply |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | blank | Manual mode: PEM full chain + key (encrypted is fine), or the pasted copies in `/etc/mediastack/tls/`; re-read on every apply |
 | `DOMAIN` | *detected / required* (`mediastack.lan` in LAN mode) | `auth.<domain>`, `sonarr.<domain>`, … |
 | `CLOUDFLARE_DNS_ZONE` / `CLOUDFLARE_EMAIL` | `= DOMAIN` / blank | Traefik DNS-01 (Let's Encrypt only) |
 | `LOCAL_DOCKER_IP` / `LOCAL_SUBNET` | `auto` | Or a fixed IPv4 / CIDR |
@@ -239,11 +239,19 @@ The certificate source applies whenever Traefik runs, in either mode:
   - The leaf is renewed automatically 30 days before expiry, or when the domain or IP changes.
   - **Import `ca.crt` once on each device** and every app hostname is trusted.
   - Point `*.<domain>` at the host in your local DNS (for example Pi-hole or your router).
-- **`manual`**: give the paths of your own full-chain certificate and unencrypted key, for example files that
-  acme.sh renews.
+- **`manual`**: your own full-chain certificate and private key. For each one, the wizard (Settings →
+  Access/certs) asks for a **file path**, or you can type **`paste`** and paste the PEM text.
+  - **Paths** suit files a renewal job such as acme.sh keeps replacing: every apply re-reads them.
+  - **Pasted** PEMs are stored in `/etc/mediastack/tls/manual-cert.pem` (0644) and `manual-key.pem` (0600). The
+    certificate paste ends at a blank line, a line `END`, or Ctrl-D. The key paste is hidden and ends at its
+    `-----END … PRIVATE KEY-----` line. Windows line endings are fine.
+  - **Encrypted keys** (PKCS#8 `ENCRYPTED PRIVATE KEY`, or traditional `Proc-Type: 4,ENCRYPTED`) are detected and
+    the wizard asks for the passphrase. It verifies the passphrase (3 tries) and stores it in the vault as
+    `TLS_KEY_PASSPHRASE`. Traefik cannot read an encrypted key, so every apply decrypts it into Traefik's copy
+    (`traefik/certs/key.pem`, root-only 0600). A renewal job can keep writing encrypted keys with the same passphrase
+    without any prompt. If the passphrase changes, set it again in Settings → Access/certs or the Secrets menu.
   - Each apply checks that the key matches, the certificate hasn't expired (warns inside 14 days) and it covers
-    `*.<domain>`, then copies it into Traefik.
-  - When your renewal job replaces the files, run **Apply** (or `--start`).
+    `*.<domain>`, then installs it. After a renewal, run **Apply** (or `--start`).
 
 In `selfsigned` and `manual` modes the installer rewires Traefik's config:
 
@@ -427,7 +435,8 @@ Secrets live encrypted in `/etc/mediastack/secrets.enc`. They are never logged a
 
 - **Prompted:** VPN credentials, Cloudflare token, Tailscale key, SMTP password, Plex claim, and the WireGuard keys
   when `VPN_TYPE=wireguard`.
-- **Collected from Settings:** SMB username and password for the media share.
+- **Collected from Settings:** SMB username and password for the media share, and the passphrase of an encrypted
+  manual TLS key (`TLS_KEY_PASSPHRASE`).
 - **Generated once and reused:** the PostgreSQL password, Authentik secret key, headplane cookie secret and Homarr's
   `SECRET_ENCRYPTION_KEY`.
 - **Asked for only when used:** for example, the Cloudflare token only when Traefik runs with Let's Encrypt, and
@@ -565,6 +574,7 @@ password**.
 /etc/mediastack/.secrets.key             openssl backend key (0400)
 /etc/mediastack/media.smbcred            SMB credentials for mount.cifs (0600, regenerated from vault)
 /etc/mediastack/tls/ca.{crt,key}         local CA for CERT_MODE=selfsigned (import ca.crt on devices)
+/etc/mediastack/tls/manual-{cert,key}.pem  pasted manual certificate / key (key 0600, kept as pasted)
 <FOLDER_FOR_DATA>/traefik/certs/         certificate Traefik serves in selfsigned/manual mode
 /var/backups/mediastack/                 backups (BACKUP_DIR)
 /etc/fstab                               '# mediastack-installer:MEDIA|DATA' entries
@@ -590,7 +600,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 54 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 56 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
@@ -606,6 +616,8 @@ The self-test covers:
 - automatic parking of traefik-certs-dumper
 - Traefik ACME removal and the file certificate
 - the local CA and leaf (SANs, chain, renewal triggers) and the manual cert/key match check
+- encrypted keys (PKCS#8 and traditional; with no, a wrong, and the right passphrase) and the paste readers
+  (chains, CRLF, the blank line in traditional keys)
 - portable-backup encryption and `--set` validation
 
 Development testing ran these scenarios against the real upstream compose file, validated with `docker compose config`:
