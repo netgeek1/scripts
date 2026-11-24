@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.6"
+readonly SCRIPT_VERSION="2.5.7"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2167,7 +2167,15 @@ vpn_wg_probe() {
         log_warn "  1) Interface public key: compare with the 'public key' 'wg show' printed for a working config;"
         log_warn "     different -> re-import the working wg0.conf (Settings -> VPN, answer y to replace)."
         log_warn "  2) Server key: must equal [Peer] PublicKey in that wg0.conf."
-        local snet sbr eg2
+        local snet sbr eg2 nroutes sub
+        sub=$(stack_subnet)
+        nroutes=$(ip -4 route show 2>/dev/null | grep -c "^${sub%/*}/" || true)
+        if [[ -n "$sub" ]] && (( nroutes > 1 )); then
+            log_warn "  3) The host has $nroutes routes for the stack's subnet $sub (two Docker networks share it):"
+            ip -4 route show 2>/dev/null | grep "^${sub%/*}/" | sed 's/^/       /'
+            log_warn "     The server's answers are routed to the wrong bridge. Run Apply: it removes the duplicate network."
+            return 0
+        fi
         snet=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' gluetun 2>/dev/null | awk '{print $1}')
         log_info "Testing whether containers can reach the internet (DNS to 1.1.1.1 from throwaway containers)..."
         eg=$(docker_egress_test bridge)
@@ -2940,6 +2948,60 @@ compose_pull() {
     fi
 }
 
+# cidr_overlap A/n B/m -> 0 when the two IPv4 networks overlap
+ip4_int() { local a b c d; IFS=. read -r a b c d <<<"$1"; printf '%s' $(( (a << 24) | (b << 16) | (c << 8) | d )); }
+cidr_overlap() {
+    [[ "$1" == */* && "$2" == */* ]] || return 1
+    valid_ipv4 "${1%/*}" && valid_ipv4 "${2%/*}" || return 1
+    local n=${1#*/} m=${2#*/} p mask
+    p=$(( n < m ? n : m ))
+    mask=$(( p == 0 ? 0 : (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF ))
+    (( ($(ip4_int "${1%/*}") & mask) == ($(ip4_int "${2%/*}") & mask) ))
+}
+
+# stack_subnet -> DOCKER_SUBNET from the stack's .env
+stack_subnet() { env_get "$FOLDER_FOR_YAML/.env" DOCKER_SUBNET 2>/dev/null || true; }
+
+# network_conflicts -> "id|name|project|containers" for every Docker network overlapping the stack's subnet
+network_conflicts() {
+    local sub id line name proj subs cn x
+    sub=$(stack_subnet); [[ -n "$sub" ]] || return 0
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        line=$(docker network inspect -f '{{.Name}}|{{index .Labels "com.docker.compose.project"}}|{{range .IPAM.Config}}{{.Subnet}} {{end}}|{{len .Containers}}' "$id" 2>/dev/null) || continue
+        IFS='|' read -r name proj subs cn <<<"$line"
+        for x in $subs; do
+            if cidr_overlap "$x" "$sub"; then printf '%s|%s|%s|%s\n' "${id:0:12}" "$name" "$proj" "$cn"; break; fi
+        done
+    done < <(docker network ls -q --filter driver=bridge 2>/dev/null)
+    return 0
+}
+
+# ensure_stack_network -- exactly one Docker network may use the stack's subnet. A second one (left by an
+# earlier run, a different project name or a duplicate "mediastack" network) gets its own host route for the
+# same subnet, and replies to the containers (e.g. Gluetun's WireGuard handshake) are routed into it and lost.
+ensure_stack_network() {
+    local -a nets=() keep=(); local n id name proj cn foreign=""
+    mapfile -t nets < <(network_conflicts)
+    (( ${#nets[@]} > 1 )) || return 0
+    log_warn "${#nets[@]} Docker networks use the stack's subnet $(stack_subnet); traffic back to the containers goes to the wrong one:"
+    for n in "${nets[@]}"; do
+        IFS='|' read -r id name proj cn <<<"$n"
+        log_warn "  $name ($id, project ${proj:-none}, $cn container(s)) -> host interface br-$id"
+        if [[ "$name" != "$PROJECT_NAME" && "$proj" != "$PROJECT_NAME" && "$cn" != 0 ]]; then foreign+=" $name"; fi
+    done
+    [[ -z "$foreign" ]] || die "Network(s)${foreign} belong to something else and are in use. Remove them, or give MediaStack another DOCKER_SUBNET/DOCKER_GATEWAY in $FOLDER_FOR_YAML/.env, then Apply again."
+    log_info "Recreating the stack's network: stopping MediaStack's containers and removing the duplicate network(s)..."
+    run_logged compose_run down --remove-orphans || true
+    for n in "${nets[@]}"; do
+        IFS='|' read -r id name proj cn <<<"$n"
+        if run docker network rm "$id" >/dev/null 2>&1; then log_ok "Removed network $name ($id)"
+        else keep+=("$name ($id)"); fi
+    done
+    (( ${#keep[@]} == 0 )) || die "Could not remove: ${keep[*]} (still in use?). Check: docker network inspect <id>"
+    return 0
+}
+
 stop_excluded_containers() {
     local s cid
     while IFS= read -r s; do
@@ -2997,6 +3059,7 @@ stack_apply() {
     vpn_preflight
     compose_run config --quiet || die "docker compose config failed (missing variables or invalid YAML)."
     log_ok "Compose configuration valid"
+    ensure_stack_network
     stop_excluded_containers
     if [[ "$mode" == pull ]]; then
         compose_pull || die "Pulling images failed (network or registry problem); nothing was changed."
@@ -4773,6 +4836,7 @@ FIX
     st "custom WireGuard: new names, no filters" '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[VPN_TYPE]=wireguard; CFG[VPN_ENDPOINT_IP]=37.120.137.194; CFG[VPN_ENDPOINT_PORT]=51820; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"WIREGUARD_ENDPOINT_IP=37.120.137.194"* && "$o" == *"WIREGUARD_ENDPOINT_PORT=51820"* && "$o" != *UPDATER_PERIOD* ]] && h=$(vpn_log_hints "ERROR VPN settings: provider settings: server selection: for VPN service provider custom: the country specified is not valid: one or more values is set but there is no possible value available") && [[ "$h" == *"must be blank"* && $(grep -c . <<<"$h") == 1 ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && vpn_normalize && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *WIREGUARD_ENDPOINT* && "$o" == *UPDATER_PERIOD=480h* ]] )'
     st "WireGuard dump parsing"           '( d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t37.120.137.194:51820\t0.0.0.0/0\t0\t0\t1480\toff\n"); [[ "$(wg_dump_eval "$d")" == "PUBX= 37.120.137.194:51820 0 0 1480 PEERPUB= 51820" ]] && d=$(printf "tun0\tPRIV\tPUBX=\t51820\toff\ntun0\tPEERPUB=\t(none)\t1.2.3.4:51820\t0.0.0.0/0\t1764000000\t9000\t3000\toff\n") && [[ "$(wg_dump_eval "$d")" == "PUBX= 1.2.3.4:51820 1764000000 9000 3000 PEERPUB= 51820" ]] )'
     st "installed copy updated only upward" '( MS_INSTALL_BIN="$t/inst"; printf "readonly SCRIPT_VERSION=\"2.5.2\"\n" >"$t/inst"; [[ "$(installed_version)" == 2.5.2 ]] && [[ "$(printf "%s\n%s\n" 2.5.2 2.5.10 | sort -V | tail -n1)" == 2.5.10 ]] && printf "readonly SCRIPT_VERSION=\"9.0.0\"\n" >"$t/inst" && [[ "$(installed_version)" == 9.0.0 ]] )'
+    st "subnet overlap check"             '( cidr_overlap 172.28.10.0/24 172.28.10.0/24 && cidr_overlap 172.28.0.0/16 172.28.10.0/24 && ! cidr_overlap 172.28.11.0/24 172.28.10.0/24 && ! cidr_overlap 172.17.0.0/16 172.28.10.0/24 && cidr_overlap 0.0.0.0/0 10.1.2.0/24 && ! cidr_overlap fd00::/64 172.28.10.0/24 )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
