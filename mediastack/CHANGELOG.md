@@ -3,6 +3,15 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.9 — 2026-11-24
+
+### Fixed
+- **Apply looked hung after "N container(s) started or running".** The installer then waited silently for up to
+  180 s for every service to run, and up to ~45 s more for Traefik to serve the certificate. It now:
+  - says what it waits for, with a live count and the services still pending (every 30 s when not on a terminal)
+  - stops waiting early when the remaining services have exited or were never started, since waiting can't change that
+  - announces the Traefik certificate check
+
 ## v2.5.8 — 2026-11-24
 
 ### Fixed
