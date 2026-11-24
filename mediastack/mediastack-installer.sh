@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.2.1"
+readonly SCRIPT_VERSION="2.3.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1901,6 +1901,7 @@ vpn_problems() {
     svc_enabled gluetun || return 0
     local p=${CFG[VPN_SERVICE_PROVIDER]:-} f=${CFG[VPN_CUSTOM_OVPN_FILE]:-}
     [[ -n "$p" ]] || echo "VPN_SERVICE_PROVIDER is not set"
+    validate_key SERVER_REGIONS "${CFG[SERVER_REGIONS]:-}" || echo "SERVER_REGIONS '${CFG[SERVER_REGIONS]}' is not a region list (clear it in Settings -> VPN)"
     if [[ "${CFG[VPN_TYPE]}" == wireguard ]]; then
         secret_is_set WIREGUARD_PRIVATE_KEY || echo "WIREGUARD_PRIVATE_KEY is not set (import your provider's wg0.conf)"
         [[ -n "${CFG[WIREGUARD_ADDRESSES]:-}" ]] || echo "WIREGUARD_ADDRESSES is not set (the Address line of your wg0.conf)"
@@ -1946,10 +1947,12 @@ vpn_log_hints() {
     local l=${1,,}
     [[ "$l" =~ auth_failed|auth.*fail|authentication\ fail|wrong\ (username|password) ]] && \
         echo "The VPN rejected the username/password. Many providers use separate OpenVPN/service credentials (e.g. NordVPN 'service credentials', Surfshark 'manual setup'); set them in the Secrets menu."
-    [[ "$l" =~ no\ server|server.*not\ found|no\ .*server.*match|filter ]] && \
-        echo "No server matches the filter. Clear or correct SERVER_REGIONS (Settings -> VPN), or SERVER_COUNTRIES/CITIES in .env."
-    [[ "$l" =~ provider.*(not\ valid|invalid|unknown)|vpn_service_provider ]] && \
+    if [[ "$l" =~ server\ selection|no\ server|server.*not\ found|no\ .*server.*match|filter|(region|country|city|hostname).*not\ valid ]]; then
+        echo "No server matches the server filter. Clear or correct SERVER_REGIONS (Settings -> VPN), or SERVER_COUNTRIES/CITIES in .env."
+        [[ "$l" =~ region.*no\ possible\ value ]] && echo "This provider has no regions in Gluetun: leave SERVER_REGIONS blank (use SERVER_COUNTRIES in .env to pick a country)."
+    elif [[ "$l" =~ provider.*(not\ valid|invalid|unknown)|vpn_service_provider ]]; then
         echo "VPN_SERVICE_PROVIDER is not a Gluetun provider name (see the list in Settings -> VPN)."
+    fi
     [[ "$l" =~ custom.*config|openvpn_custom_config|\.ovpn ]] && \
         echo "The custom OpenVPN config could not be used; check the .ovpn (Settings -> VPN)."
     [[ "$l" =~ wireguard|wg0 ]] && \
@@ -2087,7 +2090,15 @@ cfg_vpn() {
             if [[ -n "$u" ]]; then SECRETS[VPN_PASSWORD]=$u; SECRETS_DIRTY=1; fi
         fi
     fi
-    ask "CFG[SERVER_REGIONS]" "VPN server regions (blank = provider default)" "${CFG[SERVER_REGIONS]}"
+    if ! validate_key SERVER_REGIONS "${CFG[SERVER_REGIONS]}"; then
+        log_warn "Stored SERVER_REGIONS '${CFG[SERVER_REGIONS]}' is not a region list (pasted text?); cleared."
+        CFG[SERVER_REGIONS]=""
+    fi
+    while :; do
+        ask "CFG[SERVER_REGIONS]" "VPN server regions, comma-separated (blank = any; not every provider has regions)" "${CFG[SERVER_REGIONS]}"
+        validate_key SERVER_REGIONS "${CFG[SERVER_REGIONS]}" && break
+        log_warn "That is not a region list (e.g. 'Netherlands' or 'US East,US West')."; CFG[SERVER_REGIONS]=""
+    done
     local probs l; probs=$(vpn_problems)
     if [[ -n "$probs" ]]; then while IFS= read -r l; do log_warn "VPN: $l"; done <<<"$probs"; else log_ok "VPN settings complete"; fi
 }
@@ -2193,6 +2204,78 @@ compose_run() {
     )
 }
 
+# image_id IMAGE -> local image ID (blank when not present)
+image_id() { docker image inspect -f '{{.Id}}' "$1" 2>/dev/null || true; }
+
+# compose_stream ARGS... -- docker compose with line-based progress. The log gets every line except
+# the per-layer byte counters (Downloading 12.3MB / Extracting 4B); the console gets one updating
+# status line (one line per image when not a terminal) plus anything that is not progress.
+STREAM_AWK='
+function clr() { if (st) { printf "\r\033[K"; st = 0 } }
+function status(msg) { if (tty) { printf "\r\033[K  %s", substr(msg, 1, 100); st = 1; fflush() } }
+function nm(s) { sub(/^[^A-Za-z0-9]*/, "", s); sub(/^Container +/, "", s); sub(/ +[A-Z][a-z]+( [a-z]+)?[ \t]*$/, "", s); return s }
+{
+    sub(/\r$/, ""); line = $0; show = line; sub(/^[ \t]+/, "", show)
+    layer = (line ~ /^[ \t]*[0-9a-f]{12} /)
+    if (layer && line ~ /(Downloading|Extracting|Waiting|Verifying Checksum|Pulling fs layer)/) next
+    if (lf != "") { print line >> lf; fflush(lf) }
+    if (layer || line ~ /^[ \t]*$/) next
+    if (line ~ /[Ee]rror|failed|unhealthy|denied|not found|manifest unknown/) { clr(); print "  " show; fflush(); next }
+    if (line ~ / Pulling[ \t]*$/) { status(sprintf("Pulling images: %d done, now %s", pulled, nm(line))); next }
+    if (line ~ / Pulled[ \t]*$/) {
+        pulled++
+        if (tty) status(sprintf("Pulling images: %d done (%s)", pulled, nm(line)))
+        else { print "  pulled: " nm(line); fflush() }
+        next
+    }
+    if (line ~ /^[ \t]*Container /) {
+        if (line ~ / (Started|Running|Healthy)[ \t]*$/) started[nm(line)] = 1
+        status("Starting containers: " nm(line) " " $NF); next
+    }
+    if (line ~ /^[ \t]*(Network|Volume) /) next
+    clr(); print "  " show; fflush()
+}
+END {
+    clr()
+    if (pulled) printf "  Pulled %d image(s)\n", pulled
+    n = 0; for (k in started) n++
+    if (n) printf "  %d container(s) started or running\n", n
+}'
+compose_stream() {
+    if (( DRY_RUN )); then run compose_run "$@"; return 0; fi
+    _log_file RUN "docker compose $*"
+    local tty=0
+    [[ -t 1 ]] && tty=1
+    if compose_run --progress plain "$@" 2>&1 | awk -v lf="${LOG_FILE:-}" -v tty="$tty" "$STREAM_AWK"; then
+        return 0
+    else
+        return "${PIPESTATUS[0]}"
+    fi
+}
+
+# compose_pull -- pull with compact progress (see compose_stream) and report which images changed
+compose_pull() {
+    local img a rc=0
+    local -a imgs changed=()
+    local -A before=()
+    mapfile -t imgs < <(compose_run config --images 2>/dev/null | sort -u)
+    for img in "${imgs[@]}"; do [[ -n "$img" ]] && before[$img]=$(image_id "$img"); done
+    log_info "Pulling ${#imgs[@]} image(s); the first install can take several minutes..."
+    compose_stream pull || rc=$?
+    (( rc == 0 )) || return "$rc"
+    for img in "${imgs[@]}"; do
+        [[ -n "$img" ]] || continue
+        a=$(image_id "$img")
+        [[ -n "$a" && "$a" != "${before[$img]:-}" ]] && changed+=("$img")
+    done
+    if (( ${#changed[@]} )); then
+        log_ok "${#changed[@]} image(s) new or updated:"
+        for img in "${changed[@]}"; do log_info "  $img"; done
+    else
+        log_ok "All ${#imgs[@]} image(s) already up to date"
+    fi
+}
+
 stop_excluded_containers() {
     local s cid
     while IFS= read -r s; do
@@ -2242,8 +2325,8 @@ stack_apply() {
     log_step "Starting MediaStack ($mode)"
     if (( DRY_RUN )); then
         run compose_run config --quiet
-        [[ "$mode" == pull ]] && run compose_run pull
-        run compose_run up -d --remove-orphans
+        [[ "$mode" == pull ]] && run compose_run pull --quiet
+        run compose_run up -d --remove-orphans --quiet-pull
         return 0
     fi
     vpn_preflight
@@ -2251,9 +2334,9 @@ stack_apply() {
     log_ok "Compose configuration valid"
     stop_excluded_containers
     if [[ "$mode" == pull ]]; then
-        run_logged compose_run pull || die "Pulling images failed (network or registry problem); nothing was changed."
+        compose_pull || die "Pulling images failed (network or registry problem); nothing was changed."
     fi
-    if ! run_logged compose_run up -d --remove-orphans; then
+    if ! compose_stream up -d --remove-orphans; then
         diagnose_start_failure
         die "Some containers could not start (causes above). Fix them, then run Apply again."
     fi
@@ -2616,16 +2699,27 @@ cfg_access() {
 # something has arrived (a terminal paste arrives in one burst, so multi-block chains and config
 # files with blank lines are read whole). CR line endings are stripped.
 read_paste() {
-    local out=$1 hid=${2:-0} line n=0
+    local out=$1 hid=${2:-0} line n=0 rc stty_save=""
     local -a ro
     : >"$out"
+    # Non-canonical mode: a paste whose last line has no newline is still delivered (in canonical
+    # mode it would sit in the tty buffer and be fed to the NEXT prompt as its answer).
+    if [[ -t 0 ]]; then stty_save=$(stty -g 2>/dev/null || true); stty -icanon -echoctl min 1 time 0 2>/dev/null || true; fi
     while :; do
         ro=(-r); (( hid )) && ro+=(-s); (( n )) && ro+=(-t 3)
-        IFS= read "${ro[@]}" line || break
+        line=""; rc=0
+        IFS= read "${ro[@]}" line || rc=$?
         line=${line%$'\r'}
+        if (( rc )); then
+            if [[ -n "$line" && "$line" != END && "$line" != end ]]; then   # unterminated last line
+                printf '%s\n' "$line" >>"$out"; [[ -t 0 ]] && echo
+            fi
+            break
+        fi
         [[ "$line" == END || "$line" == end ]] && break
         printf '%s\n' "$line" >>"$out"; n=$((n + 1))
     done
+    if [[ -n "$stty_save" ]]; then stty "$stty_save" 2>/dev/null || true; fi
     (( hid )) && echo
     local body; body=$(cat "$out")            # drop trailing blank lines
     if [[ -n "$body" ]]; then printf '%s\n' "$body" >"$out"; else : >"$out"; fi
@@ -3400,7 +3494,8 @@ validate_key() {   # validate_key KEY VALUE
         WIREGUARD_PUBLIC_KEY) [[ -z "$v" || "$v" =~ ^[A-Za-z0-9+/]{42,43}=?$ ]] ;;
         WIREGUARD_ADDRESSES) return 0 ;;
         VPN_SERVICE_PROVIDER) [[ -n "$v" ]] ;;
-        CLOUDFLARE_EMAIL|SERVER_REGIONS|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
+        SERVER_REGIONS) [[ "$v" != *[=\[\]#/]* ]] ;;
+        CLOUDFLARE_EMAIL|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
         DISABLED_SERVICES|REMOVED_SERVICES|EXTRA_PACKAGES|MEDIA_SMB_DOMAIN|MEDIA_MOUNT_OPTS|DATA_MOUNT_OPTS) return 0 ;;
         *) return 1 ;;
     esac
@@ -3956,6 +4051,9 @@ FIX
         ! tls_validate_pair "$d/mixed.pem" "$d/root.key.missing" ; rc=$?; rm -rf "$d"; exit $rc )'
     st "wg0.conf import (custom)"         '( printf "[Interface]\nPrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=\nAddress = 10.64.1.2/32\nDNS = 10.64.0.1\n\n[Peer]\nPublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=\nPresharedKey = ccc=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.7:51820 # srv\n" >"$t/wg0.conf"; CFG[VPN_SERVICE_PROVIDER]=custom; wg_import "$t/wg0.conf" && [[ "${SECRETS[WIREGUARD_PRIVATE_KEY]}" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa= && "${CFG[WIREGUARD_ADDRESSES]}" == 10.64.1.2/32 && "${CFG[VPN_ENDPOINT_IP]}" == 198.51.100.7 && "${CFG[VPN_ENDPOINT_PORT]}" == 51820 && "${CFG[WIREGUARD_PUBLIC_KEY]}" == bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb= && "${SECRETS[WIREGUARD_PRESHARED_KEY]}" == ccc= ]] && validate_key WIREGUARD_PUBLIC_KEY "${CFG[WIREGUARD_PUBLIC_KEY]}" )'
     st "wg0.conf without PresharedKey"    '( st_prep lan jellyfin tailscale core selfsigned; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=mullvad; SECRETS[WIREGUARD_PRESHARED_KEY]=old=; printf "[Interface]\nPrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=\nAddress = 10.64.1.2/32\n\n[Peer]\nPublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=\nEndpoint = 198.51.100.7:51820\n" >"$t/wg1.conf"; wg_import "$t/wg1.conf" >/dev/null && [[ -z "${SECRETS[WIREGUARD_PRESHARED_KEY]}" ]] && secret_needed WIREGUARD_PRIVATE_KEY && ! secret_needed WIREGUARD_PRESHARED_KEY && ! in_list WIREGUARD_PRESHARED_KEY "${SECRET_WIREGUARD[@]}" && [[ -z "$(vpn_problems)" || "$(vpn_problems)" != *PRESHARED* ]] )'
+    st "Gluetun hint: invalid region"     '( h=$(vpn_log_hints "ERROR VPN settings: provider settings: server selection: for VPN service provider protonvpn: the region specified is not valid: one or more values is set but there is no possible value available"); [[ "$h" == *SERVER_REGIONS* && "$h" == *"no regions"* && "$h" != *"not a Gluetun provider"* ]] && h=$(vpn_log_hints "ERROR VPN_SERVICE_PROVIDER: provider foo is not valid") && [[ "$h" == *"not a Gluetun provider"* ]] )'
+    st "SERVER_REGIONS rejects pasted text" '( validate_key SERVER_REGIONS "" && validate_key SERVER_REGIONS "US East,Netherlands" && ! validate_key SERVER_REGIONS "PersistentKeepalive = 25" && ! validate_key SERVER_REGIONS "[Peer]" && st_prep lan jellyfin tailscale core selfsigned && CFG[SERVER_REGIONS]="PersistentKeepalive = 25" && [[ "$(vpn_problems)" == *SERVER_REGIONS* ]] )'
+    st "compose output: log vs console"   '( f="$t/stream.log"; : >"$f"; c=$(printf " sonarr Pulling\n a1289cb1b2e1 Downloading 138.4MB\n 7970ef2aa55e Extracting 7B\n a1289cb1b2e1 Pull complete\n sonarr Pulled\n Container sonarr Started\nError response from daemon: boom\n" | awk -v lf="$f" -v tty=0 "$STREAM_AWK"); [[ "$c" == *"pulled: sonarr"* && "$c" == *"Error response from daemon: boom"* && "$c" == *"Pulled 1 image(s)"* && "$c" != *Downloading* && "$c" != *Extracting* ]] && ! grep -q "Downloading\|Extracting" "$f" && grep -q "Pull complete" "$f" && grep -q "sonarr Pulled" "$f" && grep -q "Container sonarr Started" "$f" )'
     st "VPN problems detected"             '( st_prep lan jellyfin tailscale core selfsigned; CFG[VPN_TYPE]=openvpn; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[VPN_CUSTOM_OVPN_FILE]=""; p=$(vpn_problems); [[ "$p" == *".ovpn"* ]] &&
         CFG[VPN_SERVICE_PROVIDER]=nordvpn && SECRETS[VPN_USERNAME]=""; p=$(vpn_problems); [[ "$p" == *"VPN_USERNAME"* ]] &&
         SECRETS[VPN_USERNAME]=u && SECRETS[VPN_PASSWORD]=p && p=$(vpn_problems) && [[ "$p" != *VPN_USERNAME* ]] &&
