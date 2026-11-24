@@ -3,6 +3,18 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.5.1 — 2026-11-23
+
+### Fixed
+- **False "The VPN rejected the username/password" hint for WireGuard.** The diagnosis picked log lines containing
+  `fail` or `auth` anywhere, including Gluetun's settings dump ("Restart VPN on healthcheck failure", "Authentication
+  file path"), and matched hints across line breaks. It now uses only lines with Gluetun's `ERROR`/`WARN`/`FATAL`
+  level and judges each line on its own.
+- The "tunnel passes no traffic" hint names the usual WireGuard causes: a ProtonVPN free plan (only free servers
+  accept the key, so set `FREE_ONLY=on`), outbound UDP 51820 blocked by a firewall, a revoked key, or an outdated
+  server list.
+- Self-test: 73 checks.
+
 ## v2.5.0 — 2026-11-23 — Gluetun WireGuard fixes and server-list updates
 
 ### Fixed
