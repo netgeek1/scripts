@@ -283,7 +283,8 @@ starting anything:
   copied to Gluetun as `/gluetun/custom.ovpn`, and `OPENVPN_CUSTOM_CONFIG` is set for you. Credentials are asked
   for only if the file uses `auth-user-pass`.
 - **WireGuard:** give your provider's `wg0.conf` as a path or by pasting it.
-  - The private key (and any preshared key) goes into the vault, and `Address` goes into `WIREGUARD_ADDRESSES`.
+  - The private key goes into the vault, and `Address` goes into `WIREGUARD_ADDRESSES`. A `PresharedKey` is
+    optional: it is stored only if your file has one, and you are never asked for it.
   - For `custom`, the server's `Endpoint` (resolved to an IP) and `PublicKey` are also taken.
 - **Host:** `/dev/net/tun` must exist.
 
@@ -638,7 +639,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 61 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 62 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
@@ -657,7 +658,7 @@ The self-test covers:
 - encrypted keys (PKCS#8 and traditional; with no, a wrong, and the right passphrase) and the paste readers
   (chains, CRLF, the blank line in traditional keys)
 - multi-certificate chains pasted with blank lines and reordered leaf → intermediate → root
-- `wg0.conf` import, VPN settings problems, and Gluetun log diagnosis
+- `wg0.conf` import (with and without a PresharedKey), VPN settings problems, and Gluetun log diagnosis
 - portable-backup encryption and `--set` validation
 
 Development testing ran these scenarios against the real upstream compose file, validated with `docker compose config`:
