@@ -41,6 +41,7 @@ After installation it handles day-2 operations:
 - [Storage: local, SMB, NFS, external](#storage-local-smb-nfs-external)
 - [Services: on / disabled / removed](#services-on--disabled--removed)
 - [Add-ons and patched services](#add-ons-and-patched-services)
+- [Dynamic DNS (DDNS-Updater)](#dynamic-dns-ddns-updater)
 - [Secrets](#secrets)
 - [Backup and restore](#backup-and-restore)
 - [Service account](#service-account)
@@ -141,6 +142,7 @@ You can re-run detection any time with **Settings → D**.
    7) Services           preset=core player=jellyfin tailscale=tailscale
    8) VPN / email        openvpn / mullvad
    9) Upstream / secrets / backups  8e908ae60bf4 full-download-vpn mode=vault
+   E) Dynamic DNS        cloudflare (media.example.org,*.media.example.org)
    D) Re-run detection   T) Test share mount   V) View all
    W) Save   A) Save + apply   0) Back
 ```
@@ -469,12 +471,13 @@ inside the one-off update container Gluetun's updater takes them as arguments fo
 
 | Preset | Services on |
 |---|---|
-| **core** (default) | Gluetun, qBittorrent, SABnzbd, Prowlarr, FlareSolverr, Unpackerr, Sonarr, Radarr, Lidarr, Bazarr, Seerr, Homepage, **Tailscale**, Audiobookshelf + your **player** (Jellyfin, Plex or both). In `internet` mode, also Traefik, Authentik, CrowdSec, PostgreSQL, Valkey and traefik-certs-dumper. With `TAILSCALE_CONTROL=headscale`, also Headscale and Headplane |
+| **core** (default) | Gluetun, qBittorrent, SABnzbd, Prowlarr, FlareSolverr, Unpackerr, Sonarr, Radarr, Lidarr, Bazarr, Seerr, Homepage, Homarr, Heimdall, **Tailscale**, Audiobookshelf, the status board + your **player** (Jellyfin, Plex or both). In `internet` mode, also Traefik, Authentik, CrowdSec, PostgreSQL, Valkey and traefik-certs-dumper. With `TAILSCALE_CONTROL=headscale`, also Headscale and Headplane. With `DDNS_PROVIDER` set, also DDNS-Updater |
 | **full** | Every upstream service except Whisparr (disabled), plus add-ons |
 | **custom** | Whatever you choose in the numbered list (a new install starts from Core) |
 
 Readarr is always removed: the project was retired upstream. Everything that is off stays one keypress away in
-**Settings → Services**.
+**Settings → Services**. A Core or Full install is brought in step with the preset of the installed version on every
+Apply (new add-ons, DDNS on/off); a custom selection is never changed.
 
 Before anything starts, the installer checks the dependencies of every enabled service:
 
@@ -603,11 +606,31 @@ Upstream still ships the legacy `ghcr.io/ajnart/homarr` (0.x) image. The install
 - **Not migrated:** existing 0.x boards in `homarr/configs` are left untouched. Recreate them in 1.x, or follow
   Homarr's migration guide.
 
-Homarr is off in the Core preset and on in Full.
+Homarr is on in the Core and Full presets. Its apps are filled by Apply (see [Homarr and Heimdall](#homarr-and-heimdall)).
 
-### Status board (Tailscale, Gluetun, CrowdSec)
+### Homarr and Heimdall
 
-An add-on included in the Core preset: one page with three tabs, at **`https://status.<domain>`** (Authentik
+Apply fills both dashboards with the same apps as Homepage: every enabled service with a web page, grouped (Media,
+Downloads, Library, Access & security, Tools), linked to `https://<app>.<domain>` with Traefik or `http://<ip>:<port>`
+without. Both are changed from a throwaway `python:3.13-alpine` container, so the host needs no Python, SQLite or curl.
+
+- **Heimdall:** tiles are written into its database (`<data>/heimdall/www/app.sqlite`) on the home dashboard,
+  pinned, coloured by group. Managed tiles carry the description *Managed by mediastack-installer*; they are updated
+  on every Apply and removed when the service is turned off. Your own tiles are never touched. On a first install
+  the tiles appear once Heimdall has created its database (Apply waits up to a minute, otherwise the next Apply).
+- **Homarr:** the API needs a key, which only exists after Homarr's first-start setup:
+  1. Open Homarr, create the admin user (onboarding).
+  2. **Management → Tools → API**: create an API key.
+  3. **Post-install helpers → 8** (`--helper homarr-key`): stores the key in the vault (`HOMARR_API_KEY`) and adds
+     the apps.
+
+  Apps go into Homarr's **app library** with a status ping on the LAN address; their descriptions start with
+  `[MediaStack]`, which marks them as managed. Placing them on a board is up to you (Homarr boards are free-form
+  layouts). Apps you created yourself are never changed.
+
+### Status board (Tailscale, Gluetun, CrowdSec, DDNS)
+
+An add-on included in the Core preset: one page with four tabs, at **`https://status.<domain>`** (Authentik
 sign-in) or **`http://<host-ip>:13380`** (read-only). Its Python source is embedded in the installer and written to
 `<data>/statusboard/app` on every apply. It runs in a stock `python:3.13-alpine` container (read-only filesystem,
 no capabilities, **no Docker socket**) and uses each tool's own API:
@@ -616,17 +639,18 @@ no capabilities, **no Docker socket**) and uses each tool's own API:
 |---|---|---|---|
 | **Tailscale** | state, tailnet, this node, advertised routes/exit node, home relay; every peer with online state, IP, OS, direct/relay connection, traffic, last seen | ping a peer; a link to **Tailscale's own web interface** (`http://<tailscale-ip>:5252`, enabled by Apply) for exit node, routes and SSH changes | LocalAPI over the `tailscaled` socket (shared `<data>/tailscale/run`, read-only mount) |
 | **Gluetun VPN** | VPN state, provider/type, public IP and location, forwarded port, server-list updater | restart / stop / start the VPN, update the server list now; **change the server selection** (countries, cities, hostnames, regions) or recreate Gluetun | control server with a generated API key (`HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE`) |
+| **DDNS** | provider, records, last update and current IP per record (from DDNS-Updater's `updates.json`), a link to its page | **change the records** (Cloudflare provider) | DDNS-Updater's data folder, read-only |
 | **CrowdSec** | metrics (decisions, alerts, log lines read and parsed, bouncer requests), active decisions, recent alerts | ban an IP or range (duration, reason), unban | LAPI: the Traefik bouncer key for decisions, a `statusboard` machine login (registered by Apply) for alerts/ban/unban; metrics on :6060 |
 
 **Changes need the HTTPS address.** Actions are accepted only when the request comes through Traefik with an
 Authentik user (`X-authentik-username`). The LAN port is read-only, and every change is logged with the user name.
 
-**Server selection changes** recreate Gluetun, which only the host can do. The board writes a validated request
+**Server selection and DDNS record changes** recreate a container, which only the host can do. The board writes a validated request
 file into `<data>/statusboard/requests`. The `mediastack-requests.path` systemd unit then runs
 `mediastack-installer --process-requests`, which:
 
 - accepts only whitelisted actions and validated values
-- sets the filters, runs Apply and writes the result back. The board's "Recent change requests" table shows it.
+- sets the filters or records, runs Apply and writes the result back. The board's "Recent change requests" table shows it.
 
 These runs are logged as `request-*.log` in `/var/log/mediastack/`.
 
@@ -721,6 +745,25 @@ the API directly, which forward-auth would break. It keeps upstream's security h
 
 ---
 
+## Dynamic DNS (DDNS-Updater)
+
+DDNS-Updater keeps public DNS records pointed at your current public IP. **Its own web page is status-only**: it has
+no editor, its records come from a JSON config. The installer builds that config, so the records are set in
+**Settings → E) Dynamic DNS** (or on the status board's DDNS tab, which goes through the same validation).
+
+| Key | Default | Notes |
+|---|---|---|
+| `DDNS_PROVIDER` | `none` | `none` (DDNS-Updater off in the presets), `cloudflare` or `custom` |
+| `DDNS_RECORDS` | `<zone>,*.<zone>` | Cloudflare: comma-separated names, each the zone or under it |
+| `DDNS_CF_ZONE_ID` | blank | Cloudflare Zone ID (32 hex: dashboard → your domain → Overview) |
+| `DDNS_TTL` / `DDNS_PROXIED` / `DDNS_IP_VERSION` | `1` (auto) / `no` / `ipv4` | Per-record settings for every record |
+| `DDNS_CONFIG_FILE` | blank | `custom`: your own `config.json` for any provider DDNS-Updater supports, copied to `<data>/ddns-updater/` |
+
+With `cloudflare`, the config goes into DDNS-Updater's `CONFIG` variable in the managed override. The API token is
+the vault's `CLOUDFLARE_DNS_API_TOKEN` (Zone → DNS → Edit), the same one Let's Encrypt mode uses, and is filled in by
+Compose at start, so it is never written to a file. Status shows the records and any problem (missing zone ID or
+token, records outside the zone).
+
 ## Secrets
 
 Secrets live encrypted in `/etc/mediastack/secrets.enc`. They are never logged and never placed on a command line.
@@ -732,9 +775,9 @@ Secrets live encrypted in `/etc/mediastack/secrets.enc`. They are never logged a
   (`TLS_KEY_PASSPHRASE`).
 - **Generated once and reused:** the PostgreSQL password, Authentik secret key, headplane cookie secret and Homarr's
   `SECRET_ENCRYPTION_KEY`.
-- **Asked for only when used:** for example, the Cloudflare token only when Traefik runs with Let's Encrypt, and
-  `PLEX_CLAIM` only when Plex is on.
-- **Collected by a helper:** *ARR API tokens.
+- **Asked for only when used:** for example, the Cloudflare token only when Traefik runs with Let's Encrypt or
+  DDNS-Updater uses Cloudflare, and `PLEX_CLAIM` only when Plex is on.
+- **Collected by a helper:** *ARR API tokens, Homarr's API key (`HOMARR_API_KEY`; stays in the vault, not in `.env`).
 
 | Backend | When | Protection |
 |---|---|---|
@@ -848,6 +891,7 @@ password**.
 | *ARR API keys | Reads each app's key and optionally stores the keys in the vault for unpackerr/homepage |
 | VPN check | Settings problems, Gluetun's health, its recent errors with hints, and (WireGuard) the handshake state read inside Gluetun's network namespace (`--helper vpn-check`) |
 | Traefik check | Routers Traefik could not build (and why), whether its config files (`@file` middlewares, certificate) loaded, the certificate it serves, and recent errors (`--helper traefik-check`) |
+| Homarr: API key | Stores the API key you created in Homarr in the vault and adds the apps (`--helper homarr-key`) |
 | Update VPN server list | Runs Gluetun's server-list updater once and restarts Gluetun (`--helper vpn-servers`; see [Server list updates](#server-list-updates)) |
 
 ## Uninstall
@@ -905,7 +949,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 87 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 88 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
