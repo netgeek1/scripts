@@ -3,6 +3,30 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.7.0 — 2026-11-24 — CrowdSec bouncer works out of the box
+
+### Fixed
+- **Every HTTPS hostname answered 404** ("middleware traefik-bouncer@file does not exist"). Traefik fetches the
+  CrowdSec bouncer plugin when it starts, and if that fails plugins stay off for the container's lifetime. After
+  starting, Apply now checks Traefik's API, restarts Traefik once if the plugin is missing, and shows Traefik's
+  plugin messages if the retry fails too.
+- **Upstream's sample CrowdSec LAPI key.** Every install had the same key, and no CrowdSec knew it, so the bouncer
+  would refuse requests once loaded. A per-install `CROWDSEC_BOUNCER_KEY` is now generated into the vault and
+  written into Traefik's `dynamic.yaml` on every apply. CrowdSec registers it via `BOUNCER_KEY_traefik` in the
+  managed override, which also sets `COLLECTIONS=crowdsecurity/traefik crowdsecurity/http-cve`.
+- Secrets that a newer version adds (generated ones) are now created on apply, so an existing install does not
+  need a full reinstall.
+- The Traefik check also shows Traefik's plugin messages.
+- Self-test: 82 checks.
+
+## v2.6.1 — 2026-11-24
+
+### Added
+- **Traefik check** (Post-install helpers → 7, `--helper traefik-check`): asks Traefik's own API which routers are in
+  error and why (an error makes the hostname answer 404). It also checks whether the config-file (`@file`)
+  middlewares loaded, shows the certificate actually served, and lists recent Traefik errors.
+- Self-test: 81 checks.
+
 ## v2.6.0 — 2026-11-24 — URLs, ports and DNS view
 
 ### Added
