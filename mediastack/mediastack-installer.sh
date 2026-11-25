@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.1.1"
+readonly SCRIPT_VERSION="3.1.2"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -5282,39 +5282,56 @@ print("Heimdall: %d tiles (%d new, %d removed%s); your own tiles untouched"
 HOMARR_PY='
 import json, os, sys, urllib.error, urllib.request
 BASE, KEY, MARK = "http://homarr:7575", os.environ["HK"], "[MediaStack] "
-HDR = {"ApiKey": KEY, "Authorization": "Bearer " + KEY, "Content-Type": "application/json", "Accept": "application/json"}
+HDR = {"ApiKey": KEY, "Content-Type": "application/json", "Accept": "application/json"}
 def call(method, path, body=None):
     req = urllib.request.Request(BASE + path, data=None if body is None else json.dumps(body).encode(), method=method, headers=HDR)
     with urllib.request.urlopen(req, timeout=20) as r:
         t = r.read().decode()
     return json.loads(t) if t.strip() else None
+def why(e):
+    try:
+        d = json.loads(e.read().decode())
+        fe = ((d.get("data") or {}).get("zodError") or {}).get("fieldErrors") or {}
+        return "HTTP %s %s" % (e.code, "; ".join("%s: %s" % (k, ", ".join(v)) for k, v in fe.items()) or d.get("message", ""))
+    except Exception:
+        return "HTTP %s" % e.code
 try:
     apps = call("GET", "/api/apps") or []
-    if isinstance(apps, dict):
-        apps = apps.get("items") or apps.get("apps") or apps.get("data") or []
-    mine = {a.get("name"): a for a in apps if (a.get("description") or "").startswith(MARK)}
-    taken = {a.get("name") for a in apps}
-    rows = [l.rstrip("\n").split("|") for l in sys.stdin if l.strip()]
-    added = updated = removed = 0
-    for r in rows:
-        group, title, href, desc, icon, lan = (r + [""] * 6)[:6]
-        body = {"name": title, "description": MARK + desc, "href": href,
-                "iconUrl": "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/%s.png" % icon}
-        if lan:
-            body["pingUrl"] = lan
-        if title in mine:
-            call("PATCH", "/api/apps/" + str(mine[title]["id"]), body); updated += 1
-        elif title not in taken:
-            call("POST", "/api/apps", body); added += 1
-    wanted = {(r + ["", ""])[1] for r in rows}
-    for name, a in mine.items():
-        if name not in wanted:
-            call("DELETE", "/api/apps/" + str(a["id"])); removed += 1
 except urllib.error.HTTPError as e:
-    print("Homarr API: HTTP %s %s" % (e.code, e.read().decode()[:200])); sys.exit(5)
+    print("Homarr API: %s (check the API key)" % why(e)); sys.exit(5)
 except Exception as e:
     print("Homarr API not reachable: %s" % e); sys.exit(6)
+if isinstance(apps, dict):
+    apps = apps.get("items") or apps.get("apps") or apps.get("data") or []
+mine = {a.get("name"): a for a in apps if (a.get("description") or "").startswith(MARK)}
+taken = {a.get("name") for a in apps}
+rows = [l.rstrip("\n").split("|") for l in sys.stdin if l.strip()]
+added = updated = removed = 0; failed = []
+for r in rows:
+    group, title, href, desc, icon, lan = (r + [""] * 6)[:6]
+    # every field is required by Homarr (pingUrl: an http(s) URL or ""; "" = ping the href)
+    body = {"name": title[:64], "description": (MARK + desc)[:512], "href": href,
+            "iconUrl": "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/%s.png" % icon,
+            "pingUrl": lan if lan.startswith(("http://", "https://")) else ""}
+    try:
+        if title in mine:
+            call("PATCH", "/api/apps/" + str(mine[title]["id"]), dict(body, id=str(mine[title]["id"]))); updated += 1
+        elif title not in taken:
+            call("POST", "/api/apps", body); added += 1
+    except urllib.error.HTTPError as e:
+        failed.append("%s (%s)" % (title, why(e)))
+    except Exception as e:
+        failed.append("%s (%s)" % (title, e))
+wanted = {(r + ["", ""])[1] for r in rows}
+for name, a in mine.items():
+    if name not in wanted:
+        try:
+            call("DELETE", "/api/apps/" + str(a["id"])); removed += 1
+        except Exception as e:
+            failed.append("%s (remove: %s)" % (name, e))
 print("Homarr: %d apps added, %d updated, %d removed (your own apps untouched)" % (added, updated, removed))
+if failed:
+    print("Homarr: not synced: " + "; ".join(failed)); sys.exit(7)
 '
 
 sync_heimdall() {
@@ -5343,7 +5360,10 @@ sync_homarr() {
     fi
     local out
     if out=$(HK=${SECRETS[HOMARR_API_KEY]} py_oneoff -e HK -- "$HOMARR_PY" <<<"$(dash_entries)" 2>&1); then log_ok "$out"
-    else log_warn "Homarr apps not synced: ${out##*$'\n'}"; fi
+    else
+        [[ "$out" == *$'\n'* ]] && log_info "${out%$'\n'*}"
+        log_warn "${out##*$'\n'}"
+    fi
 }
 
 helper_homarr_key() {
