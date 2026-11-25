@@ -3,6 +3,18 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.1.4 — 2026-11-25 — Headscale 0.29 config
+
+### Fixed
+- **Headscale restart loop (and so Headplane unhealthy → 404).** Upstream's `headscale-config.yaml` still sets
+  `randomize_client_port`, which Headscale 0.29 removed and refuses to start with. Apply now migrates the file
+  before placing it: `randomize_client_port` is dropped (upstream's value is the default, `false`; a `true` value is
+  reported, as it now belongs in the policy file) and `ephemeral_node_inactivity_timeout` moves to
+  `node.ephemeral.inactivity_timeout`.
+- Dependency check: Headplane now needs Headscale. Headplane's health check is Headscale's, and Traefik does not
+  route to an unhealthy container, so Headplane without Headscale was always a 404.
+- Self-test: 89 checks.
+
 ## v3.1.3 — 2026-11-25 — Headplane link fix
 
 ### Fixed
