@@ -603,6 +603,13 @@ Upstream still ships the legacy `ghcr.io/ajnart/homarr` (0.x) image. The install
 
 Homarr is off in the Core preset and on in Full.
 
+### Apps that check their hostname
+
+**SABnzbd** refuses requests for hostnames it doesn't know ("Access denied - Hostname verification failed"). With
+Traefik enabled, Apply adds `sabnzbd.<domain>` to `host_whitelist` in `<data>/sabnzbd/sabnzbd.ini`. SABnzbd rewrites
+that file when it stops, so Apply stops it, edits the file and starts it again. This happens only when the entry
+is missing; on a first install, Apply waits up to a minute for SABnzbd to create the file.
+
 ### Homepage dashboard
 
 Apply generates Homepage's `services.yaml` and `docker.yaml` (in `<data>/homepage/`) from the services that are
@@ -871,7 +878,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 84 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 85 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
