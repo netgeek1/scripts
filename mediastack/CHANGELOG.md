@@ -3,6 +3,17 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.3.3 — 2026-11-25 — Provider switch keeps the wg0.conf server
+
+### Fixed
+- **Switching back to `custom` failed with "needs the server endpoint and public key".** Choosing a listed provider
+  (e.g. accepting the switch to `protonvpn`) erased the server endpoint and public key imported from the wg0.conf.
+  They now stay stored for every provider and are passed to Gluetun only for `custom`, so switching back works
+  without importing the wg0.conf again. With a listed provider, `WIREGUARD_PUBLIC_KEY` in `.env` stays blank, as
+  each of the provider's servers brings its own key.
+- Gluetun's "endpoint IP is not set" with provider `custom` got the hint meant for listed providers ("must be
+  blank"); it now says to import the wg0.conf (or switch to the provider's name).
+
 ## v3.3.2 — 2026-11-25 — Server-list date, status screen
 
 ### Fixed
