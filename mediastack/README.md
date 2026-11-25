@@ -498,8 +498,15 @@ later.
 - **`headscale`** keeps upstream's setup and enables Headscale and Headplane. Apply updates upstream's Headscale config for
   Headscale 0.29+ (removed `randomize_client_port`, moved `ephemeral_node_inactivity_timeout`). Headplane needs
   Headscale running: its health check is Headscale's, and Traefik doesn't route to an unhealthy container.
-  Headplane is at `https://headplane.<domain>/admin/`; sign in with a Headscale API key
-  (`docker exec headscale headscale apikeys create`). Create the key with
+  Headplane is at `https://headplane.<domain>/admin/`. Sign in with the Headscale API key that Apply creates on the
+  first start (valid 365 days, kept in the vault as `HEADSCALE_API_KEY` and shown once on the terminal). Show it again
+  or create a new one with **Post-install helpers → 9** (`--helper headscale-key`).
+  Headscale itself has **no web page**: `https://headscale.<domain>` is its API for Tailscale clients and Headplane,
+  and its root page is blank by design. Dashboards show it without a link.
+- **Running both:** the Tailscale container and Headscale are different things, so both can run. The Tailscale
+  container is a node (subnet router and exit node) and Headscale is a control server. With
+  `TAILSCALE_CONTROL=headscale` the container joins your Headscale tailnet. With `tailscale` it joins Tailscale's
+  tailnet, while Headscale can still serve a separate tailnet for other devices. Create the key with
   `docker exec headscale headscale preauthkeys create --user <user> --reusable` once Headscale runs.
 
 ---
@@ -897,6 +904,7 @@ password**.
 | VPN check | Settings problems, Gluetun's health, its recent errors with hints, and (WireGuard) the handshake state read inside Gluetun's network namespace (`--helper vpn-check`) |
 | Traefik check | Routers Traefik could not build (and why), whether its config files (`@file` middlewares, certificate) loaded, the certificate it serves, and recent errors (`--helper traefik-check`) |
 | Homarr: API key | Stores the API key you created in Homarr in the vault and adds the apps (`--helper homarr-key`) |
+| Headscale: API key | Shows the stored Headscale API key for Headplane sign-in and the keys Headscale knows, and can create a new one (`--helper headscale-key`) |
 | Update VPN server list | Runs Gluetun's server-list updater once and restarts Gluetun (`--helper vpn-servers`; see [Server list updates](#server-list-updates)) |
 
 ## Uninstall
@@ -954,7 +962,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 89 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 91 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
