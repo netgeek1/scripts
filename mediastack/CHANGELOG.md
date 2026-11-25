@@ -3,6 +3,20 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.9.0 — 2026-11-24 — Homepage lists every app
+
+### Added
+- **Homepage `services.yaml` and `docker.yaml` generated on every apply** from the enabled services:
+  - grouped (Media, Downloads, Library, Access & security, Tools, Infrastructure, Other), each with an icon,
+    description and link (the HTTPS hostname with Traefik, else LAN IP:port)
+  - container status from Docker
+  - API widgets for Sonarr/Radarr/Lidarr/Readarr when their keys are in the vault (Post-install helpers → 4), passed
+    as `HOMEPAGE_VAR_*` variables
+  Marker-line ownership: Homepage's first-start samples are replaced (kept as `*.orig`), and files without the
+  marker are left alone.
+- `HOMEPAGE_ALLOWED_HOSTS` also accepts `<host-ip>:<port>` and `localhost:<port>`, so Homepage opens by IP and port.
+- Self-test: 84 checks.
+
 ## v2.8.0 — 2026-11-24 — Authentik forward auth configured automatically
 
 ### Added
