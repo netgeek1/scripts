@@ -167,7 +167,7 @@ You can re-run detection any time with **Settings → D**.
 | `--cert-push-setup [FILE\|-]` | Set up the push receiver: user, forced-command key, sudoers rule. Public key from a file, stdin or a prompt |
 | `--cert-receive` | The push receiver itself (run by the forced SSH command; reads chain + key on stdin) |
 | `--test-storage MEDIA\|DATA` | Trial-mount the share; test write and hardlinks as the service account |
-| `--helper NAME` | `authentik-db`, `guacamole`, `akadmin`, `apikeys`, `vpn-servers` or `vpn-check` |
+| `--helper NAME` | `authentik-db`, `guacamole`, `akadmin`, `apikeys`, `vpn-servers`, `vpn-check` or `traefik-check` |
 | `--secrets` | Secrets menu |
 | `--uninstall` | Remove stack, compose and app-data folders, and managed mounts (keyword `UNINSTALL`) |
 | `--purge-docker` | Remove Docker Engine host-wide (keyword `PURGE-DOCKER`) |
@@ -603,6 +603,23 @@ Upstream still ships the legacy `ghcr.io/ajnart/homarr` (0.x) image. The install
 
 Homarr is off in the Core preset and on in Full.
 
+### CrowdSec bouncer (Traefik plugin)
+
+Every HTTPS router upstream uses the `traefik-bouncer@file` middleware, which is the CrowdSec bouncer
+**plugin**. Two things make it work without manual steps:
+
+- **Own LAPI key.** Upstream ships a sample `crowdsecLapiKey` that no CrowdSec knows; with it the bouncer refuses
+  requests. The installer generates `CROWDSEC_BOUNCER_KEY` (vault) and writes it into Traefik's `dynamic.yaml` on
+  every apply. CrowdSec registers it at start (`BOUNCER_KEY_traefik`), and also installs the
+  `crowdsecurity/traefik` and `crowdsecurity/http-cve` collections (`COLLECTIONS`).
+- **Plugin download retry.** Traefik downloads the plugin from plugins.traefik.io when it starts. If that fails
+  (no internet yet, a timeout, an integrity-check error), plugins stay off. The middleware then doesn't exist and
+  every hostname answers **404** ("middleware traefik-bouncer@file does not exist"). After starting, Apply checks
+  Traefik's API, restarts Traefik once if the plugin is missing, and shows Traefik's plugin messages if the retry
+  fails too.
+
+Enrolling in the CrowdSec console (`cscli console enroll …`) is optional and stays a manual step.
+
 ### Tailscale
 
 With `TAILSCALE_CONTROL=tailscale`, only `TS_EXTRA_ARGS` is overridden: the same exit node and routes, without
@@ -756,6 +773,7 @@ password**.
 | Reset akadmin | Runs `ak changepassword akadmin` once Authentik is healthy |
 | *ARR API keys | Reads each app's key and optionally stores the keys in the vault for unpackerr/homepage |
 | VPN check | Settings problems, Gluetun's health, its recent errors with hints, and (WireGuard) the handshake state read inside Gluetun's network namespace (`--helper vpn-check`) |
+| Traefik check | Routers Traefik could not build (and why), whether its config files (`@file` middlewares, certificate) loaded, the certificate it serves, and recent errors (`--helper traefik-check`) |
 | Update VPN server list | Runs Gluetun's server-list updater once and restarts Gluetun (`--helper vpn-servers`; see [Server list updates](#server-list-updates)) |
 
 ## Uninstall
@@ -813,7 +831,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 80 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 82 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
