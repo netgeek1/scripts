@@ -615,7 +615,8 @@ Downloads, Library, Access & security, Tools), linked to `https://<app>.<domain>
 without. Both are changed from a throwaway `python:3.13-alpine` container, so the host needs no Python, SQLite or curl.
 
 - **Heimdall:** tiles are written into its database (`<data>/heimdall/www/app.sqlite`) on the home dashboard,
-  pinned, coloured by group. Managed tiles carry the description *Managed by mediastack-installer*; they are updated
+  pinned, coloured by group. The service description is the tile's tooltip. Managed tiles are tracked in a
+  `mediastack_managed` table in the same database (Heimdall ignores it); they are updated
   on every Apply and removed when the service is turned off. Your own tiles are never touched. On a first install
   the tiles appear once Heimdall has created its database (Apply waits up to a minute, otherwise the next Apply).
 - **Homarr:** the API needs a key, which only exists after Homarr's first-start setup:
