@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.9.1"
+readonly SCRIPT_VERSION="2.9.2"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -4257,8 +4257,11 @@ compose_service_facts() {
         END { flush() }' <<<"$1"
 }
 
-# web_path SERVICE -> path to append to the LAN URL
-web_path() { case "$1" in plex) printf '/web' ;; esac; }
+# web_path SERVICE -> path of the web UI, for the LAN URL and the HTTPS hostname. Upstream's Traefik routers for
+# these only match that path (plex: PathPrefix /web/; traefik: /api and /dashboard), so the bare hostname is a 404.
+web_path() { case "$1" in plex) printf '/web/' ;; traefik) printf '/dashboard/' ;; esac; }
+# https_urls SERVICE "HOST..." -> "https://HOST/path ..." for each hostname
+https_urls() { local h out=""; for h in $2; do out+="${out:+ }https://$h$(web_path "$1")"; done; printf '%s' "$out"; }
 
 show_urls() {
     require_config; resolve_runtime; load_secrets
@@ -4279,9 +4282,9 @@ show_urls() {
         if [[ "$port" =~ ^[0-9]+$ ]]; then
             claimed[$port]=1
             url="http://$ip:$port$(web_path "$name")"
-            rows+=("$name|$url|${hosts:+https://${hosts// / https://}}|$note")
+            rows+=("$name|$url|$(https_urls "$name" "$hosts")|$note")
         elif [[ -n "$hosts" ]]; then
-            rows+=("$name|-|https://${hosts// / https://}|$note")
+            rows+=("$name|-|$(https_urls "$name" "$hosts")|$note")
         fi
         if [[ -n "$hosts" ]]; then local -a hl; read -ra hl <<<"$hosts"; allhosts+=("${hl[@]}"); fi
         [[ -n "$ports" ]] && other+=("$name|$ports")
@@ -4388,7 +4391,7 @@ render_homepage_services() {
         for s in $members; do
             [[ -n "${seen[$s]:-}" ]] && continue; seen[$s]=1
             href=""
-            if svc_enabled traefik && [[ -n "${F_HOSTS[$s]}" ]]; then href="https://${F_HOSTS[$s]%% *}"
+            if svc_enabled traefik && [[ -n "${F_HOSTS[$s]}" ]]; then href=$(https_urls "$s" "${F_HOSTS[$s]%% *}")
             else
                 port=$(env_get "$envf" "WEBUI_PORT_$(tr 'a-z-' 'A-Z_' <<<"$s")" 2>/dev/null || true)
                 [[ "$port" =~ ^[0-9]+$ ]] && href="http://$ip:$port$(web_path "$s")"
@@ -5394,6 +5397,7 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "Authentik blueprint + patch"       '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; b=$(render_authentik_blueprint); [[ "$b" == *"mode: forward_domain"* && "$b" == *"cookie_domain: certifiedgeeks.net"* && "$b" == *"external_host: https://auth.certifiedgeeks.net"* && "$b" == *"authentik_host: https://auth.certifiedgeeks.net/"* && "$b" == *"managed: goauthentik.io/outposts/embedded"* ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ $(grep -c "/blueprints/mediastack:ro" <<<"$o") -ge 1 && "$o" == *"AUTHENTIK_BOOTSTRAP_PASSWORD=\${AUTHENTIK_BOOTSTRAP_PASSWORD:?err}"* ]] )'
     st "Homepage services from compose"   '( st_prep internet jellyfin tailscale core; FOLDER_FOR_YAML="$t/hp"; mkdir -p "$t/hp"; printf "WEBUI_PORT_SONARR=8989\nWEBUI_PORT_JELLYFIN=8096\n" >"$t/hp/.env"; CFG[LOCAL_DOCKER_IP]=10.0.0.5; SECRETS[SONARR_API_TOKEN]=abc; f=$(printf "%s\n" "sonarr|service:gluetun|sonarr.x.org|1|" "jellyfin|service:gluetun|jellyfin.x.org|1|" "postgresql|||0|5432/tcp" "zeta|||0|"); y=$(render_homepage_services "$f"); [[ "$y" == *"- Media:"*"- Jellyfin:"*"href: https://jellyfin.x.org"* && "$y" == *"- Sonarr:"*"url: http://gluetun:8989"*"{{HOMEPAGE_VAR_SONARR_API_TOKEN}}"* && "$y" == *"- Infrastructure:"*"- PostgreSQL:"*"icon: postgres.png"* && "$y" == *"- Other:"*"- Zeta:"* && "$y" != *"PostgreSQL:"*"href:"*"- Other"* ]] && svc_enabled traefik )'
     st "SABnzbd host_whitelist edit"       '( f="$t/sab.ini"; printf "[misc]\nhost_whitelist = 9f2c1a, \nport = 8080\n[servers]\nhost_whitelist = x\n" >"$f"; ini_whitelist_add "$f" sabnzbd.example.org && grep -qx "host_whitelist = 9f2c1a, sabnzbd.example.org" "$f" && grep -qx "host_whitelist = x" "$f" && ! ini_whitelist_add "$f" SABnzbd.example.org && printf "[misc]\nhost_whitelist = \n" >"$f" && ini_whitelist_add "$f" a.b && grep -qx "host_whitelist = a.b" "$f" )'
+    st "web UI paths (Plex, Traefik)"      '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
