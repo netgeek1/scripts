@@ -3,6 +3,14 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.9.1 — 2026-11-24
+
+### Fixed
+- **SABnzbd: "Access denied - Hostname verification failed"** at `https://sabnzbd.<domain>`. Apply now adds that
+  hostname to `host_whitelist` in `sabnzbd.ini`, with SABnzbd stopped because it rewrites the file on shutdown. It
+  does nothing when the entry is already there.
+- Self-test: 85 checks.
+
 ## v2.9.0 — 2026-11-24 — Homepage lists every app
 
 ### Added
