@@ -3,6 +3,22 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.2.0 — 2026-11-25 — Hostnames and LAN ports per service
+
+### Added
+- **Settings → U) Hostnames / ports:** an alphabetical, numbered list of the enabled services with their hostnames
+  and LAN port; pick one by number or name to change it.
+  - **Hostnames** (`SERVICE_HOSTNAMES`, e.g. `sonarr=tv,sonarr plex=watch`): one or more subdomains per service,
+    the first being the main one. Apply rewrites the service's Traefik router `Host(...)` in the managed override,
+    keeping the rest of the rule (Plex `/web/`, Headplane `/admin/`, Traefik `/api|/dashboard`). Single labels only,
+    so the wildcard certificate covers them; names used twice are refused.
+  - **LAN ports** (`SERVICE_PORTS`, e.g. `sonarr=18989`): set `WEBUI_PORT_<SVC>` in `.env`; a port another `.env`
+    port already uses is refused; removing an override restores upstream's default.
+- Everything that names a service follows the main hostname: Homepage, Homarr, Heimdall, the URL view, the status
+  board address, Authentik's own address in its blueprint (`external_host`, `authentik_host`), Headscale's
+  `server_url` and Headplane's `public_url`, and SABnzbd's `host_whitelist` (every SABnzbd name).
+- Self-test: 95 checks.
+
 ## v3.1.7 — 2026-11-25 — Guacamole database on Apply
 
 ### Fixed
