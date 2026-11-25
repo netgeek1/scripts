@@ -603,6 +603,24 @@ Upstream still ships the legacy `ghcr.io/ajnart/homarr` (0.x) image. The install
 
 Homarr is off in the Core preset and on in Full.
 
+### Homepage dashboard
+
+Apply generates Homepage's `services.yaml` and `docker.yaml` (in `<data>/homepage/`) from the services that are
+enabled:
+
+- **Groups:** Media, Downloads, Library, Access & security, Tools, Infrastructure (status only), plus Other for
+  anything new.
+- **Each app:** icon, description, and a link: the HTTPS hostname when Traefik is on, otherwise
+  `http://<host-ip>:<port>`. Each app also shows a live **container status** read from Docker.
+- **Widgets:** Sonarr, Radarr, Lidarr (and Readarr) get API widgets (queue, wanted, …) once their keys are in the
+  vault. Post-install helpers → 4 reads and stores them; then Apply. The keys reach Homepage as `HOMEPAGE_VAR_*`
+  variables, never in the file.
+- **Who owns the files:** a file with the marker line `# managed-by: mediastack-installer …` is rewritten on every
+  apply. Homepage's own first-start samples are replaced, and kept once as `*.orig`. Delete the marker line to edit
+  a file yourself; the installer then leaves it alone.
+- **Access by IP:** `HOMEPAGE_ALLOWED_HOSTS` also accepts `<host-ip>:<port>` and `localhost:<port>`, so
+  `http://<host-ip>:<port>` works as well as `https://homepage.<domain>`.
+
 ### Authentik sign-in (forward auth)
 
 With Traefik and Authentik enabled, every app hostname goes through Authentik's sign-in. The installer sets this up
@@ -853,7 +871,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 83 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 84 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
