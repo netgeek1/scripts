@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.1.3"
+readonly SCRIPT_VERSION="3.1.4"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1316,6 +1316,7 @@ compose_deps() {   # FILE -> "service dependency" pairs
 
 soft_deps() {
     printf '%s\n' "traefik crowdsec" "traefik authentik"   # traefik-bouncer + authentik-forwardauth middlewares
+    printf '%s\n' "headplane headscale"   # Headplane's health check is Headscale's; unhealthy = no Traefik route (404)
     [[ "${CFG[TAILSCALE_CONTROL]}" == headscale ]] && printf '%s\n' "tailscale headscale"
     return 0
 }
@@ -2025,12 +2026,35 @@ write_authentik_blueprint() {
     rm -f "$tmp"
 }
 
+# headscale_migrate_config FILE -- upstream's file predates Headscale 0.29, which refuses to start on removed keys:
+#   randomize_client_port              removed (0.29): now a policy-file setting; upstream sets the default (false)
+#   ephemeral_node_inactivity_timeout  removed (0.29/0.30): now node.ephemeral.inactivity_timeout
+headscale_migrate_config() {
+    local f=$1 tmp rcp eph
+    [[ -f "$f" ]] && ! (( DRY_RUN )) || return 0
+    rcp=$(sed -nE 's/^randomize_client_port:[[:space:]]*([A-Za-z]+).*/\1/p' "$f")
+    eph=$(sed -nE 's/^ephemeral_node_inactivity_timeout:[[:space:]]*([^[:space:]#]+).*/\1/p' "$f")
+    [[ -n "$rcp$eph" ]] || return 0
+    tmp=$(mktemp)
+    awk -v eph="$eph" '
+        /^randomize_client_port:/ || /^ephemeral_node_inactivity_timeout:/ {next}
+        /^node:[[:space:]]*$/ {hasnode = 1}
+        {print}
+        END {if (eph != "" && !hasnode) printf "\nnode:\n  ephemeral:\n    inactivity_timeout: %s\n", eph}
+    ' "$f" >"$tmp" && cat "$tmp" >"$f"
+    rm -f "$tmp"
+    log_ok "Headscale config updated for Headscale 0.29+ (removed: ${rcp:+randomize_client_port }${eph:+ephemeral_node_inactivity_timeout -> node.ephemeral.inactivity_timeout})"
+    [[ "$rcp" == true ]] && log_warn "Headscale: randomize_client_port was true; set \"randomizeClientPort\": true in your Headscale policy instead."
+    return 0
+}
+
 copy_app_configs() {
     local m src dst
     for m in "${APP_CONFIG_MAP[@]}"; do
         src="$FOLDER_FOR_YAML/${m%%:*}"; dst="$FOLDER_FOR_DATA/${m#*:}"
         [[ -f "$src" ]] || { log_warn "Missing $src"; continue; }
         [[ -d "$(dirname "$dst")" ]] || continue     # folder skipped (service removed)
+        [[ "${m%%:*}" == headscale-config.yaml ]] && headscale_migrate_config "$src"
         put_file "$src" "$dst" 664
     done
     local acme="$FOLDER_FOR_DATA/traefik/letsencrypt/acme.json"
@@ -6574,6 +6598,7 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "Authentik blueprint + patch"       '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; b=$(render_authentik_blueprint); [[ "$b" == *"mode: forward_domain"* && "$b" == *"cookie_domain: certifiedgeeks.net"* && "$b" == *"external_host: https://auth.certifiedgeeks.net"* && "$b" == *"authentik_host: https://auth.certifiedgeeks.net/"* && "$b" == *"managed: goauthentik.io/outposts/embedded"* ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ $(grep -c "/blueprints/mediastack:ro" <<<"$o") -ge 1 && "$o" == *"AUTHENTIK_BOOTSTRAP_PASSWORD=\${AUTHENTIK_BOOTSTRAP_PASSWORD:?err}"* ]] )'
     st "Homepage services from compose"   '( st_prep internet jellyfin tailscale core; FOLDER_FOR_YAML="$t/hp"; mkdir -p "$t/hp"; printf "WEBUI_PORT_SONARR=8989\nWEBUI_PORT_JELLYFIN=8096\n" >"$t/hp/.env"; CFG[LOCAL_DOCKER_IP]=10.0.0.5; SECRETS[SONARR_API_TOKEN]=abc; f=$(printf "%s\n" "sonarr|service:gluetun|sonarr.x.org|1|" "jellyfin|service:gluetun|jellyfin.x.org|1|" "postgresql|||0|5432/tcp" "zeta|||0|"); y=$(render_homepage_services "$f"); [[ "$y" == *"- Media:"*"- Jellyfin:"*"href: https://jellyfin.x.org"* && "$y" == *"- Sonarr:"*"url: http://gluetun:8989"*"{{HOMEPAGE_VAR_SONARR_API_TOKEN}}"* && "$y" == *"- Infrastructure:"*"- PostgreSQL:"*"icon: postgres.png"* && "$y" == *"- Other:"*"- Zeta:"* && "$y" != *"PostgreSQL:"*"href:"*"- Other"* ]] && svc_enabled traefik )'
     st "SABnzbd host_whitelist edit"       '( f="$t/sab.ini"; printf "[misc]\nhost_whitelist = 9f2c1a, \nport = 8080\n[servers]\nhost_whitelist = x\n" >"$f"; ini_whitelist_add "$f" sabnzbd.example.org && grep -qx "host_whitelist = 9f2c1a, sabnzbd.example.org" "$f" && grep -qx "host_whitelist = x" "$f" && ! ini_whitelist_add "$f" SABnzbd.example.org && printf "[misc]\nhost_whitelist = \n" >"$f" && ini_whitelist_add "$f" a.b && grep -qx "host_whitelist = a.b" "$f" )'
+    st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
     st "DDNS settings and config"          '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; CFG[DDNS_PROVIDER]=cloudflare; CFG[DDNS_RECORDS]="certifiedgeeks.net,*.certifiedgeeks.net"; CFG[DDNS_CF_ZONE_ID]=0123456789abcdef0123456789abcdef; j=$(ddns_config_json); [[ "$j" == "{\"settings\":[{\"provider\":\"cloudflare\",\"zone_identifier\":\"0123456789abcdef0123456789abcdef\",\"domain\":\"certifiedgeeks.net\""* && "$j" == *"\"domain\":\"*.certifiedgeeks.net\""* && "$j" == *"\"token\":\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\""* ]] && { ! command -v python3 >/dev/null || python3 -c "import json,sys; json.loads(sys.argv[1].replace(\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\",\"t\"))" "$j"; } && ddns_records_in_zone "certifiedgeeks.net,*.certifiedgeeks.net,a.certifiedgeeks.net" && ! ddns_records_in_zone "evil.org" && v_ddns_records "*.x.org,y.org" && ! v_ddns_records "a b" && apply_preset && st_on ddns-updater && o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"- '"'"'CONFIG={\"settings\""* ]] )'
