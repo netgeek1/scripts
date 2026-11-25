@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.7.0"
+readonly SCRIPT_VERSION="2.8.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -52,8 +52,8 @@ readonly AUTHENTIK_CONTAINER="authentik"
 
 # Folder layout. Mirrors upstream restart.sh at the pinned commit. The *_BRACE
 # strings are the exact upstream text and are used only for drift detection.
-readonly DATA_BRACE='{authentik/{certs,media,templates},bazarr,chromium,crowdsec/data,ddns-updater,filebot,gluetun,grafana,headplane/data,headscale/data,heimdall,homarr/{configs,data,icons},homepage,huntarr,jellyfin,lidarr,logs/{unpackerr,traefik},mylar,plex,portainer,postgresql,prometheus,prowlarr,qbittorrent,radarr,readarr,sabnzbd,seerr,sonarr,tailscale,tdarr/{server,configs,logs},tdarr-node,traefik/letsencrypt,traefik-certs-dumper,unpackerr,valkey,whisparr}'
-DATA_SUBDIRS=( authentik/{certs,media,templates} bazarr chromium crowdsec/data ddns-updater filebot
+readonly DATA_BRACE='{authentik/{certs,media,templates,blueprints},bazarr,chromium,crowdsec/data,ddns-updater,filebot,gluetun,grafana,headplane/data,headscale/data,heimdall,homarr/{configs,data,icons},homepage,huntarr,jellyfin,lidarr,logs/{unpackerr,traefik},mylar,plex,portainer,postgresql,prometheus,prowlarr,qbittorrent,radarr,readarr,sabnzbd,seerr,sonarr,tailscale,tdarr/{server,configs,logs},tdarr-node,traefik/letsencrypt,traefik-certs-dumper,unpackerr,valkey,whisparr}'
+DATA_SUBDIRS=( authentik/{certs,media,templates,blueprints} bazarr chromium crowdsec/data ddns-updater filebot
                gluetun grafana headplane/data headscale/data heimdall homarr/{configs,data,icons} homepage
                huntarr jellyfin lidarr logs/{unpackerr,traefik} mylar plex portainer postgresql prometheus
                prowlarr qbittorrent radarr readarr sabnzbd seerr sonarr tailscale tdarr/{server,configs,logs}
@@ -119,13 +119,14 @@ SECRET_KEYS=( VPN_USERNAME VPN_PASSWORD PLEX_CLAIM CLOUDFLARE_DNS_API_TOKEN EMAI
               WIREGUARD_PRIVATE_KEY WIREGUARD_PRESHARED_KEY POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY
               HEADPLANE_COOKIE_SECRET SONARR_API_TOKEN RADARR_API_TOKEN LIDARR_API_TOKEN READARR_API_TOKEN
               WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD SECRET_ENCRYPTION_KEY
-              TLS_KEY_PASSPHRASE UPDATER_PROTONVPN_PASSWORD CROWDSEC_BOUNCER_KEY )
+              TLS_KEY_PASSPHRASE UPDATER_PROTONVPN_PASSWORD CROWDSEC_BOUNCER_KEY AUTHENTIK_BOOTSTRAP_PASSWORD )
 # Vault entries that are not .env variables
 SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE )
 SECRET_PROMPTED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY EMAIL_PASSWORD PLEX_CLAIM )
 SECRET_WIREGUARD=( WIREGUARD_PRIVATE_KEY )   # WIREGUARD_PRESHARED_KEY is optional: taken from wg0.conf only
 SECRET_REQUIRED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY )   # compose :?err
-SECRET_GENERATED=( POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY HEADPLANE_COOKIE_SECRET SECRET_ENCRYPTION_KEY CROWDSEC_BOUNCER_KEY )
+SECRET_GENERATED=( POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY HEADPLANE_COOKIE_SECRET SECRET_ENCRYPTION_KEY CROWDSEC_BOUNCER_KEY
+                   AUTHENTIK_BOOTSTRAP_PASSWORD )
 readonly SECRET_UNSET="not-set"
 declare -A SECRETS=()
 SECRETS_LOADED=0
@@ -616,6 +617,7 @@ ensure_generated_secrets() {
         case "$k" in
             AUTHENTIK_SECRET_KEY)    SECRETS[$k]=$(gen_hex 48) ;;
             HEADPLANE_COOKIE_SECRET) SECRETS[$k]=$(gen_hex 16) ;;
+            AUTHENTIK_BOOTSTRAP_PASSWORD) SECRETS[$k]=$(gen_hex 12) ;;
             *)                       SECRETS[$k]=$(gen_hex 32) ;;
         esac
         log_ok "Generated $k (new in this version; stored once)"; changed=1
@@ -651,6 +653,7 @@ secrets_init() {
                 HEADPLANE_COOKIE_SECRET) SECRETS[$k]=$(gen_hex 16) ;;
                 SECRET_ENCRYPTION_KEY)   SECRETS[$k]=$(gen_hex 32) ;;   # Homarr 1.x: 64 hex chars
                 CROWDSEC_BOUNCER_KEY)    SECRETS[$k]=$(gen_hex 32) ;;   # Traefik bouncer <-> CrowdSec LAPI
+                AUTHENTIK_BOOTSTRAP_PASSWORD) SECRETS[$k]=$(gen_hex 12) ;;   # akadmin, only when Authentik is first set up
             esac
             log_ok "Generated $k (stored once; reused on every run)"; changed=1
         fi
@@ -1367,6 +1370,15 @@ render_patch() {   # render_patch NAME -> body that changes an upstream service
       - SECRET_ENCRYPTION_KEY=${SECRET_ENCRYPTION_KEY:?err}
 EOF
             ;;
+        authentik|authentic-worker)
+            cat <<'EOF'
+    # Authentik: first-start admin password (akadmin) and the installer's blueprint (forward auth for the domain)
+    environment:
+      - AUTHENTIK_BOOTSTRAP_PASSWORD=${AUTHENTIK_BOOTSTRAP_PASSWORD:?err}
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/authentik/blueprints:/blueprints/mediastack:ro
+EOF
+            ;;
         crowdsec)
             cat <<'EOF'
     # CrowdSec: register this install's Traefik bouncer key, install the Traefik/HTTP detection collections
@@ -1405,6 +1417,10 @@ active_patches() {   # upstream services this installer modifies
     local compose=$1
     [[ -f "$compose" ]] || return 0
     if grep -qE '^  homarr:[[:space:]]*$' "$compose" && ! is_removed homarr; then echo homarr; fi
+    local a
+    for a in authentik authentic-worker; do
+        if grep -qE "^  ${a}:[[:space:]]*\$" "$compose" && ! is_removed "$a"; then echo "$a"; fi
+    done
     if grep -qE '^  crowdsec:[[:space:]]*$' "$compose" && ! is_removed crowdsec; then echo crowdsec; fi
     if grep -qE '^  gluetun:[[:space:]]*$' "$compose" && ! is_removed gluetun \
         && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint; }; then echo gluetun; fi
@@ -1840,6 +1856,65 @@ put_file() {
     svc_run sh -c 'cat >"$1" && chmod "$2" "$1"' _ "$dst" "$mode" <"$src"
 }
 
+# render_authentik_blueprint -> Authentik blueprint: one domain-level forward-auth proxy provider for
+# https://auth.<zone> (cookie domain <zone>), the "Authentik" application, and the embedded outpost serving it with
+# the right authentik_host (otherwise it redirects browsers to http://0.0.0.0:9000).
+render_authentik_blueprint() {
+    local z; z=$(tls_zone)
+    cat <<EOF
+# Managed by $SCRIPT_NAME -- rewritten on every apply; Authentik re-applies it when it changes.
+version: 1
+metadata:
+  name: MediaStack forward auth
+  labels:
+    blueprints.goauthentik.io/description: "Domain-level forward auth for *.${z} through Traefik"
+entries:
+  - model: authentik_providers_proxy.proxyprovider
+    id: mediastack-provider
+    identifiers:
+      name: Provider for Authentik
+    attrs:
+      mode: forward_domain
+      external_host: https://auth.${z}
+      cookie_domain: ${z}
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-explicit-consent]]
+      authentication_flow: !Find [authentik_flows.flow, [slug, default-authentication-flow]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+  - model: authentik_core.application
+    identifiers:
+      slug: authentik
+    attrs:
+      name: Authentik
+      provider: !KeyOf mediastack-provider
+      meta_launch_url: https://auth.${z}
+      open_in_new_tab: false
+  - model: authentik_outposts.outpost
+    identifiers:
+      managed: goauthentik.io/outposts/embedded
+    attrs:
+      providers:
+        - !KeyOf mediastack-provider
+      config:
+        authentik_host: https://auth.${z}/
+        authentik_host_insecure: false
+        authentik_host_browser: ""
+EOF
+}
+
+write_authentik_blueprint() {
+    local d="$FOLDER_FOR_DATA/authentik/blueprints"
+    { svc_enabled authentik && svc_enabled traefik; } || return 0
+    [[ -d "$d" ]] || run install -d -m 755 -o "$PUID" -g "$PGID" "$d"
+    (( DRY_RUN )) && { log_info "[dry-run] would write $d/mediastack-forward-auth.yaml"; return 0; }
+    local tmp; tmp=$(mktemp)
+    render_authentik_blueprint >"$tmp"
+    if ! cmp -s "$tmp" "$d/mediastack-forward-auth.yaml"; then
+        put_file "$tmp" "$d/mediastack-forward-auth.yaml" 644
+        log_ok "Authentik blueprint written: forward auth for *.$(tls_zone) via https://auth.$(tls_zone)"
+    fi
+    rm -f "$tmp"
+}
+
 copy_app_configs() {
     local m src dst
     for m in "${APP_CONFIG_MAP[@]}"; do
@@ -1867,6 +1942,7 @@ copy_app_configs() {
     if [[ -f "$dyn" ]] && secret_is_set CROWDSEC_BOUNCER_KEY && ! (( DRY_RUN )); then
         sed -i -E "s|^([[:space:]]*crowdsecLapiKey:).*|\1 ${SECRETS[CROWDSEC_BOUNCER_KEY]}|" "$dyn"
     fi
+    write_authentik_blueprint
     log_ok "App config files placed (traefik, headscale, headplane, crowdsec); acme.json 600"
 }
 
@@ -4215,6 +4291,10 @@ print_summary() {
     if svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == selfsigned ]]; then
         printf '\n  Self-signed: import %s/ca.crt on your devices (and point *.%s at %s in your DNS).\n' "$(tls_dir)" "$z" "$ip"
     fi
+    if svc_enabled authentik && svc_enabled traefik; then
+        printf '\n  Authentik: sign in at https://auth.%s as akadmin. A new Authentik gets the password stored as\n' "$z"
+        printf '  AUTHENTIK_BOOTSTRAP_PASSWORD (Secrets -> 4 to reveal); for an existing one use Post-install helpers -> 3.\n'
+    fi
     if svc_enabled tailscale && [[ "${CFG[TAILSCALE_CONTROL]}" == tailscale ]]; then
         printf '  Tailscale: approve the advertised routes / exit node for "exit-node" in the Tailscale admin console.\n'
     fi
@@ -5151,6 +5231,7 @@ networks:
 sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "Traefik router errors parsed"      '( j="[{\"entryPoints\":[\"secureweb\"],\"service\":\"sonarr\",\"rule\":\"Host(\`sonarr.x\`)\",\"error\":[\"middleware \\\"traefik-bouncer@file\\\" does not exist\"],\"status\":\"disabled\",\"name\":\"sonarr@docker\"},{\"service\":\"api@internal\",\"status\":\"enabled\",\"name\":\"traefik@docker\"}]"; e=$(traefik_router_errors "$j"); [[ "$e" == "sonarr@docker: middleware '"'"'traefik-bouncer@file'"'"' does not exist" ]] )'
     st "CrowdSec bouncer key wiring"      '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"BOUNCER_KEY_traefik=\${CROWDSEC_BOUNCER_KEY:?err}"* ]] && in_list CROWDSEC_BOUNCER_KEY "${SECRET_GENERATED[@]}" && f="$t/dyn.yaml" && printf "x:\n          crowdsecLapiKey: 8andilX0JKYIu8z+R4imPkIgG+TMdCttAuMaHrsV7ZU\n          crowdsecLapiHost: crowdsec:8080\n" >"$f" && sed -i -E "s|^([[:space:]]*crowdsecLapiKey:).*|\\1 abc123|" "$f" && grep -qx "          crowdsecLapiKey: abc123" "$f" && grep -q "crowdsecLapiHost: crowdsec:8080" "$f" )'
+    st "Authentik blueprint + patch"       '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; b=$(render_authentik_blueprint); [[ "$b" == *"mode: forward_domain"* && "$b" == *"cookie_domain: certifiedgeeks.net"* && "$b" == *"external_host: https://auth.certifiedgeeks.net"* && "$b" == *"authentik_host: https://auth.certifiedgeeks.net/"* && "$b" == *"managed: goauthentik.io/outposts/embedded"* ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ $(grep -c "/blueprints/mediastack:ro" <<<"$o") -ge 1 && "$o" == *"AUTHENTIK_BOOTSTRAP_PASSWORD=\${AUTHENTIK_BOOTSTRAP_PASSWORD:?err}"* ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
