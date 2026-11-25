@@ -481,6 +481,9 @@ Gluetun picks servers from a list built into its image, which goes out of date. 
 connect to one that no longer accepts your key. Two ways to keep the list fresh
 ([Gluetun wiki](https://github.com/qdm12/gluetun-wiki/blob/main/setup/servers.md)):
 
+- **Built in:** every Gluetun image carries a server list; it is what Gluetun uses until one of the updates below
+  runs. The status board's Server list card shows its date and how it is kept current. Gluetun keeps the data in
+  `<data>/gluetun/servers/` (older versions: `<data>/gluetun/servers.json`).
 - **Automatic** (`VPN_SERVERS_UPDATE_PERIOD`, default `480h` = 20 days; the wiki asks for at least `360h`; `off` to
   disable). Gluetun refreshes the list for your provider through the tunnel and keeps it in `<data>/gluetun/`. It
   is set as `UPDATER_PERIOD` in the managed override.
