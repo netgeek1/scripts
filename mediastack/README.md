@@ -204,8 +204,8 @@ read from `docker compose config`, not from a fixed list, and also prints at the
 
 - **LAN:** the app's own port (`WEBUI_PORT_*` in `.env`). It works without DNS and without Traefik.
 - **HTTPS:** the hostnames from Traefik's router rules, with the web UI's path where upstream's router only matches
-  that path: Plex `https://plex.<domain>/web/`, Traefik `https://traefik.<domain>/dashboard/`. The bare hostname
-  answers 404 for these two. "via VPN" means the app runs inside Gluetun's network, so
+  that path: Plex `https://plex.<domain>/web/`, Traefik `https://traefik.<domain>/dashboard/`, Headplane
+  `https://headplane.<domain>/admin/`. The bare hostname answers 404 for these three. "via VPN" means the app runs inside Gluetun's network, so
   its port is published on the `gluetun` container. "Authentik login" means Traefik asks for an Authentik sign-in
   first.
 - **Other published ports:** everything else on the host, each named from the `.env` variable that sets it.
