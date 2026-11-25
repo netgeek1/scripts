@@ -3,6 +3,20 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.3.1 — 2026-11-25 — Board feedback, port-forward timeout
+
+### Fixed
+- **Status board: "Forwarded port … timed out" while port forwarding worked.** Gluetun runs its port up-command
+  while holding its port-forwarding lock, so its control server could not report the port until the command ended.
+  The qBittorrent hook retried for up to 5 minutes inside that command. It now starts the work in the background and
+  returns at once; the outcome goes to `<data>/gluetun/mediastack-pf-qbittorrent.status`.
+- **Buttons gave no sign they worked.** A clicked button now shows a spinner ("Working…") and a status message stays
+  up until the result is in. Change requests are followed through: queued, being applied by the installer, then
+  done or failed with the installer's message, and the tab refreshes.
+
+### Added
+- The Forwarded port card shows whether qBittorrent took the port (or why not) and when.
+
 ## v3.3.0 — 2026-11-25 — Gluetun options on the status board, port forwarding
 
 ### Added
