@@ -495,7 +495,15 @@ later.
   LAN-only.
   - Create a reusable auth key in the Tailscale admin console.
   - Approve the advertised subnet routes and exit node there.
-- **`headscale`** keeps upstream's setup and enables Headscale and Headplane. Apply updates upstream's Headscale config for
+- **`headscale`** keeps upstream's setup and enables Headscale and Headplane. With the Tailscale container on,
+  Apply joins it to Headscale by itself:
+  - creates the Headscale user `exit-node` and a reusable pre-auth key (365 days) and stores it as `TAILSCALE_AUTHKEY`
+    (a Tailscale.com key can't log in to Headscale)
+  - points the container at Headscale over the stack network (`--login-server=http://headscale:8080`), so it
+    doesn't depend on DNS for `headscale.<domain>`
+  - sets aside the container's saved login when it belonged to another control server
+    (`<data>/tailscale/tailscaled.state.bak-<time>`)
+  - approves its advertised subnets and exit node in Headscale. Apply updates upstream's Headscale config for
   Headscale 0.29+ (removed `randomize_client_port`, moved `ephemeral_node_inactivity_timeout`). Headplane needs
   Headscale running: its health check is Headscale's, and Traefik doesn't route to an unhealthy container.
   Headplane is at `https://headplane.<domain>/admin/`. Sign in with the Headscale API key that Apply creates on the
@@ -503,6 +511,8 @@ later.
   or create a new one with **Post-install helpers → 9** (`--helper headscale-key`).
   Headscale itself has **no web page**: `https://headscale.<domain>` is its API for Tailscale clients and Headplane,
   and its root page is blank by design. Dashboards show it without a link.
+- **Switching back** to `tailscale` needs a Tailscale.com auth key again (Secrets) and a fresh login (move
+  `<data>/tailscale/tailscaled.state` aside).
 - **Running both:** the Tailscale container and Headscale are different things, so both can run. The Tailscale
   container is a node (subnet router and exit node) and Headscale is a control server. With
   `TAILSCALE_CONTROL=headscale` the container joins your Headscale tailnet. With `tailscale` it joins Tailscale's
@@ -962,7 +972,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 91 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 92 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
