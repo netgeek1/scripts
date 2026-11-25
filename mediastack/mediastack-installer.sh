@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.1.4"
+readonly SCRIPT_VERSION="3.1.5"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -122,9 +122,9 @@ SECRET_KEYS=( VPN_USERNAME VPN_PASSWORD PLEX_CLAIM CLOUDFLARE_DNS_API_TOKEN EMAI
               HEADPLANE_COOKIE_SECRET SONARR_API_TOKEN RADARR_API_TOKEN LIDARR_API_TOKEN READARR_API_TOKEN
               WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD SECRET_ENCRYPTION_KEY
               TLS_KEY_PASSPHRASE UPDATER_PROTONVPN_PASSWORD CROWDSEC_BOUNCER_KEY AUTHENTIK_BOOTSTRAP_PASSWORD
-              STATUSBOARD_GLUETUN_KEY CROWDSEC_STATUSBOARD_PASSWORD HOMARR_API_KEY )
+              STATUSBOARD_GLUETUN_KEY CROWDSEC_STATUSBOARD_PASSWORD HOMARR_API_KEY HEADSCALE_API_KEY )
 # Vault entries that are not .env variables
-SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE HOMARR_API_KEY )
+SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE HOMARR_API_KEY HEADSCALE_API_KEY )
 SECRET_PROMPTED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY EMAIL_PASSWORD PLEX_CLAIM )
 SECRET_WIREGUARD=( WIREGUARD_PRIVATE_KEY )   # WIREGUARD_PRESHARED_KEY is optional: taken from wg0.conf only
 SECRET_REQUIRED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY )   # compose :?err
@@ -3502,6 +3502,7 @@ stack_apply() {
     statusboard_wire
     sync_heimdall
     sync_homarr
+    headscale_ensure_api_key
     log_info "URLs, ports and DNS names: menu L, or sudo $MS_INSTALL_BIN --urls"
     if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ ! "$(tls_ensure_live)" =~ ^(yes|n/a)$ ]]; then
         log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem yet; check: sudo $MS_INSTALL_BIN --cert-show"
@@ -5240,7 +5241,7 @@ dash_entries() {
     for g in "${HOMEPAGE_GROUPS[@]}"; do
         grp=${g%%|*}; [[ "$grp" == Infrastructure ]] && continue
         for s in ${g#*|}; do
-            [[ -n "${F_NM[$s]+x}" ]] || continue
+            [[ -n "${F_NM[$s]+x}" ]] && ! no_webui "$s" || continue
             port=$(env_get "$envf" "WEBUI_PORT_$(tr 'a-z-' 'A-Z_' <<<"$s")" 2>/dev/null || true)
             lan=""; [[ "$port" =~ ^[0-9]+$ ]] && lan="http://$ip:$port$(web_path "$s")"
             href=$lan
@@ -5390,6 +5391,78 @@ sync_homarr() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# HEADSCALE API KEY (Headplane sign-in). Headscale shows a key only when it is created, so it is kept in the vault.
+# -----------------------------------------------------------------------------
+HEADSCALE_KEY_EXPIRY=365d
+
+# headscale_wait SECONDS -- until Headscale answers its CLI
+headscale_wait() {
+    local i
+    for (( i = 0; i < $1; i += 3 )); do
+        docker exec headscale headscale apikeys list >/dev/null 2>&1 && return 0
+        sleep 3
+    done
+    return 1
+}
+
+# headscale_new_api_key -- creates a key and stores it in the vault (prints nothing); rc 1 if Headscale can't
+headscale_new_api_key() {
+    local out k
+    out=$(docker exec headscale headscale apikeys create --expiration "$HEADSCALE_KEY_EXPIRY" 2>/dev/null) || return 1
+    k=$(printf '%s\n' "$out" | awk 'NF {l = $NF} END {print l}')
+    [[ "$k" =~ ^[A-Za-z0-9._-]{20,}$ ]] || return 1
+    SECRETS[HEADSCALE_API_KEY]=$k; save_secrets
+    _log_file INFO "Headscale API key created (expires in $HEADSCALE_KEY_EXPIRY); stored in the vault"
+}
+
+headplane_url() {
+    if svc_enabled traefik; then printf 'https://headplane.%s/admin/' "$(tls_zone)"
+    else printf 'http://%s:%s/admin/' "$(eff_local_ip)" "$(env_get "$FOLDER_FOR_YAML/.env" WEBUI_PORT_HEADPLANE 2>/dev/null)"; fi
+}
+
+headscale_show_api_key() {   # terminal only; never written to a log
+    printf '\n  %sHeadscale API key%s (sign in to Headplane at %s):\n\n    %s\n\n' "$B" "$NC" "$(headplane_url)" \
+        "${SECRETS[HEADSCALE_API_KEY]}"
+    _log_file AUDIT "Headscale API key shown on screen"
+}
+
+# Apply: a first key for a new Headscale, shown once on the terminal (later: Post-install helpers -> 9)
+headscale_ensure_api_key() {
+    svc_enabled headscale || return 0
+    (( DRY_RUN )) && return 0
+    secret_is_set HEADSCALE_API_KEY && return 0
+    if ! headscale_wait 60; then
+        log_warn "Headscale is not answering yet; create the Headplane API key later: Post-install helpers -> 9"
+        return 0
+    fi
+    if ! headscale_new_api_key; then
+        log_warn "Headscale did not create an API key; try Post-install helpers -> 9"
+        return 0
+    fi
+    log_ok "Headscale API key created for Headplane (stored in the vault; valid $HEADSCALE_KEY_EXPIRY)"
+    if is_tty && [[ -t 1 ]]; then headscale_show_api_key
+    else log_info "Show it with Post-install helpers -> 9 (sudo $MS_INSTALL_BIN --helper headscale-key)"; fi
+}
+
+# Post-install helper: show the stored key, or create a new one
+helper_headscale_key() {
+    require_config; resolve_runtime; load_secrets
+    svc_enabled headscale || die "Headscale is not enabled (Settings -> Services)."
+    is_tty || die "This helper is interactive (it shows the key on the screen)."
+    headscale_wait 30 || die "Headscale is not answering (sudo docker logs --tail 30 headscale)."
+    if secret_is_set HEADSCALE_API_KEY; then
+        headscale_show_api_key
+        log_info "Keys Headscale knows (prefix, expiry):"
+        docker exec headscale headscale apikeys list 2>/dev/null | sed 's/^/    /' || true
+        confirm "Create a new key? (the one above stays valid until it expires or you expire it)" n || return 0
+    fi
+    headscale_new_api_key || die "Headscale did not create an API key (sudo docker logs --tail 30 headscale)."
+    log_ok "New Headscale API key stored in the vault (valid $HEADSCALE_KEY_EXPIRY)"
+    headscale_show_api_key
+    log_info "Expire an old key: sudo docker exec headscale headscale apikeys expire --prefix <prefix>"
+}
+
 helper_homarr_key() {
     require_config; resolve_runtime; load_secrets
     is_tty || die "This helper is interactive."
@@ -5441,6 +5514,8 @@ compose_service_facts() {
 # web_path SERVICE -> path of the web UI, for the LAN URL and the HTTPS hostname. Upstream's Traefik routers for
 # these only match that path (plex: PathPrefix /web/; traefik: /api and /dashboard; headplane: /admin/), so the bare
 # hostname is a 404.
+# no_webui SERVICE -- runs a web server but has no page for people (Headscale's / is deliberately blank: API + clients)
+no_webui() { [[ "$1" == headscale ]]; }
 web_path() { case "$1" in plex) printf '/web/' ;; traefik) printf '/dashboard/' ;; headplane) printf '/admin/' ;; esac; }
 # https_urls SERVICE "HOST..." -> "https://HOST/path ..." for each hostname
 https_urls() { local h out=""; for h in $2; do out+="${out:+ }https://$h$(web_path "$1")"; done; printf '%s' "$out"; }
@@ -5461,6 +5536,7 @@ show_urls() {
         note=""
         [[ "$nm" == service:gluetun ]] && note="via VPN"
         (( sso )) && note+="${note:+, }Authentik login"
+        no_webui "$name" && note+="${note:+, }no web page (API for clients/Headplane)"
         if [[ "$port" =~ ^[0-9]+$ ]]; then
             claimed[$port]=1
             url="http://$ip:$port$(web_path "$name")"
@@ -5533,7 +5609,7 @@ declare -A HOMEPAGE_DESC=( [statusboard]="Tailscale, VPN and CrowdSec status" [j
     [seerr]="Requests" [tdarr]="Transcoding" [qbittorrent]="Torrent client (via VPN)" [sabnzbd]="Usenet client (via VPN)"
     [sonarr]="TV shows" [radarr]="Movies" [lidarr]="Music" [readarr]="Books" [whisparr]="Adult" [mylar]="Comics"
     [bazarr]="Subtitles" [prowlarr]="Indexers" [filebot]="File renaming" [authentik]="Single sign-on"
-    [traefik]="Reverse proxy" [crowdsec]="Intrusion prevention" [headscale]="Tailnet control server"
+    [traefik]="Reverse proxy" [crowdsec]="Intrusion prevention" [headscale]="Tailnet control server (no web page; manage it in Headplane)"
     [headplane]="Headscale admin" [tailscale]="Tailnet exit node" [gluetun]="VPN for the download apps"
     [portainer]="Docker admin" [grafana]="Dashboards" [prometheus]="Metrics" [guacamole]="Remote desktop gateway"
     [homarr]="Dashboard" [heimdall]="Dashboard" [chromium]="Browser in a container" [ddns-updater]="Dynamic DNS"
@@ -5573,7 +5649,8 @@ render_homepage_services() {
         for s in $members; do
             [[ -n "${seen[$s]:-}" ]] && continue; seen[$s]=1
             href=""
-            if svc_enabled traefik && [[ -n "${F_HOSTS[$s]}" ]]; then href=$(https_urls "$s" "${F_HOSTS[$s]%% *}")
+            if no_webui "$s"; then :
+            elif svc_enabled traefik && [[ -n "${F_HOSTS[$s]}" ]]; then href=$(https_urls "$s" "${F_HOSTS[$s]%% *}")
             else
                 port=$(env_get "$envf" "WEBUI_PORT_$(tr 'a-z-' 'A-Z_' <<<"$s")" 2>/dev/null || true)
                 [[ "$port" =~ ^[0-9]+$ ]] && href="http://$ip:$port$(web_path "$s")"
@@ -6598,6 +6675,8 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "Authentik blueprint + patch"       '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; b=$(render_authentik_blueprint); [[ "$b" == *"mode: forward_domain"* && "$b" == *"cookie_domain: certifiedgeeks.net"* && "$b" == *"external_host: https://auth.certifiedgeeks.net"* && "$b" == *"authentik_host: https://auth.certifiedgeeks.net/"* && "$b" == *"managed: goauthentik.io/outposts/embedded"* ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ $(grep -c "/blueprints/mediastack:ro" <<<"$o") -ge 1 && "$o" == *"AUTHENTIK_BOOTSTRAP_PASSWORD=\${AUTHENTIK_BOOTSTRAP_PASSWORD:?err}"* ]] )'
     st "Homepage services from compose"   '( st_prep internet jellyfin tailscale core; FOLDER_FOR_YAML="$t/hp"; mkdir -p "$t/hp"; printf "WEBUI_PORT_SONARR=8989\nWEBUI_PORT_JELLYFIN=8096\n" >"$t/hp/.env"; CFG[LOCAL_DOCKER_IP]=10.0.0.5; SECRETS[SONARR_API_TOKEN]=abc; f=$(printf "%s\n" "sonarr|service:gluetun|sonarr.x.org|1|" "jellyfin|service:gluetun|jellyfin.x.org|1|" "postgresql|||0|5432/tcp" "zeta|||0|"); y=$(render_homepage_services "$f"); [[ "$y" == *"- Media:"*"- Jellyfin:"*"href: https://jellyfin.x.org"* && "$y" == *"- Sonarr:"*"url: http://gluetun:8989"*"{{HOMEPAGE_VAR_SONARR_API_TOKEN}}"* && "$y" == *"- Infrastructure:"*"- PostgreSQL:"*"icon: postgres.png"* && "$y" == *"- Other:"*"- Zeta:"* && "$y" != *"PostgreSQL:"*"href:"*"- Other"* ]] && svc_enabled traefik )'
     st "SABnzbd host_whitelist edit"       '( f="$t/sab.ini"; printf "[misc]\nhost_whitelist = 9f2c1a, \nport = 8080\n[servers]\nhost_whitelist = x\n" >"$f"; ini_whitelist_add "$f" sabnzbd.example.org && grep -qx "host_whitelist = 9f2c1a, sabnzbd.example.org" "$f" && grep -qx "host_whitelist = x" "$f" && ! ini_whitelist_add "$f" SABnzbd.example.org && printf "[misc]\nhost_whitelist = \n" >"$f" && ini_whitelist_add "$f" a.b && grep -qx "host_whitelist = a.b" "$f" )'
+    st "Headscale API key: create + parse" '( docker() { [[ "$*" == *"apikeys create --expiration 365d"* ]] && printf "hskey-api-AbCd1234-0123456789abcdefghijKLMN\n"; }; save_secrets() { :; }; unset "SECRETS[HEADSCALE_API_KEY]"; headscale_new_api_key && [[ "${SECRETS[HEADSCALE_API_KEY]}" == hskey-api-AbCd1234-0123456789abcdefghijKLMN ]] && docker() { printf "Error: no\n"; return 1; } && ! headscale_new_api_key )'
+    st "Headscale: no web page links"      '( no_webui headscale && ! no_webui headplane && f="headscale|service:x|headscale.x.org||" && o=$(F() { render_homepage_services "$f"; }; F) && awk "/- Headscale:/{f=1;next} /^    - /{f=0} f" <<<"$o" | grep -q "description:" && ! awk "/- Headscale:/{f=1;next} /^    - /{f=0} f" <<<"$o" | grep -q "href:" )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
@@ -6646,7 +6725,7 @@ menu_helpers() {
     printf '  3) Reset Authentik akadmin password\n  4) Show *ARR API keys (optionally store in vault)\n'
     printf '  5) Update Gluetun VPN server list now\n  6) VPN check (Gluetun health, errors, WireGuard handshake)\n'
     printf '  7) Traefik check (router errors, config files, served certificate)\n'
-    printf '  8) Homarr: store API key and add the apps\n  0) Back\n'
+    printf '  8) Homarr: store API key and add the apps\n  9) Headscale: show / create the API key (Headplane sign-in)\n  0) Back\n'
     local ch; read -rp "  Choice: " ch || return 0
     case "$ch" in
         1) menu_action helper_authentik_db ;;
@@ -6657,6 +6736,7 @@ menu_helpers() {
         6) menu_action vpn_check ;;
         7) menu_action traefik_check ;;
         8) menu_action helper_homarr_key ;;
+        9) menu_action helper_headscale_key ;;
     esac
 }
 
@@ -6748,7 +6828,7 @@ Actions (default: interactive menu)
   --cert-receive         Push receiver: read chain + key on stdin (run by the forced SSH command)
   --process-requests     Apply status board change requests (run by the mediastack-requests.path unit)
   --helper NAME          authentik-db | guacamole | akadmin | apikeys | vpn-servers | vpn-check | traefik-check
-                         | homarr-key
+                         | homarr-key | headscale-key
   --settings             Settings menu (paths, network, storage, services, ...)
   --test-storage T       Trial-mount MEDIA or DATA share; check write + hardlinks
   --secrets              Secrets menu
@@ -6887,7 +6967,8 @@ main() {
                 vpn-check)    vpn_check ;;
                 traefik-check) traefik_check ;;
                 homarr-key)   helper_homarr_key ;;
-                *)            die "Unknown helper '$helper' (authentik-db|guacamole|akadmin|apikeys|vpn-servers|vpn-check|traefik-check|homarr-key)" ;;
+                headscale-key) helper_headscale_key ;;
+                *)            die "Unknown helper '$helper' (authentik-db|guacamole|akadmin|apikeys|vpn-servers|vpn-check|traefik-check|homarr-key|headscale-key)" ;;
             esac ;;
     esac
     _log_file INFO "Finished action=$action"
