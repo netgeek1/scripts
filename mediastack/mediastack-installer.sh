@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.1.6"
+readonly SCRIPT_VERSION="3.1.7"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -3425,7 +3425,7 @@ stop_excluded_containers() {
 }
 
 verify_services() {   # verify_services TIMEOUT_SECONDS -- wait (visibly) until every enabled service runs
-    local timeout=${1:-180} waited=0 s st msg tty=0 settled
+    local timeout=${1:-240} waited=0 s st msg tty=0 settled
     local -a svcs bad
     local -A state
     [[ -t 1 ]] && tty=1
@@ -3497,9 +3497,10 @@ stack_apply() {
         diagnose_start_failure
         die "Some containers could not start (causes above). Fix them, then run Apply again."
     fi
-    verify_services 180 || true
+    verify_services 240 || true
     traefik_ensure_middlewares
     ensure_app_hostnames
+    guacamole_ensure_db
     statusboard_wire
     sync_heimdall
     sync_homarr
@@ -3634,23 +3635,51 @@ helper_authentik_db() {
     log_ok "Permissions applied on '$AUTH_DB'"
 }
 
+# pg_names_from_env -- PG_USER / AUTH_DB / GUAC_DB from .env (rc 1 when missing)
+pg_names_from_env() {
+    PG_USER=$(env_get "$FOLDER_FOR_YAML/.env" POSTGRESQL_USERNAME 2>/dev/null || true)
+    AUTH_DB=$(env_get "$FOLDER_FOR_YAML/.env" AUTHENTIK_DATABASE 2>/dev/null || true)
+    GUAC_DB=$(env_get "$FOLDER_FOR_YAML/.env" GUACAMOLE_DATABASE 2>/dev/null || true)
+    [[ -n "$PG_USER" && -n "$GUAC_DB" ]]
+}
+
+# guacamole_ensure_db -- Guacamole needs its own database with its schema loaded ("An error has occurred" otherwise).
+#   Creates the database and/or loads the schema when missing, then restarts Guacamole. Safe to run on every apply.
+guacamole_ensure_db() {
+    svc_enabled guacamole && svc_enabled postgresql || return 0
+    (( DRY_RUN )) && { log_info "[dry-run] would check the Guacamole database"; return 0; }
+    pg_names_from_env || { log_warn "Guacamole: POSTGRESQL_USERNAME / GUACAMOLE_DATABASE missing in .env"; return 0; }
+    wait_postgres 120 >/dev/null || { log_warn "Guacamole: PostgreSQL not ready; database not checked (run Apply again)."; return 0; }
+    local chg=0 schema=0 img
+    if [[ "$(pg_query postgres "SELECT 1 FROM pg_database WHERE datname='$GUAC_DB'" 2>/dev/null)" != 1 ]]; then
+        printf 'CREATE DATABASE "%s";\n' "$GUAC_DB" | pg_sql postgres || { log_warn "Guacamole: could not create database '$GUAC_DB'."; return 0; }
+        log_ok "Guacamole database '$GUAC_DB' created"
+        chg=1
+    fi
+    if [[ "$(pg_query "$GUAC_DB" "SELECT to_regclass('public.guacamole_user') IS NOT NULL" 2>/dev/null)" != t ]]; then
+        img=$(compose_run config --images 2>/dev/null | grep -m1 -E '(^|/)guacamole/guacamole(:|$)' || true)
+        [[ -n "$img" ]] || img=$(docker inspect -f '{{.Config.Image}}' guacamole 2>/dev/null || echo guacamole/guacamole)
+        if ! docker run --rm "$img" /opt/guacamole/bin/initdb.sh --postgresql | pg_sql "$GUAC_DB"; then
+            log_warn "Guacamole: loading the schema into '$GUAC_DB' failed (see $LOG_FILE)."; return 0
+        fi
+        log_ok "Guacamole schema loaded into '$GUAC_DB'"
+        chg=1; schema=1
+    fi
+    (( chg )) || return 0
+    grant_sql "$GUAC_DB" | pg_sql "$GUAC_DB" >/dev/null 2>&1 || true
+    docker restart guacamole >/dev/null 2>&1 || true
+    (( schema )) && log_warn "Guacamole's first login is guacadmin / guacadmin -- sign in and change it now."
+    return 0
+}
+
 helper_guacamole_db() {
     helper_prereq
-    log_step "Create Guacamole database ($GUAC_DB)"
-    wait_postgres || return 1
-    if [[ "$(pg_query postgres "SELECT 1 FROM pg_database WHERE datname='$GUAC_DB'")" == 1 ]]; then
-        log_ok "Database '$GUAC_DB' already exists; nothing to do"; return 0
-    fi
-    if (( DRY_RUN )); then log_info "[dry-run] would create $GUAC_DB, grant, and load schema"; return 0; fi
-    printf 'CREATE DATABASE "%s";\n' "$GUAC_DB" | pg_sql postgres
-    grant_sql "$GUAC_DB" | pg_sql "$GUAC_DB"
-    local img
-    img=$(docker inspect -f '{{.Config.Image}}' guacamole 2>/dev/null || echo guacamole/guacamole)
-    log_info "Loading schema from $img ..."
-    docker run --rm "$img" /opt/guacamole/bin/initdb.sh --postgresql | pg_sql "$GUAC_DB"
-    docker restart guacamole >/dev/null 2>&1 || true
-    log_ok "Guacamole database created and initialised"
-    log_warn "Default Guacamole login is guacadmin / guacadmin -- change it immediately."
+    log_step "Guacamole database ($GUAC_DB)"
+    svc_enabled guacamole || die "Guacamole is not enabled (Settings -> Services)."
+    local before; before=$(pg_query "$GUAC_DB" "SELECT to_regclass('public.guacamole_user') IS NOT NULL" 2>/dev/null || true)
+    guacamole_ensure_db
+    [[ "$before" == t ]] && log_ok "Database '$GUAC_DB' and its schema are already in place; nothing to do"
+    return 0
 }
 
 helper_akadmin() {
@@ -6757,6 +6786,7 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "Headscale API key: create + parse" '( docker() { [[ "$*" == *"apikeys create --expiration 365d"* ]] && printf "hskey-api-AbCd1234-0123456789abcdefghijKLMN\n"; }; save_secrets() { :; }; unset "SECRETS[HEADSCALE_API_KEY]"; headscale_new_api_key && [[ "${SECRETS[HEADSCALE_API_KEY]}" == hskey-api-AbCd1234-0123456789abcdefghijKLMN ]] && docker() { printf "Error: no\n"; return 1; } && ! headscale_new_api_key )'
     st "Headscale: no web page links"      '( no_webui headscale && ! no_webui headplane && f="headscale|service:x|headscale.x.org||" && o=$(F() { render_homepage_services "$f"; }; F) && awk "/- Headscale:/{f=1;next} /^    - /{f=0} f" <<<"$o" | grep -q "description:" && ! awk "/- Headscale:/{f=1;next} /^    - /{f=0} f" <<<"$o" | grep -q "href:" )'
     st "Headscale join: key, state, routes" '( st_prep internet jellyfin headscale core; FOLDER_FOR_DATA=$t/hj; FOLDER_FOR_YAML=$t/hj; mkdir -p $t/hj/tailscale; printf "DOCKER_SUBNET=172.28.10.0/24\n" >$t/hj/.env; echo old >$t/hj/tailscale/tailscaled.state; CFG[LOCAL_SUBNET]=192.168.11.0/24; LOG_FILE=/dev/null; SECRETS[TAILSCALE_AUTHKEY]=tskey-auth-old; save_secrets() { :; }; sleep() { :; }; compose_run() { echo "compose $*" >>$t/hj/calls; }; docker() { shift 3; case "$*" in "apikeys list") ;; "users list -o json") [[ -f $t/hj/u ]] && printf "[\n  {\n    \"id\": \"4\",\n    \"name\": \"exit-node\"\n  }\n]\n" || echo "[]" ;; "users create exit-node") touch $t/hj/u ;; "preauthkeys create --user 4 --reusable --expiration 365d") echo hskey-auth-Ab12-xyzxyzxyzxyzxyz ;; "nodes list -o json") echo "[{\"id\":\"9\",\"name\":\"exit-node\",\"online\":true}]" ;; nodes\ approve-routes*) echo "$*" >>$t/hj/calls ;; *) return 1 ;; esac; }; headscale_join_tailscale >/dev/null; [[ "${SECRETS[TAILSCALE_AUTHKEY]}" == hskey-auth-Ab12-xyzxyzxyzxyzxyz && ! -e $t/hj/tailscale/tailscaled.state && $(ls $t/hj/tailscale/tailscaled.state.bak-* | wc -l) == 1 && "$(cat $t/hj/tailscale/.control-server)" == http://headscale:8080 ]] && grep -q "compose up -d --force-recreate tailscale" $t/hj/calls && grep -q "approve-routes --identifier 9 --routes 192.168.11.0/24,172.28.10.0/24,0.0.0.0/0,::/0" $t/hj/calls && : >$t/hj/calls && headscale_join_tailscale >/dev/null && ! grep -q force-recreate $t/hj/calls )'
+    st "Guacamole DB: create + schema once" '( st_prep internet jellyfin tailscale full; FOLDER_FOR_YAML=$t/gq; mkdir -p $t/gq; printf "POSTGRESQL_USERNAME=pg\nAUTHENTIK_DATABASE=ak\nGUACAMOLE_DATABASE=guac\n" >$t/gq/.env; : >$t/gq/calls; wait_postgres() { :; }; compose_run() { echo guacamole/guacamole:1.6.0; }; pg_query() { case "$2" in *pg_database*) [[ -f $t/gq/db ]] && echo 1 ;; *to_regclass*) [[ -f $t/gq/schema ]] && echo t || echo f ;; esac; }; pg_sql() { local q; q=$(cat); case "$q" in *"CREATE DATABASE \"guac\""*) touch $t/gq/db ;; *guacamole_user*) touch $t/gq/schema ;; esac; echo "sql $1" >>$t/gq/calls; }; docker() { case "$1" in run) echo "CREATE TABLE guacamole_user (x int);"; echo "run $*" >>$t/gq/calls ;; restart) echo "restart $2" >>$t/gq/calls ;; esac; }; svc_enabled() { [[ "$1" == guacamole || "$1" == postgresql ]]; }; guacamole_ensure_db >/dev/null 2>&1; [[ -f $t/gq/db && -f $t/gq/schema ]] && grep -q "run run --rm guacamole/guacamole:1.6.0 /opt/guacamole/bin/initdb.sh --postgresql" $t/gq/calls && grep -q "restart guacamole" $t/gq/calls && : >$t/gq/calls && guacamole_ensure_db >/dev/null 2>&1 && [[ ! -s $t/gq/calls ]] && rm $t/gq/schema && guacamole_ensure_db >/dev/null 2>&1 && grep -q initdb $t/gq/calls && ! grep -q "CREATE" $t/gq/calls )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
@@ -6801,7 +6831,7 @@ menu_action() {
 
 menu_helpers() {
     printf '\n  %sPost-install helpers%s\n' "$B" "$NC"
-    printf '  1) Secure Authentik database (grants)\n  2) Create Guacamole database + schema\n'
+    printf '  1) Secure Authentik database (grants)\n  2) Guacamole database + schema (Apply also does this)\n'
     printf '  3) Reset Authentik akadmin password\n  4) Show *ARR API keys (optionally store in vault)\n'
     printf '  5) Update Gluetun VPN server list now\n  6) VPN check (Gluetun health, errors, WireGuard handshake)\n'
     printf '  7) Traefik check (router errors, config files, served certificate)\n'
