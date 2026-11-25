@@ -519,7 +519,9 @@ endpoint (IP, port, public key) from another config of the same provider.
   shares Gluetun's network, so Apply turns on qBittorrent's "Bypass authentication for clients on localhost"
   (`WebUI\LocalHostAuth=false`). Other apps that share Gluetun's network can then reach qBittorrent's Web UI
   without a login.
-- The forwarded port shows on the status board's Gluetun tab, and in `docker logs gluetun`.
+- The forwarded port shows on the status board's Gluetun tab, with whether qBittorrent took it, and in
+  `docker logs gluetun`. The hook returns to Gluetun at once and works in the background (Gluetun can't report the
+  port while its hook runs); its last result is in `<data>/gluetun/mediastack-pf-qbittorrent.status`.
 
 ---
 
