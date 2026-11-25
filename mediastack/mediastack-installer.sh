@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.1.5"
+readonly SCRIPT_VERSION="3.1.6"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1506,10 +1506,12 @@ EOF
             fi
             ;;
         tailscale)
-            printf '    # Tailscale: official control server (TAILSCALE_CONTROL=tailscale) / LocalAPI socket for the status board\n'
+            printf '    # Tailscale: control server (TAILSCALE_CONTROL; Headscale over the stack network) / LocalAPI socket for the status board\n'
             printf '    environment:\n'
             if [[ "${CFG[TAILSCALE_CONTROL]}" == tailscale ]]; then
                 printf '      - TS_EXTRA_ARGS=--hostname=exit-node --advertise-exit-node --advertise-routes=${LOCAL_SUBNET:?err},${DOCKER_SUBNET:?err}\n'
+            else
+                printf '      - TS_EXTRA_ARGS=--hostname=exit-node --advertise-exit-node --advertise-routes=${LOCAL_SUBNET:?err},${DOCKER_SUBNET:?err} --login-server=%s\n' "$HEADSCALE_INTERNAL_URL"
             fi
             if svc_enabled statusboard; then
                 printf '      - TS_SOCKET=/var/run/tailscale/tailscaled.sock\n'
@@ -1535,8 +1537,7 @@ active_patches() {   # upstream services this installer modifies
     if grep -qE '^  crowdsec:[[:space:]]*$' "$compose" && ! is_removed crowdsec; then echo crowdsec; fi
     if grep -qE '^  gluetun:[[:space:]]*$' "$compose" && ! is_removed gluetun \
         && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint || svc_enabled statusboard; }; then echo gluetun; fi
-    if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale \
-        && { [[ "${CFG[TAILSCALE_CONTROL]}" == tailscale ]] || svc_enabled statusboard; }; then echo tailscale; fi
+    if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale; then echo tailscale; fi
     return 0
 }
 
@@ -3503,6 +3504,7 @@ stack_apply() {
     sync_heimdall
     sync_homarr
     headscale_ensure_api_key
+    headscale_join_tailscale
     log_info "URLs, ports and DNS names: menu L, or sudo $MS_INSTALL_BIN --urls"
     if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ ! "$(tls_ensure_live)" =~ ^(yes|n/a)$ ]]; then
         log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem yet; check: sudo $MS_INSTALL_BIN --cert-show"
@@ -5463,6 +5465,83 @@ helper_headscale_key() {
     log_info "Expire an old key: sudo docker exec headscale headscale apikeys expire --prefix <prefix>"
 }
 
+# -----------------------------------------------------------------------------
+# HEADSCALE <- TAILSCALE CONTAINER (TAILSCALE_CONTROL=headscale)
+#   key    : a reusable pre-auth key for user HEADSCALE_TS_USER (a Tailscale.com key can't log in to Headscale)
+#   state  : the container's saved login is tied to one control server; it is set aside when that changes
+#   routes : the advertised subnets + exit node are approved in Headscale
+# -----------------------------------------------------------------------------
+HEADSCALE_TS_USER=exit-node
+HEADSCALE_INTERNAL_URL=http://headscale:8080
+
+hs() { docker exec headscale headscale "$@"; }
+
+# json_ids_by_field JSON FIELD VALUE -> "id" of every top-level object whose FIELD is VALUE, one per line
+#   (Headscale's -o json: an array of objects, "id" first, ids as strings; nested objects never start a line)
+json_ids_by_field() {
+    tr -d '\n' <<<"$1" | sed -E 's/^[[:space:]]*\[//; s/\}[[:space:]]*,[[:space:]]*\{[[:space:]]*"id"/}\n{"id"/g' \
+        | grep -E "\"$2\":[[:space:]]*\"$3\"" | sed -nE 's/^[[:space:]]*\{[[:space:]]*"id":[[:space:]]*"?([0-9]+)"?.*/\1/p'
+}
+json_id_by_field() { json_ids_by_field "$@" | head -n1; }
+
+headscale_ts_user_id() {
+    local id
+    id=$(json_id_by_field "$(hs users list -o json 2>/dev/null)" name "$HEADSCALE_TS_USER")
+    if [[ -z "$id" ]]; then
+        hs users create "$HEADSCALE_TS_USER" >/dev/null 2>&1 || return 1
+        id=$(json_id_by_field "$(hs users list -o json 2>/dev/null)" name "$HEADSCALE_TS_USER")
+    fi
+    [[ "$id" =~ ^[0-9]+$ ]] && printf '%s' "$id"
+}
+
+headscale_join_tailscale() {
+    [[ "${CFG[TAILSCALE_CONTROL]}" == headscale ]] && svc_enabled headscale && svc_enabled tailscale || return 0
+    (( DRY_RUN )) && return 0
+    local uid out k marker="$FOLDER_FOR_DATA/tailscale/.control-server" tsstate="$FOLDER_FOR_DATA/tailscale/tailscaled.state"
+    local recreate=0 i nid
+    headscale_wait 60 || { log_warn "Headscale is not answering; the Tailscale container can't join it yet (run Apply again)."; return 0; }
+    if [[ "${SECRETS[TAILSCALE_AUTHKEY]:-}" != hskey-auth-* ]]; then
+        uid=$(headscale_ts_user_id) || { log_warn "Headscale: could not create user '$HEADSCALE_TS_USER'."; return 0; }
+        out=$(hs preauthkeys create --user "$uid" --reusable --expiration 365d 2>/dev/null) || {
+            log_warn "Headscale did not create a pre-auth key for the Tailscale container."; return 0; }
+        k=$(printf '%s\n' "$out" | awk 'NF {l = $NF} END {print l}')
+        [[ "$k" == hskey-auth-* ]] || { log_warn "Headscale returned an unexpected pre-auth key; not stored."; return 0; }
+        SECRETS[TAILSCALE_AUTHKEY]=$k; save_secrets
+        [[ "${CFG[SECRETS_MODE]}" == vault ]] || env_set "$FOLDER_FOR_YAML/.env" TAILSCALE_AUTHKEY "$k"
+        log_ok "Headscale pre-auth key for the Tailscale container stored (user $HEADSCALE_TS_USER, reusable, 365 days)"
+        recreate=1
+    fi
+    if [[ "$(cat "$marker" 2>/dev/null)" != "$HEADSCALE_INTERNAL_URL" ]]; then
+        if [[ -s "$tsstate" ]]; then
+            compose_run stop tailscale >/dev/null 2>&1 || true
+            mv -f "$tsstate" "$tsstate.bak-$(date +%Y%m%d%H%M%S)"
+            log_ok "Tailscale container: previous login (other control server) set aside; it logs in to Headscale"
+        fi
+        printf '%s\n' "$HEADSCALE_INTERNAL_URL" >"$marker"
+        recreate=1
+    fi
+    if (( recreate )); then
+        compose_run up -d --force-recreate tailscale >>"$LOG_FILE" 2>&1 || { log_warn "Could not recreate the Tailscale container."; return 0; }
+    fi
+    # approve the advertised routes + exit node (idempotent)
+    for (( i = 0; i < 60; i += 3 )); do
+        out=$(hs nodes list -o json 2>/dev/null)
+        nid=$(json_ids_by_field "$(tr -d '\n' <<<"$out" | sed -E 's/\}[[:space:]]*,[[:space:]]*\{[[:space:]]*"id"/}\n{"id"/g' | grep -E '"online":[[:space:]]*true' | paste -sd, -)" name exit-node | tail -n1)
+        [[ -n "$nid" ]] && break
+        sleep 3
+    done
+    if [[ -z "$nid" ]]; then
+        log_warn "The Tailscale container has not registered with Headscale yet (sudo docker logs --tail 30 tailscale)."
+        return 0
+    fi
+    local routes; routes="$(eff_local_subnet),$(env_get "$FOLDER_FOR_YAML/.env" DOCKER_SUBNET),0.0.0.0/0,::/0"
+    if hs nodes approve-routes --identifier "$nid" --routes "$routes" >/dev/null 2>&1; then
+        log_ok "Tailscale container is node $nid in Headscale; routes and exit node approved ($routes)"
+    else
+        log_warn "Headscale: approve the routes of node $nid in Headplane (Machines -> exit-node)."
+    fi
+}
+
 helper_homarr_key() {
     require_config; resolve_runtime; load_secrets
     is_tty || die "This helper is interactive."
@@ -6580,7 +6659,7 @@ FIX
     st "dependency problems detected"      '( st_prep internet jellyfin tailscale core; CFG[SERVICE_PRESET]=custom; set_svc_state gluetun disabled; set_svc_state crowdsec disabled; set_svc_state postgresql removed; d=$(check_dependencies); grep -qx "jellyfin needs gluetun" <<<"$d" && grep -qx "traefik needs crowdsec" <<<"$d" && grep -qx "authentik needs postgresql" <<<"$d" )'
     st "homarr patch: homarr-labs + !override" '( st_prep internet jellyfin tailscale full; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"image: ghcr.io/homarr-labs/homarr:latest"* && "$o" == *"volumes: !override"* && "$o" == *"SECRET_ENCRYPTION_KEY=\${SECRET_ENCRYPTION_KEY:?err}"* ]] )'
     st "disabled + patched -> one block"   '( st_prep internet jellyfin tailscale core; CFG[SERVICE_PRESET]=custom; set_svc_state homarr disabled; o=$(render_override "$t/y/docker-compose.yaml"); [[ $(grep -c "^  homarr:" <<<"$o") == 1 ]] && [[ "$(awk "/^  homarr:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o")" == *profiles* ]] )'
-    st "tailscale patch follows control"   '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"TS_EXTRA_ARGS=--hostname=exit-node --advertise-exit-node"* && "$o" != *login-server* ]] && st_prep internet jellyfin headscale core && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *TS_EXTRA_ARGS* ]] )'
+    st "tailscale patch follows control"   '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"TS_EXTRA_ARGS=--hostname=exit-node --advertise-exit-node"* && "$o" != *login-server* ]] && st_prep internet jellyfin headscale core && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"--login-server=http://headscale:8080"* ]] )'
     st "certs-dumper auto-off unless LE"   '( st_prep internet jellyfin tailscale core selfsigned; [[ $(svc_state traefik-certs-dumper) == on && $(eff_state traefik-certs-dumper) == disabled ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$(awk "/^  traefik-certs-dumper:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o")" == *profiles* ]] )'
     st "secrets needed follow services"    '( st_prep lan jellyfin tailscale core selfsigned; ! secret_needed CLOUDFLARE_DNS_API_TOKEN && secret_needed TAILSCALE_AUTHKEY && secret_needed VPN_PASSWORD && ! secret_needed PLEX_CLAIM && st_prep internet plex tailscale core letsencrypt && secret_needed CLOUDFLARE_DNS_API_TOKEN && secret_needed PLEX_CLAIM )'
     st "traefik static: ACME removed"      '( DRY_RUN=0; traefik_static_no_acme "$t/data/traefik/traefik.yaml"; f="$t/data/traefik/traefik.yaml"; ! grep -q "certResolver\|certificatesResolvers\|domains:\|acme" "$f" && grep -q "^experimental:" "$f" && grep -q "options: default" "$f" && grep -q "^  metrics:" "$f" )'
@@ -6677,6 +6756,7 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "SABnzbd host_whitelist edit"       '( f="$t/sab.ini"; printf "[misc]\nhost_whitelist = 9f2c1a, \nport = 8080\n[servers]\nhost_whitelist = x\n" >"$f"; ini_whitelist_add "$f" sabnzbd.example.org && grep -qx "host_whitelist = 9f2c1a, sabnzbd.example.org" "$f" && grep -qx "host_whitelist = x" "$f" && ! ini_whitelist_add "$f" SABnzbd.example.org && printf "[misc]\nhost_whitelist = \n" >"$f" && ini_whitelist_add "$f" a.b && grep -qx "host_whitelist = a.b" "$f" )'
     st "Headscale API key: create + parse" '( docker() { [[ "$*" == *"apikeys create --expiration 365d"* ]] && printf "hskey-api-AbCd1234-0123456789abcdefghijKLMN\n"; }; save_secrets() { :; }; unset "SECRETS[HEADSCALE_API_KEY]"; headscale_new_api_key && [[ "${SECRETS[HEADSCALE_API_KEY]}" == hskey-api-AbCd1234-0123456789abcdefghijKLMN ]] && docker() { printf "Error: no\n"; return 1; } && ! headscale_new_api_key )'
     st "Headscale: no web page links"      '( no_webui headscale && ! no_webui headplane && f="headscale|service:x|headscale.x.org||" && o=$(F() { render_homepage_services "$f"; }; F) && awk "/- Headscale:/{f=1;next} /^    - /{f=0} f" <<<"$o" | grep -q "description:" && ! awk "/- Headscale:/{f=1;next} /^    - /{f=0} f" <<<"$o" | grep -q "href:" )'
+    st "Headscale join: key, state, routes" '( st_prep internet jellyfin headscale core; FOLDER_FOR_DATA=$t/hj; FOLDER_FOR_YAML=$t/hj; mkdir -p $t/hj/tailscale; printf "DOCKER_SUBNET=172.28.10.0/24\n" >$t/hj/.env; echo old >$t/hj/tailscale/tailscaled.state; CFG[LOCAL_SUBNET]=192.168.11.0/24; LOG_FILE=/dev/null; SECRETS[TAILSCALE_AUTHKEY]=tskey-auth-old; save_secrets() { :; }; sleep() { :; }; compose_run() { echo "compose $*" >>$t/hj/calls; }; docker() { shift 3; case "$*" in "apikeys list") ;; "users list -o json") [[ -f $t/hj/u ]] && printf "[\n  {\n    \"id\": \"4\",\n    \"name\": \"exit-node\"\n  }\n]\n" || echo "[]" ;; "users create exit-node") touch $t/hj/u ;; "preauthkeys create --user 4 --reusable --expiration 365d") echo hskey-auth-Ab12-xyzxyzxyzxyzxyz ;; "nodes list -o json") echo "[{\"id\":\"9\",\"name\":\"exit-node\",\"online\":true}]" ;; nodes\ approve-routes*) echo "$*" >>$t/hj/calls ;; *) return 1 ;; esac; }; headscale_join_tailscale >/dev/null; [[ "${SECRETS[TAILSCALE_AUTHKEY]}" == hskey-auth-Ab12-xyzxyzxyzxyzxyz && ! -e $t/hj/tailscale/tailscaled.state && $(ls $t/hj/tailscale/tailscaled.state.bak-* | wc -l) == 1 && "$(cat $t/hj/tailscale/.control-server)" == http://headscale:8080 ]] && grep -q "compose up -d --force-recreate tailscale" $t/hj/calls && grep -q "approve-routes --identifier 9 --routes 192.168.11.0/24,172.28.10.0/24,0.0.0.0/0,::/0" $t/hj/calls && : >$t/hj/calls && headscale_join_tailscale >/dev/null && ! grep -q force-recreate $t/hj/calls )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
