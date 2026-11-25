@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.1.2"
+readonly SCRIPT_VERSION="3.1.3"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -5415,8 +5415,9 @@ compose_service_facts() {
 }
 
 # web_path SERVICE -> path of the web UI, for the LAN URL and the HTTPS hostname. Upstream's Traefik routers for
-# these only match that path (plex: PathPrefix /web/; traefik: /api and /dashboard), so the bare hostname is a 404.
-web_path() { case "$1" in plex) printf '/web/' ;; traefik) printf '/dashboard/' ;; esac; }
+# these only match that path (plex: PathPrefix /web/; traefik: /api and /dashboard; headplane: /admin/), so the bare
+# hostname is a 404.
+web_path() { case "$1" in plex) printf '/web/' ;; traefik) printf '/dashboard/' ;; headplane) printf '/admin/' ;; esac; }
 # https_urls SERVICE "HOST..." -> "https://HOST/path ..." for each hostname
 https_urls() { local h out=""; for h in $2; do out+="${out:+ }https://$h$(web_path "$1")"; done; printf '%s' "$out"; }
 
@@ -6573,7 +6574,7 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "Authentik blueprint + patch"       '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; b=$(render_authentik_blueprint); [[ "$b" == *"mode: forward_domain"* && "$b" == *"cookie_domain: certifiedgeeks.net"* && "$b" == *"external_host: https://auth.certifiedgeeks.net"* && "$b" == *"authentik_host: https://auth.certifiedgeeks.net/"* && "$b" == *"managed: goauthentik.io/outposts/embedded"* ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ $(grep -c "/blueprints/mediastack:ro" <<<"$o") -ge 1 && "$o" == *"AUTHENTIK_BOOTSTRAP_PASSWORD=\${AUTHENTIK_BOOTSTRAP_PASSWORD:?err}"* ]] )'
     st "Homepage services from compose"   '( st_prep internet jellyfin tailscale core; FOLDER_FOR_YAML="$t/hp"; mkdir -p "$t/hp"; printf "WEBUI_PORT_SONARR=8989\nWEBUI_PORT_JELLYFIN=8096\n" >"$t/hp/.env"; CFG[LOCAL_DOCKER_IP]=10.0.0.5; SECRETS[SONARR_API_TOKEN]=abc; f=$(printf "%s\n" "sonarr|service:gluetun|sonarr.x.org|1|" "jellyfin|service:gluetun|jellyfin.x.org|1|" "postgresql|||0|5432/tcp" "zeta|||0|"); y=$(render_homepage_services "$f"); [[ "$y" == *"- Media:"*"- Jellyfin:"*"href: https://jellyfin.x.org"* && "$y" == *"- Sonarr:"*"url: http://gluetun:8989"*"{{HOMEPAGE_VAR_SONARR_API_TOKEN}}"* && "$y" == *"- Infrastructure:"*"- PostgreSQL:"*"icon: postgres.png"* && "$y" == *"- Other:"*"- Zeta:"* && "$y" != *"PostgreSQL:"*"href:"*"- Other"* ]] && svc_enabled traefik )'
     st "SABnzbd host_whitelist edit"       '( f="$t/sab.ini"; printf "[misc]\nhost_whitelist = 9f2c1a, \nport = 8080\n[servers]\nhost_whitelist = x\n" >"$f"; ini_whitelist_add "$f" sabnzbd.example.org && grep -qx "host_whitelist = 9f2c1a, sabnzbd.example.org" "$f" && grep -qx "host_whitelist = x" "$f" && ! ini_whitelist_add "$f" SABnzbd.example.org && printf "[misc]\nhost_whitelist = \n" >"$f" && ini_whitelist_add "$f" a.b && grep -qx "host_whitelist = a.b" "$f" )'
-    st "web UI paths (Plex, Traefik)"      '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
+    st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
     st "DDNS settings and config"          '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; CFG[DDNS_PROVIDER]=cloudflare; CFG[DDNS_RECORDS]="certifiedgeeks.net,*.certifiedgeeks.net"; CFG[DDNS_CF_ZONE_ID]=0123456789abcdef0123456789abcdef; j=$(ddns_config_json); [[ "$j" == "{\"settings\":[{\"provider\":\"cloudflare\",\"zone_identifier\":\"0123456789abcdef0123456789abcdef\",\"domain\":\"certifiedgeeks.net\""* && "$j" == *"\"domain\":\"*.certifiedgeeks.net\""* && "$j" == *"\"token\":\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\""* ]] && { ! command -v python3 >/dev/null || python3 -c "import json,sys; json.loads(sys.argv[1].replace(\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\",\"t\"))" "$j"; } && ddns_records_in_zone "certifiedgeeks.net,*.certifiedgeeks.net,a.certifiedgeeks.net" && ! ddns_records_in_zone "evil.org" && v_ddns_records "*.x.org,y.org" && ! v_ddns_records "a b" && apply_preset && st_on ddns-updater && o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"- '"'"'CONFIG={\"settings\""* ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
