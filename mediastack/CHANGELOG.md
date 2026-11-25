@@ -3,6 +3,13 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.1.3 — 2026-11-25 — Headplane link fix
+
+### Fixed
+- **Headplane 404 from Homepage.** Upstream's Traefik router for Headplane only matches `/admin/`, so links to
+  `https://headplane.<domain>` hit no route. Headplane links (Homepage, Homarr, Heimdall, the URL view, LAN port)
+  now go to `/admin/`.
+
 ## v3.1.2 — 2026-11-25 — Homarr sync fix
 
 ### Fixed
