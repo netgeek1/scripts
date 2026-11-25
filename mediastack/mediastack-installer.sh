@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.3.2"
+readonly SCRIPT_VERSION="3.3.3"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1168,7 +1168,7 @@ render_env() {
     # so they stay blank here and the override sets WIREGUARD_ENDPOINT_IP/PORT instead.
     env_set "$envf" VPN_ENDPOINT_IP ""
     env_set "$envf" VPN_ENDPOINT_PORT ""
-    env_set "$envf" WIREGUARD_PUBLIC_KEY "${CFG[WIREGUARD_PUBLIC_KEY]:-}"
+    env_set "$envf" WIREGUARD_PUBLIC_KEY "$(vpn_wg_pubkey_env)"     # a listed provider brings each server's own key
     v=$(wg_addresses_usable "${CFG[WIREGUARD_ADDRESSES]:-}")
     [[ -n "$v" ]] && env_set "$envf" WIREGUARD_ADDRESSES "$v"
     if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom && "${CFG[VPN_TYPE]}" == openvpn ]]; then
@@ -2384,8 +2384,8 @@ vpn_offer_provider_switch() {
     confirm "Switch the provider from custom to protonvpn?" y || return 0
     CFG[VPN_SERVICE_PROVIDER]=protonvpn
     CFG[VPN_PORT_FORWARDING_PROVIDER]=""
-    vpn_normalize
-    log_ok "Provider: protonvpn (private key and address kept; the server endpoint is now chosen by Gluetun)"
+    log_ok "Provider: protonvpn (private key and address kept; Gluetun now picks the server. Your wg0.conf server stays"
+    log_ok "stored: choosing provider custom again connects to it without a new import)"
 }
 
 # vpn_pf_status_line -- status screen: the forwarded port Gluetun holds now, and whether qBittorrent took it
@@ -2468,7 +2468,9 @@ vpn_line_hints() {
     local l=${1,,}
     [[ "$l" =~ auth_failed|auth.*fail|authentication\ fail|wrong\ (username|password) ]] && \
         echo "The VPN rejected the username/password. Many providers use separate OpenVPN/service credentials (e.g. NordVPN 'service credentials', Surfshark 'manual setup'); set them in the Secrets menu."
-    if [[ "$l" =~ target\ ip\ address\ not\ found|endpoint\ ip\ is\ not\ set ]]; then
+    if [[ "$l" =~ endpoint\ ip\ is\ not\ set ]] && [[ "${CFG[VPN_SERVICE_PROVIDER]:-}" == custom ]]; then
+        echo "Provider 'custom' + WireGuard needs your server's endpoint and public key: import your wg0.conf (Settings -> 8), or switch to your provider's name (e.g. protonvpn) to let Gluetun pick servers."
+    elif [[ "$l" =~ target\ ip\ address\ not\ found|endpoint\ ip\ is\ not\ set ]]; then
         echo "A fixed server endpoint (VPN_ENDPOINT_IP/PORT) only works with provider 'custom'. For a listed provider it must be blank (Apply blanks it now); choose servers with SERVER_COUNTRIES/CITIES/HOSTNAMES."
     elif [[ "$l" =~ provider\ custom.*(country|region|city|hostname).*not\ valid ]]; then
         echo "Provider 'custom' has no server list, so server filters (countries/cities/hostnames/regions) must be blank. Apply now leaves them out for 'custom'."
@@ -2496,11 +2498,11 @@ vpn_line_hints() {
     return 0
 }
 
-# vpn_normalize -- endpoint/public key only apply to provider 'custom'
-vpn_normalize() {
-    [[ "${CFG[VPN_SERVICE_PROVIDER]:-}" == custom ]] && return 0
-    CFG[VPN_ENDPOINT_IP]=""; CFG[VPN_ENDPOINT_PORT]=""; CFG[WIREGUARD_PUBLIC_KEY]=""
-}
+# vpn_normalize -- the server endpoint and public key from a wg0.conf only apply to provider 'custom'. They stay
+# stored for every provider, so switching back to custom works without importing the wg0.conf again; Apply passes
+# them to Gluetun only for custom (vpn_custom_wg_endpoint, render_env).
+vpn_normalize() { return 0; }
+vpn_wg_pubkey_env() { [[ "${CFG[VPN_SERVICE_PROVIDER]:-}" == custom ]] && printf '%s' "${CFG[WIREGUARD_PUBLIC_KEY]:-}"; return 0; }
 # wg_addresses_usable LIST -> the IPv4 entries (all entries when there is no IPv4 one)
 wg_addresses_usable() {
     local a out="" x
@@ -7340,12 +7342,12 @@ FIX
     st "hostnames menu: fresh menu session" '( st_prep internet both tailscale core; CFG[FOLDER_FOR_YAML]=$t/hz; FOLDER_FOR_YAML=""; printf "WEBUI_PORT_SONARR=8989\n" >$t/hz/.env; detect_network() { :; }; ask() { printf -v "$1" "%s" ""; }; o=$(cfg_urls 2>&1); [[ "$o" == *"Hostnames (."* && "$o" == *" sonarr "* && "$o" == *8989* && "$o" != *"Install first"* ]] )'
     st "port forwarding: gluetun patch"     '( st_prep internet jellyfin tailscale core; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=protonvpn; CFG[VPN_PORT_FORWARDING]=on; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"VPN_PORT_FORWARDING=on"* && "$o" == *"PORT_FORWARD_ONLY=on"* && "$o" == *"VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh /gluetun/mediastack-pf-qbittorrent.sh up {{PORT}} {{VPN_INTERFACE}} \${WEBUI_PORT_QBITTORRENT:?err}"* && "$o" != *"VPN_PORT_FORWARDING_PROVIDER=protonvpn"* ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[VPN_ENDPOINT_IP]=203.0.113.9 && CFG[VPN_PORT_FORWARDING_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"VPN_PORT_FORWARDING_PROVIDER=protonvpn"* && "$o" != *PORT_FORWARD_ONLY* ]] && CFG[VPN_PF_QBITTORRENT]=no && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UP_COMMAND* ]] && CFG[VPN_PORT_FORWARDING]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *"- VPN_PORT_FORWARDING=on"* && "$o" != *UP_COMMAND* ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && CFG[VPN_PORT_FORWARDING]=on && ! vpn_pf_on )'
     st "port forwarding: hook + qbt conf"   '( mkdir -p $t/pf/bin; printf "#!/bin/sh\nfor a; do case \"\$a\" in json=*) printf \"%%s\\\\n\" \"\$a\" >>$t/pf/data;; http*) printf \"%%s\\\\n\" \"\$a\" >>$t/pf/url;; esac; done\nexit 0\n" >$t/pf/bin/wget; chmod +x $t/pf/bin/wget; render_pf_script >$t/pf/s.sh; sh -n $t/pf/s.sh && PATH=$t/pf/bin:$PATH MS_PF_STATUS=$t/pf/st sh $t/pf/s.sh up 45123 wg0 8200 bg >/dev/null && grep -q "^result=ok" $t/pf/st && grep -q "^port=45123" $t/pf/st && grep -qx "json={\"listen_port\":45123,\"current_network_interface\":\"wg0\",\"random_port\":false,\"upnp\":false}" $t/pf/data && grep -qx "http://127.0.0.1:8200/api/v2/app/setPreferences" $t/pf/url && st_prep internet jellyfin tailscale core && CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=protonvpn && CFG[VPN_PORT_FORWARDING]=on && FOLDER_FOR_DATA=$t/pf && mkdir -p $t/pf/qbittorrent/qBittorrent && printf "[BitTorrent]\nSession\\\\Port=1\n\n[Preferences]\nWebUI\\\\Port=8200\nWebUI\\\\LocalHostAuth=true\n" >$t/pf/qbittorrent/qBittorrent/qBittorrent.conf && docker() { :; } && sleep() { :; } && ensure_qbt_localhost >/dev/null && [[ $(grep -c "^WebUI\\\\LocalHostAuth=" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf) == 1 ]] && grep -q "^WebUI\\\\LocalHostAuth=false" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf && grep -q "^Session\\\\Port=1" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf && CFG[WIREGUARD_ADDRESSES]=10.2.0.2/32 && looks_like_proton && CFG[WIREGUARD_ADDRESSES]=10.64.1.2/32 && ! looks_like_proton && v_wgpub "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=" && ! v_wgpub "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgy=" )'
-    st "custom ProtonVPN -> protonvpn offer" '( st_prep internet jellyfin tailscale core; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[WIREGUARD_ADDRESSES]=10.2.0.2/32; CFG[VPN_ENDPOINT_IP]=203.0.113.9; CFG[VPN_ENDPOINT_PORT]=51820; CFG[WIREGUARD_PUBLIC_KEY]=bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=; is_tty() { return 0; }; ASSUME_YES=0; confirm() { return 0; }; vpn_offer_provider_switch >/dev/null; [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -z "${CFG[VPN_ENDPOINT_IP]}" && "${CFG[WIREGUARD_ADDRESSES]}" == 10.2.0.2/32 ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[WIREGUARD_ADDRESSES]=10.64.0.2/32 && vpn_offer_provider_switch >/dev/null && [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]] )'
+    st "custom ProtonVPN -> protonvpn offer" '( st_prep internet jellyfin tailscale core; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[WIREGUARD_ADDRESSES]=10.2.0.2/32; CFG[VPN_ENDPOINT_IP]=203.0.113.9; CFG[VPN_ENDPOINT_PORT]=51820; CFG[WIREGUARD_PUBLIC_KEY]=bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=; is_tty() { return 0; }; ASSUME_YES=0; confirm() { return 0; }; vpn_offer_provider_switch >/dev/null; [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && "${CFG[VPN_ENDPOINT_IP]}" == 203.0.113.9 && "${CFG[WIREGUARD_ADDRESSES]}" == 10.2.0.2/32 ]] && ! vpn_custom_wg_endpoint && [[ -z "$(vpn_wg_pubkey_env)" ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *WIREGUARD_ENDPOINT_IP* ]] && CFG[VPN_SERVICE_PROVIDER]=custom && vpn_custom_wg_endpoint && [[ "$(vpn_wg_pubkey_env)" == bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo= ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"WIREGUARD_ENDPOINT_IP=203.0.113.9"* ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[WIREGUARD_ADDRESSES]=10.64.0.2/32 && vpn_offer_provider_switch >/dev/null && [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]] )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
     st "DDNS settings and config"          '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; CFG[DDNS_PROVIDER]=cloudflare; CFG[DDNS_RECORDS]="certifiedgeeks.net,*.certifiedgeeks.net"; CFG[DDNS_CF_ZONE_ID]=0123456789abcdef0123456789abcdef; j=$(ddns_config_json); [[ "$j" == "{\"settings\":[{\"provider\":\"cloudflare\",\"zone_identifier\":\"0123456789abcdef0123456789abcdef\",\"domain\":\"certifiedgeeks.net\""* && "$j" == *"\"domain\":\"*.certifiedgeeks.net\""* && "$j" == *"\"token\":\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\""* ]] && { ! command -v python3 >/dev/null || python3 -c "import json,sys; json.loads(sys.argv[1].replace(\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\",\"t\"))" "$j"; } && ddns_records_in_zone "certifiedgeeks.net,*.certifiedgeeks.net,a.certifiedgeeks.net" && ! ddns_records_in_zone "evil.org" && v_ddns_records "*.x.org,y.org" && ! v_ddns_records "a b" && apply_preset && st_on ddns-updater && o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"- '"'"'CONFIG={\"settings\""* ]] )'
-    st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
+    st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ "${CFG[VPN_ENDPOINT_IP]}" == 1.2.3.4 && -z "$(vpn_wg_pubkey_env)" ]] && CFG[VPN_SERVICE_PROVIDER]=custom && [[ "$(vpn_wg_pubkey_env)" == x ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[VPN_TYPE]=wireguard && h=$(vpn_line_hints "ERROR VPN settings: provider settings: server selection: Wireguard server selection settings: endpoint IP is not set") && [[ "$h" == *"import your wg0.conf"* ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && h=$(vpn_line_hints "ERROR ... endpoint IP is not set") && [[ "$h" == *"must be blank"* ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* && "$o" != *UPDATER_PROTONVPN* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
     st "--set validation"                   'validate_key CERT_MODE selfsigned && ! validate_key CERT_MODE self && validate_key ACCESS_MODE lan && ! validate_key DATA_STORAGE smb && validate_key MEDIA_REMOTE "//nas/media" && validate_key BACKUP_KEEP 7 && ! validate_key BACKUP_KEEP x && ! validate_key NOPE 1 && ! validate_key DOMAIN "a b"'
