@@ -3,6 +3,22 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.1.6 — 2026-11-25 — Tailscale container joins Headscale
+
+### Added
+- **With `TAILSCALE_CONTROL=headscale`, Apply joins the Tailscale container to Headscale:**
+  - creates the Headscale user `exit-node` and a reusable pre-auth key (365 days), stored as `TAILSCALE_AUTHKEY`
+    when the stored key isn't a Headscale key (`hskey-auth-…`)
+  - sets aside a saved login that belongs to another control server (`tailscaled.state.bak-<time>`) and recreates
+    the container
+  - approves its subnets (LAN, Docker) and exit node (`headscale nodes approve-routes`).
+- The container reaches Headscale over the stack network (`--login-server=http://headscale:8080`) instead of
+  `https://headscale.<domain>`, so it doesn't need public or local DNS for that name.
+
+### Changed
+- The Tailscale patch is always applied (it now also carries the Headscale login server).
+- Self-test: 92 checks.
+
 ## v3.1.5 — 2026-11-25 — Headscale API key, no-link tile
 
 ### Added
