@@ -3,6 +3,19 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.6.0 — 2026-11-24 — URLs, ports and DNS view
+
+### Added
+- **Menu L / `--urls`:** every enabled service's LAN URL (`http://<host-ip>:<WEBUI_PORT_*>`, with `/web` for Plex) and
+  HTTPS hostname(s), read from the effective `docker compose config` (Traefik `Host()` rules). It notes "via VPN"
+  (runs in Gluetun's network) and "Authentik login" (forward-auth middleware).
+- The other published ports (VPN proxy, torrent, Plex discovery, databases, metrics), each named after the `.env`
+  variable that sets it.
+- The DNS records to create: one wildcard `*.<domain>` for LAN DNS and, in `internet` mode, public DNS plus the
+  HTTPS port forward.
+- The full install's summary shows this view instead of its fixed 15-app list, and Apply points to it.
+- Self-test: 80 checks.
+
 ## v2.5.10 — 2026-11-24
 
 ### Fixed
