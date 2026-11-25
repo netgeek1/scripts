@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.8.0"
+readonly SCRIPT_VERSION="2.9.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1370,6 +1370,17 @@ render_patch() {   # render_patch NAME -> body that changes an upstream service
       - SECRET_ENCRYPTION_KEY=${SECRET_ENCRYPTION_KEY:?err}
 EOF
             ;;
+        homepage)
+            cat <<'EOF'
+    # Homepage: reachable by IP:port too, and API keys for the widgets (from the vault; blank when not stored)
+    environment:
+      - HOMEPAGE_ALLOWED_HOSTS=homepage,homepage.${CLOUDFLARE_DNS_ZONE:?err},${CLOUDFLARE_DNS_ZONE:?err},localhost,localhost:${WEBUI_PORT_HOMEPAGE:?err},${LOCAL_DOCKER_IP:?err},${LOCAL_DOCKER_IP:?err}:${WEBUI_PORT_HOMEPAGE:?err}
+      - HOMEPAGE_VAR_SONARR_API_TOKEN=${SONARR_API_TOKEN:-}
+      - HOMEPAGE_VAR_RADARR_API_TOKEN=${RADARR_API_TOKEN:-}
+      - HOMEPAGE_VAR_LIDARR_API_TOKEN=${LIDARR_API_TOKEN:-}
+      - HOMEPAGE_VAR_READARR_API_TOKEN=${READARR_API_TOKEN:-}
+EOF
+            ;;
         authentik|authentic-worker)
             cat <<'EOF'
     # Authentik: first-start admin password (akadmin) and the installer's blueprint (forward auth for the domain)
@@ -1418,7 +1429,7 @@ active_patches() {   # upstream services this installer modifies
     [[ -f "$compose" ]] || return 0
     if grep -qE '^  homarr:[[:space:]]*$' "$compose" && ! is_removed homarr; then echo homarr; fi
     local a
-    for a in authentik authentic-worker; do
+    for a in homepage authentik authentic-worker; do
         if grep -qE "^  ${a}:[[:space:]]*\$" "$compose" && ! is_removed "$a"; then echo "$a"; fi
     done
     if grep -qE '^  crowdsec:[[:space:]]*$' "$compose" && ! is_removed crowdsec; then echo crowdsec; fi
@@ -3300,6 +3311,7 @@ stack_apply() {
     ensure_folders
     copy_app_configs
     ensure_tls
+    write_homepage_config
     cert_units
     report_dependencies die
     log_step "Starting MediaStack ($mode)"
@@ -4283,6 +4295,117 @@ show_urls() {
     return 0
 }
 
+# -----------------------------------------------------------------------------
+# HOMEPAGE: services.yaml / docker.yaml generated from the enabled services
+#   Files carrying HOMEPAGE_MARKER are rewritten on every apply; Homepage's own first-start samples are replaced
+#   (kept once as *.orig); any other file is yours and left alone.
+# -----------------------------------------------------------------------------
+readonly HOMEPAGE_MARKER="# managed-by: mediastack-installer (delete this line to manage this file yourself)"
+HOMEPAGE_GROUPS=( "Media|jellyfin plex audiobookshelf seerr tdarr"
+                  "Downloads|qbittorrent sabnzbd"
+                  "Library|sonarr radarr lidarr readarr whisparr mylar bazarr prowlarr filebot"
+                  "Access & security|authentik traefik crowdsec headscale headplane tailscale gluetun"
+                  "Tools|portainer grafana prometheus guacamole homarr heimdall chromium ddns-updater"
+                  "Infrastructure|flaresolverr unpackerr postgresql valkey guacd authentic-worker tdarr-node" )
+declare -A HOMEPAGE_DESC=( [jellyfin]="Media server" [plex]="Media server" [audiobookshelf]="Audiobooks and podcasts"
+    [seerr]="Requests" [tdarr]="Transcoding" [qbittorrent]="Torrent client (via VPN)" [sabnzbd]="Usenet client (via VPN)"
+    [sonarr]="TV shows" [radarr]="Movies" [lidarr]="Music" [readarr]="Books" [whisparr]="Adult" [mylar]="Comics"
+    [bazarr]="Subtitles" [prowlarr]="Indexers" [filebot]="File renaming" [authentik]="Single sign-on"
+    [traefik]="Reverse proxy" [crowdsec]="Intrusion prevention" [headscale]="Tailnet control server"
+    [headplane]="Headscale admin" [tailscale]="Tailnet exit node" [gluetun]="VPN for the download apps"
+    [portainer]="Docker admin" [grafana]="Dashboards" [prometheus]="Metrics" [guacamole]="Remote desktop gateway"
+    [homarr]="Dashboard" [heimdall]="Dashboard" [chromium]="Browser in a container" [ddns-updater]="Dynamic DNS"
+    [flaresolverr]="Cloudflare solver for Prowlarr" [unpackerr]="Archive extraction" [postgresql]="Database"
+    [valkey]="Cache" [guacd]="Guacamole daemon" [authentic-worker]="Authentik worker" [tdarr-node]="Transcode node" )
+declare -A HOMEPAGE_ICON=( [seerr]="jellyseerr.png" [headplane]="headscale.png" [postgresql]="postgres.png"
+    [valkey]="redis.png" [authentic-worker]="authentik.png" [tdarr-node]="tdarr.png" [guacd]="guacamole.png"
+    [ddns-updater]="ddns-updater.png" )
+# API widgets: service -> "widget type|internal port|vault token"
+declare -A HOMEPAGE_WIDGET=( [sonarr]="sonarr|8989|SONARR_API_TOKEN" [radarr]="radarr|7878|RADARR_API_TOKEN"
+    [lidarr]="lidarr|8686|LIDARR_API_TOKEN" [readarr]="readarr|8787|READARR_API_TOKEN" )
+
+homepage_container() { case "$1" in authentic-worker) echo authentik-worker ;; *) echo "$1" ;; esac; }   # upstream container_name
+homepage_title() { local s=$1; case "$s" in qbittorrent) echo qBittorrent ;; sabnzbd) echo SABnzbd ;; ddns-updater) echo "DDNS Updater" ;;
+    authentic-worker) echo "Authentik worker" ;; tdarr-node) echo "Tdarr node" ;; postgresql) echo PostgreSQL ;;
+    crowdsec) echo CrowdSec ;; *) echo "${s^}" ;; esac; }
+
+# render_homepage_services FACTS -> services.yaml content
+render_homepage_services() {
+    local facts=$1 envf="$FOLDER_FOR_YAML/.env" ip g grp members s line nm hosts href port w wt wp wk host
+    local -A F_NM=() F_HOSTS=() seen=()
+    ip=$(eff_local_ip)
+    while IFS='|' read -r s nm hosts _ _; do [[ -n "$s" ]] && { F_NM[$s]=$nm; F_HOSTS[$s]=$hosts; }; done <<<"$facts"
+    printf '%s\n# Generated from the enabled services on every apply.\n' "$HOMEPAGE_MARKER"
+    local -a groups=("${HOMEPAGE_GROUPS[@]}") other=()
+    for s in "${!F_NM[@]}"; do
+        local found=0
+        for g in "${HOMEPAGE_GROUPS[@]}"; do in_list "$s" ${g#*|} && { found=1; break; }; done
+        (( found )) || [[ "$s" == homepage || "$s" == traefik-certs-dumper ]] || other+=("$s")
+    done
+    (( ${#other[@]} )) && groups+=("Other|$(printf '%s\n' "${other[@]}" | sort | xargs)")
+    for g in "${groups[@]}"; do
+        grp=${g%%|*}; members=""
+        for s in ${g#*|}; do [[ -n "${F_NM[$s]+x}" ]] && members+=" $s"; done
+        [[ -n "$members" ]] || continue
+        printf -- '- %s:\n' "$grp"
+        for s in $members; do
+            [[ -n "${seen[$s]:-}" ]] && continue; seen[$s]=1
+            href=""
+            if svc_enabled traefik && [[ -n "${F_HOSTS[$s]}" ]]; then href="https://${F_HOSTS[$s]%% *}"
+            else
+                port=$(env_get "$envf" "WEBUI_PORT_$(tr 'a-z-' 'A-Z_' <<<"$s")" 2>/dev/null || true)
+                [[ "$port" =~ ^[0-9]+$ ]] && href="http://$ip:$port$(web_path "$s")"
+            fi
+            printf '    - %s:\n' "$(homepage_title "$s")"
+            printf '        icon: %s\n' "${HOMEPAGE_ICON[$s]:-$s.png}"
+            [[ -n "$href" ]] && printf '        href: %s\n' "$href"
+            printf '        description: %s\n' "${HOMEPAGE_DESC[$s]:-$s}"
+            printf '        server: local\n        container: %s\n' "$(homepage_container "$s")"
+            w=${HOMEPAGE_WIDGET[$s]:-}
+            if [[ -n "$w" ]] && secret_is_set "${w##*|}"; then
+                IFS='|' read -r wt wp wk <<<"$w"
+                host=$s; [[ "${F_NM[$s]}" == service:gluetun ]] && host=gluetun
+                printf '        widget:\n          type: %s\n          url: http://%s:%s\n          key: "{{HOMEPAGE_VAR_%s}}"\n' "$wt" "$host" "$wp" "$wk"
+            fi
+        done
+    done
+}
+
+render_homepage_docker() { printf '%s\nlocal:\n  socket: /var/run/docker.sock\n' "$HOMEPAGE_MARKER"; }
+
+# homepage_put NAME CONTENT -- write unless the file is the user's own
+homepage_put() {
+    local f="$FOLDER_FOR_DATA/homepage/$1" content=$2 tmp
+    if [[ -f "$f" ]] && ! grep -qF "$HOMEPAGE_MARKER" "$f"; then
+        # Homepage's first-start samples: "My First Group" services, comment-only docker.yaml
+        if grep -q "My First Group" "$f" 2>/dev/null || ! grep -qvE '^[[:space:]]*(#.*)?$|^---' "$f" 2>/dev/null; then
+            [[ -f "$f.orig" ]] || run cp -p "$f" "$f.orig"
+        else
+            log_info "Homepage $1 is your own (no marker line); left alone."
+            return 0
+        fi
+    fi
+    tmp=$(mktemp); printf '%s\n' "$content" >"$tmp"
+    if ! cmp -s "$tmp" "$f"; then put_file "$tmp" "$f" 644; HOMEPAGE_CHANGED=1; fi
+    rm -f "$tmp"
+}
+
+write_homepage_config() {
+    svc_enabled homepage || return 0
+    [[ -d "$FOLDER_FOR_DATA/homepage" ]] || return 0
+    (( DRY_RUN )) && { log_info "[dry-run] would write Homepage services.yaml/docker.yaml"; return 0; }
+    local yaml facts n
+    yaml=$(compose_run config 2>/dev/null) || { log_warn "Homepage: compose config failed; services.yaml not updated"; return 0; }
+    facts=$(compose_service_facts "$yaml")
+    HOMEPAGE_CHANGED=0
+    homepage_put services.yaml "$(render_homepage_services "$facts")"
+    homepage_put docker.yaml "$(render_homepage_docker)"
+    n=$(grep -c '^    - ' "$FOLDER_FOR_DATA/homepage/services.yaml" 2>/dev/null || echo 0)
+    (( HOMEPAGE_CHANGED )) && log_ok "Homepage: $n services listed (status from Docker; API widgets where the vault has the key)"
+    return 0
+}
+HOMEPAGE_CHANGED=0
+
 print_summary() {
     local ip z; ip=$(eff_local_ip); z=$(tls_zone)
     log_step "Done"
@@ -5232,6 +5355,7 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "Traefik router errors parsed"      '( j="[{\"entryPoints\":[\"secureweb\"],\"service\":\"sonarr\",\"rule\":\"Host(\`sonarr.x\`)\",\"error\":[\"middleware \\\"traefik-bouncer@file\\\" does not exist\"],\"status\":\"disabled\",\"name\":\"sonarr@docker\"},{\"service\":\"api@internal\",\"status\":\"enabled\",\"name\":\"traefik@docker\"}]"; e=$(traefik_router_errors "$j"); [[ "$e" == "sonarr@docker: middleware '"'"'traefik-bouncer@file'"'"' does not exist" ]] )'
     st "CrowdSec bouncer key wiring"      '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"BOUNCER_KEY_traefik=\${CROWDSEC_BOUNCER_KEY:?err}"* ]] && in_list CROWDSEC_BOUNCER_KEY "${SECRET_GENERATED[@]}" && f="$t/dyn.yaml" && printf "x:\n          crowdsecLapiKey: 8andilX0JKYIu8z+R4imPkIgG+TMdCttAuMaHrsV7ZU\n          crowdsecLapiHost: crowdsec:8080\n" >"$f" && sed -i -E "s|^([[:space:]]*crowdsecLapiKey:).*|\\1 abc123|" "$f" && grep -qx "          crowdsecLapiKey: abc123" "$f" && grep -q "crowdsecLapiHost: crowdsec:8080" "$f" )'
     st "Authentik blueprint + patch"       '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; b=$(render_authentik_blueprint); [[ "$b" == *"mode: forward_domain"* && "$b" == *"cookie_domain: certifiedgeeks.net"* && "$b" == *"external_host: https://auth.certifiedgeeks.net"* && "$b" == *"authentik_host: https://auth.certifiedgeeks.net/"* && "$b" == *"managed: goauthentik.io/outposts/embedded"* ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ $(grep -c "/blueprints/mediastack:ro" <<<"$o") -ge 1 && "$o" == *"AUTHENTIK_BOOTSTRAP_PASSWORD=\${AUTHENTIK_BOOTSTRAP_PASSWORD:?err}"* ]] )'
+    st "Homepage services from compose"   '( st_prep internet jellyfin tailscale core; FOLDER_FOR_YAML="$t/hp"; mkdir -p "$t/hp"; printf "WEBUI_PORT_SONARR=8989\nWEBUI_PORT_JELLYFIN=8096\n" >"$t/hp/.env"; CFG[LOCAL_DOCKER_IP]=10.0.0.5; SECRETS[SONARR_API_TOKEN]=abc; f=$(printf "%s\n" "sonarr|service:gluetun|sonarr.x.org|1|" "jellyfin|service:gluetun|jellyfin.x.org|1|" "postgresql|||0|5432/tcp" "zeta|||0|"); y=$(render_homepage_services "$f"); [[ "$y" == *"- Media:"*"- Jellyfin:"*"href: https://jellyfin.x.org"* && "$y" == *"- Sonarr:"*"url: http://gluetun:8989"*"{{HOMEPAGE_VAR_SONARR_API_TOKEN}}"* && "$y" == *"- Infrastructure:"*"- PostgreSQL:"*"icon: postgres.png"* && "$y" == *"- Other:"*"- Zeta:"* && "$y" != *"PostgreSQL:"*"href:"*"- Other"* ]] && svc_enabled traefik )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
