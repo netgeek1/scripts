@@ -3,6 +3,32 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.1.0 — 2026-11-25 — Homarr, Heimdall and Dynamic DNS
+
+### Added
+- **Homarr and Heimdall are filled with your apps** on every Apply (same list and grouping as Homepage, links to
+  `https://<app>.<domain>` or `http://<ip>:<port>`). Both are changed from a throwaway `python:3.13-alpine`
+  container; the host needs no Python, SQLite or curl.
+  - **Heimdall:** pinned, group-coloured tiles written into its database on the home dashboard, marked *Managed by
+    mediastack-installer*; updated every Apply, removed when the service goes off. Your own tiles are untouched.
+  - **Homarr:** apps added to its app library through its API (`[MediaStack]` description prefix, LAN status ping).
+    Needs an API key from Homarr's first-start setup: new helper **8) Homarr: store API key and add the apps**
+    (`--helper homarr-key`), stored in the vault as `HOMARR_API_KEY`.
+- **Dynamic DNS settings** (Settings → **E**): `DDNS_PROVIDER` (`none`/`cloudflare`/`custom`), `DDNS_RECORDS`,
+  `DDNS_CF_ZONE_ID`, `DDNS_TTL`, `DDNS_PROXIED`, `DDNS_IP_VERSION`, `DDNS_CONFIG_FILE`. With Cloudflare the
+  DDNS-Updater config is built into its `CONFIG` variable in the managed override, with the vault's
+  `CLOUDFLARE_DNS_API_TOKEN` filled in by Compose (never written to a file); `custom` copies your own `config.json`.
+  Records are validated (names, all inside the zone). Status shows the records and any problems.
+- **Status board DDNS tab:** provider, records, last update and IP per record (read-only from DDNS-Updater's data),
+  a link to its page, and a record editor that goes through the change-request path (new action `ddns_records`,
+  same validation as Settings, then Apply).
+
+### Changed
+- **Core preset** now includes Homarr, Heimdall and the status board, and DDNS-Updater when `DDNS_PROVIDER` is set.
+- A Core/Full install is brought in step with the preset of the installed version on every Apply (`sync_preset`), so
+  new add-ons and DDNS on/off take effect without re-choosing the preset. Custom selections are never changed.
+- Self-test: 88 checks (DDNS config and validation, presets with the new services).
+
 ## v3.0.0 — 2026-11-24 — Status board
 
 ### Added
