@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.1.7"
+readonly SCRIPT_VERSION="3.2.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -103,7 +103,8 @@ CONF_KEYS=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA FOLDER_FOR_YAML DOMAIN CLOUDFLARE_D
             VPN_CUSTOM_OVPN_FILE VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES
             CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY CERT_PUSH_USER CERT_PUSH_FROM
             SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES VPN_SERVERS_UPDATE_PERIOD VPN_UPDATER_PROTON_EMAIL
-            DDNS_PROVIDER DDNS_RECORDS DDNS_CF_ZONE_ID DDNS_TTL DDNS_PROXIED DDNS_IP_VERSION DDNS_CONFIG_FILE )
+            DDNS_PROVIDER DDNS_RECORDS DDNS_CF_ZONE_ID DDNS_TTL DDNS_PROXIED DDNS_IP_VERSION DDNS_CONFIG_FILE
+            SERVICE_HOSTNAMES SERVICE_PORTS )
 # Settings that did not exist before v2.0.0: an existing config without them keeps its old behaviour
 declare -A CONF_LEGACY=( [ACCESS_MODE]=internet [CERT_MODE]=letsencrypt [SERVICE_PRESET]=custom
                          [TAILSCALE_CONTROL]=headscale [PLAYER]=both )
@@ -418,6 +419,8 @@ set_default_config() {
         [DDNS_PROXIED]="no"
         [DDNS_IP_VERSION]="ipv4"
         [DDNS_CONFIG_FILE]=""
+        [SERVICE_HOSTNAMES]=""
+        [SERVICE_PORTS]=""
     )
 }
 
@@ -1138,6 +1141,7 @@ render_env() {
     done
     env_set "$envf" PUID "$PUID"
     env_set "$envf" PGID "$PGID"
+    (( DRY_RUN )) || render_port_overrides "$envf"
     # status board: DDNS view (MS_ prefix: not upstream keys)
     env_set "$envf" MS_DDNS_PROVIDER "${CFG[DDNS_PROVIDER]:-none}"
     env_set "$envf" MS_DDNS_RECORDS "${CFG[DDNS_RECORDS]}"
@@ -1558,6 +1562,29 @@ render_override() {   # render_override COMPOSEFILE -> stdout
         [[ -n "$s" ]] || continue
         order+=("$s"); blk[$s]="$(render_patch "$s")"$'\n'
     done < <(active_patches "$compose")
+    # hostnames (SERVICE_HOSTNAMES): replace the router rule of add-ons in place, add a label line to upstream services
+    local e rule line excl; excl=" $(excluded_services | xargs) "
+    for e in ${CFG[SERVICE_HOSTNAMES]:-}; do
+        s=${e%%=*}
+        [[ "$excl" == *" $s "* ]] && continue
+        if is_addon "$s"; then
+            [[ -n "${blk[$s]+x}" ]] || continue
+            rule=$(sed -nE "s/^[[:space:]]*- '?traefik\.http\.routers\.$s\.rule=(.*[^'[:space:]])'?[[:space:]]*\$/\1/p" <<<"${blk[$s]}" | head -n1)
+            [[ -n "$rule" ]] || continue
+            line=$(hostname_label_line "$s" "$rule")
+            blk[$s]=$(awk -v r="traefik.http.routers.$s.rule=" -v nl="$line" 'index($0, r) {print nl; next} {print}' <<<"${blk[$s]}")$'\n'
+        else
+            rule=$(router_rule "$compose" "$s")
+            [[ -n "$rule" ]] || { printf '# %s: no Traefik router in docker-compose.yaml; SERVICE_HOSTNAMES ignored\n' "$s"; continue; }
+            line=$(hostname_label_line "$s" "$rule")
+            if [[ -z "${blk[$s]+x}" ]]; then order+=("$s"); blk[$s]=""; fi
+            if [[ "${blk[$s]}" == *$'\n    labels:\n'* || "${blk[$s]}" == "    labels:"$'\n'* ]]; then
+                blk[$s]=$(awk -v nl="$line" '{print} /^    labels:[[:space:]]*$/ && !d {print nl; d = 1}' <<<"${blk[$s]}")$'\n'
+            else
+                blk[$s]+="    labels:"$'\n'"$line"$'\n'
+            fi
+        fi
+    done
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
         if is_addon "$s"; then is_removed "$s" && continue
@@ -1972,7 +1999,7 @@ put_file() {
 # https://auth.<zone> (cookie domain <zone>), the "Authentik" application, and the embedded outpost serving it with
 # the right authentik_host (otherwise it redirects browsers to http://0.0.0.0:9000).
 render_authentik_blueprint() {
-    local z; z=$(tls_zone)
+    local z authhost; z=$(tls_zone); authhost=$(svc_host authentik)
     cat <<EOF
 # Managed by $SCRIPT_NAME -- rewritten on every apply; Authentik re-applies it when it changes.
 version: 1
@@ -1987,7 +2014,7 @@ entries:
       name: Provider for Authentik
     attrs:
       mode: forward_domain
-      external_host: https://auth.${z}
+      external_host: https://${authhost}
       cookie_domain: ${z}
       authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-explicit-consent]]
       authentication_flow: !Find [authentik_flows.flow, [slug, default-authentication-flow]]
@@ -1998,7 +2025,7 @@ entries:
     attrs:
       name: Authentik
       provider: !KeyOf mediastack-provider
-      meta_launch_url: https://auth.${z}
+      meta_launch_url: https://${authhost}
       open_in_new_tab: false
   - model: authentik_outposts.outpost
     identifiers:
@@ -2007,7 +2034,7 @@ entries:
       providers:
         - !KeyOf mediastack-provider
       config:
-        authentik_host: https://auth.${z}/
+        authentik_host: https://${authhost}/
         authentik_host_insecure: false
         authentik_host_browser: ""
 EOF
@@ -2022,7 +2049,7 @@ write_authentik_blueprint() {
     render_authentik_blueprint >"$tmp"
     if ! cmp -s "$tmp" "$d/mediastack-forward-auth.yaml"; then
         put_file "$tmp" "$d/mediastack-forward-auth.yaml" 644
-        log_ok "Authentik blueprint written: forward auth for *.$(tls_zone) via https://auth.$(tls_zone)"
+        log_ok "Authentik blueprint written: forward auth for *.$(tls_zone) via https://$(svc_host authentik)"
     fi
     rm -f "$tmp"
 }
@@ -2049,6 +2076,13 @@ headscale_migrate_config() {
     return 0
 }
 
+# headscale_set_public_url FILE -- Headscale's server_url / Headplane's headscale.public_url follow SERVICE_HOSTNAMES
+headscale_set_public_url() {
+    [[ -f "$1" ]] && ! (( DRY_RUN )) || return 0
+    local u; u="https://$(svc_host headscale)"
+    sed -i -E "s|^(server_url:[[:space:]]*).*|\1$u|; s|^([[:space:]]+public_url:[[:space:]]*).*|\1\"$u\"|" "$1"
+}
+
 copy_app_configs() {
     local m src dst
     for m in "${APP_CONFIG_MAP[@]}"; do
@@ -2056,6 +2090,7 @@ copy_app_configs() {
         [[ -f "$src" ]] || { log_warn "Missing $src"; continue; }
         [[ -d "$(dirname "$dst")" ]] || continue     # folder skipped (service removed)
         [[ "${m%%:*}" == headscale-config.yaml ]] && headscale_migrate_config "$src"
+        [[ "${m%%:*}" == head*-config.yaml ]] && headscale_set_public_url "$src"
         put_file "$src" "$dst" 664
     done
     local acme="$FOLDER_FOR_DATA/traefik/letsencrypt/acme.json"
@@ -2358,15 +2393,16 @@ ini_whitelist_add() {
 ensure_app_hostnames() {
     (( DRY_RUN )) && return 0
     svc_enabled traefik && svc_enabled sabnzbd || return 0
-    local ini="$FOLDER_FOR_DATA/sabnzbd/sabnzbd.ini" h i
-    h="sabnzbd.$(tls_zone)"
+    local ini="$FOLDER_FOR_DATA/sabnzbd/sabnzbd.ini" h i stopped=0
     for (( i = 0; i < 12; i++ )); do [[ -s "$ini" ]] && break; sleep 5; done     # first start creates it
-    [[ -s "$ini" ]] || { log_warn "SABnzbd has not created $ini yet; run Apply again later to allow $h."; return 0; }
-    grep -qiE "^host_whitelist[[:space:]]*=.*(^|[ ,=])${h//./\.}([ ,]|$)" "$ini" && return 0
-    docker stop sabnzbd >/dev/null 2>&1 || true
-    if ini_whitelist_add "$ini" "$h"; then log_ok "SABnzbd: allowed hostname $h (host_whitelist)"
-    else log_warn "SABnzbd: no host_whitelist key in $ini; add $h there (Config -> Special -> host_whitelist)."; fi
-    docker start sabnzbd >/dev/null 2>&1 || true
+    [[ -s "$ini" ]] || { log_warn "SABnzbd has not created $ini yet; run Apply again later to allow $(svc_host sabnzbd)."; return 0; }
+    for h in $(svc_hosts sabnzbd); do
+        grep -qiE "^host_whitelist[[:space:]]*=.*(^|[ ,=])${h//./\.}([ ,]|$)" "$ini" && continue
+        (( stopped )) || { docker stop sabnzbd >/dev/null 2>&1 || true; stopped=1; }
+        if ini_whitelist_add "$ini" "$h"; then log_ok "SABnzbd: allowed hostname $h (host_whitelist)"
+        else log_warn "SABnzbd: no host_whitelist key in $ini; add $h there (Config -> Special -> host_whitelist)."; fi
+    done
+    (( stopped )) && { docker start sabnzbd >/dev/null 2>&1 || true; }
     return 0
 }
 
@@ -3693,7 +3729,7 @@ helper_akadmin() {
     done
     if (( DRY_RUN )); then log_info "[dry-run] would run: docker exec -it $AUTHENTIK_CONTAINER ak changepassword akadmin"; return 0; fi
     docker exec -it "$AUTHENTIK_CONTAINER" ak changepassword akadmin
-    log_ok "akadmin password changed. Log in at https://auth.${CFG[DOMAIN]} or http://$(eff_local_ip):$(env_get "$FOLDER_FOR_YAML/.env" WEBUI_PORT_AUTHENTIK || echo 6080)"
+    log_ok "akadmin password changed. Log in at https://$(svc_host authentik) or http://$(eff_local_ip):$(env_get "$FOLDER_FOR_YAML/.env" WEBUI_PORT_AUTHENTIK || echo 6080)"
 }
 
 helper_apikeys() {
@@ -4342,6 +4378,7 @@ menu_settings() {
         printf '   8) VPN / email        %s / %s\n' "${CFG[VPN_TYPE]}" "${CFG[VPN_SERVICE_PROVIDER]}"
         printf '   9) Upstream / secrets / backups  %s %s mode=%s\n' "${CFG[UPSTREAM_REF]:0:12}" "${CFG[UPSTREAM_VARIANT]}" "${CFG[SECRETS_MODE]}"
         printf '   E) Dynamic DNS        %s%s\n' "${CFG[DDNS_PROVIDER]}" "$([[ -n "${CFG[DDNS_RECORDS]}" && "${CFG[DDNS_PROVIDER]}" == cloudflare ]] && printf ' (%s)' "${CFG[DDNS_RECORDS]}")"
+        printf '   U) Hostnames / ports  %s\n' "$(n=$(( $(wc -w <<<"${CFG[SERVICE_HOSTNAMES]:-}") + $(wc -w <<<"${CFG[SERVICE_PORTS]:-}") )); (( n )) && echo "$n change(s) from the defaults" || echo "defaults")"
         printf '   D) Re-run detection   T) Test share mount   V) View all\n'
         printf '   W) Save   A) Save + apply   0) Back\n'
         read -rp "  Choice: " ch || return 0
@@ -4357,6 +4394,7 @@ menu_settings() {
             8) cfg_vpn_email; dirty=1 ;;
             9) cfg_stack; dirty=1 ;;
             e) cfg_ddns; [[ "${CFG[SERVICE_PRESET]}" == custom ]] || apply_preset; dirty=1 ;;
+            u) cfg_urls; dirty=1 ;;
             d) detect_defaults; dirty=1 ;;
             t) ask w "Test which share (MEDIA/DATA)" MEDIA; w=${w^^}
                [[ "$w" =~ ^(MEDIA|DATA)$ ]] && menu_action storage_test "$w" ;;
@@ -5067,7 +5105,7 @@ statusboard_wire() {
             log_info "Tailscale web interface not enabled yet (Tailscale not logged in?); Apply again later."
         fi
     fi
-    log_info "Status board: https://status.$(tls_zone) (changes) or http://$(eff_local_ip):$(env_get "$FOLDER_FOR_YAML/.env" WEBUI_PORT_STATUSBOARD 2>/dev/null || echo 13380) (read-only)"
+    log_info "Status board: https://$(svc_host statusboard) (changes) or http://$(eff_local_ip):$(env_get "$FOLDER_FOR_YAML/.env" WEBUI_PORT_STATUSBOARD 2>/dev/null || echo 13380) (read-only)"
     return 0
 }
 
@@ -5195,7 +5233,7 @@ ddns_config_json() {
 }
 ddns_ui_url() {
     svc_enabled ddns-updater 2>/dev/null || return 0
-    if svc_enabled traefik 2>/dev/null; then printf 'https://ddns-updater.%s' "$(tls_zone)"
+    if svc_enabled traefik 2>/dev/null; then printf 'https://%s' "$(svc_host ddns-updater)"
     else printf 'http://%s:%s' "$(eff_local_ip)" "$(env_get "$FOLDER_FOR_YAML/.env" WEBUI_PORT_DDNS_UPDATER 2>/dev/null || echo 8310)"; fi
 }
 write_ddns_custom_config() {
@@ -5448,7 +5486,7 @@ headscale_new_api_key() {
 }
 
 headplane_url() {
-    if svc_enabled traefik; then printf 'https://headplane.%s/admin/' "$(tls_zone)"
+    if svc_enabled traefik; then printf 'https://%s/admin/' "$(svc_host headplane)"
     else printf 'http://%s:%s/admin/' "$(eff_local_ip)" "$(env_get "$FOLDER_FOR_YAML/.env" WEBUI_PORT_HEADPLANE 2>/dev/null)"; fi
 }
 
@@ -5574,11 +5612,163 @@ headscale_join_tailscale() {
 helper_homarr_key() {
     require_config; resolve_runtime; load_secrets
     is_tty || die "This helper is interactive."
-    log_info "In Homarr (https://homarr.$(tls_zone)): Management -> Tools -> API -> create an API key, then paste it here."
+    log_info "In Homarr (https://$(svc_host homarr)): Management -> Tools -> API -> create an API key, then paste it here."
     local k; ask_secret k "Homarr API key"
     [[ -n "$k" ]] || die "No key entered."
     SECRETS[HOMARR_API_KEY]=$k; save_secrets
     sync_homarr
+}
+
+# -----------------------------------------------------------------------------
+# SERVICE HOSTNAMES AND LAN PORTS
+#   SERVICE_HOSTNAMES  "svc=name1,name2 ..." -- subdomains under the zone; the first is the main one (links,
+#                      dashboards). Rewrites the service's Traefik router Host(...) in the managed override and
+#                      keeps the rest of the rule (plex /web/, headplane /admin/, traefik /api|/dashboard).
+#   SERVICE_PORTS      "svc=port ..." -- the host port in .env (WEBUI_PORT_<SVC>); removed = upstream default.
+#   Single labels only, so the *.zone wildcard certificate covers every name.
+# -----------------------------------------------------------------------------
+readonly CF_ZONE_REF='${CLOUDFLARE_DNS_ZONE:?err}'
+svc_default_label() { case "$1" in authentik) echo auth ;; statusboard) echo status ;; *) echo "$1" ;; esac; }
+map_get() {   # map_get "k=v k2=v2" KEY -> value (rc 1 when absent)
+    local e; for e in $1; do [[ "${e%%=*}" == "$2" ]] && { printf '%s' "${e#*=}"; return 0; }; done; return 1
+}
+map_set() {   # map_set "k=v ..." KEY VALUE -> map with KEY set (blank VALUE removes it), sorted by key
+    local e; local -a kept=(); for e in $1; do [[ "${e%%=*}" == "$2" ]] || kept+=("$e"); done
+    [[ -n "$3" ]] && kept+=("$2=$3")
+    (( ${#kept[@]} )) && printf '%s\n' "${kept[@]}" | sort | xargs
+    return 0
+}
+svc_labels() { local v; v=$(map_get "${CFG[SERVICE_HOSTNAMES]:-}" "$1") || v=$(svc_default_label "$1"); printf '%s\n' ${v//,/ }; }
+svc_host()   { printf '%s.%s' "$(svc_labels "$1" | head -n1)" "$(tls_zone)"; }
+svc_hosts()  { local l; for l in $(svc_labels "$1"); do printf '%s.%s\n' "$l" "$(tls_zone)"; done; }
+
+v_label()      { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; }
+v_labels()     { local l n=0; local -A seen=(); for l in ${1//,/ }; do v_label "$l" && [[ -z "${seen[$l]:-}" ]] || return 1; seen[$l]=1; n=$((n + 1)); done; (( n > 0 )) && [[ "$1" != *,,* && "$1" != ,* && "$1" != *, ]]; }
+v_port()       { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+v_hostmap() {
+    local e l; local -A used=()
+    for e in $1; do
+        [[ "$e" =~ ^[a-z0-9-]+=[a-z0-9,-]+$ ]] && v_labels "${e#*=}" || return 1
+        for l in $(tr ',' ' ' <<<"${e#*=}"); do [[ -z "${used[$l]:-}" ]] || return 1; used[$l]=1; done
+    done
+    return 0
+}
+v_portmap() { local e; for e in $1; do [[ "$e" =~ ^[a-z0-9-]+=[0-9]+$ ]] && v_port "${e#*=}" || return 1; done; return 0; }
+svc_port_key() { printf 'WEBUI_PORT_%s' "$(tr 'a-z-' 'A-Z_' <<<"$1")"; }
+
+# router_rule COMPOSE SVC -> the rule of router SVC in upstream's file (blank when it has none)
+router_rule() { [[ -f "$1" ]] && sed -nE "s/^[[:space:]]*- traefik\.http\.routers\.$2\.rule=(.*[^[:space:]])[[:space:]]*\$/\1/p" "$1" | head -n1; }
+# hostname_rule SVC RULE -> RULE with its leading Host(`...`) replaced by the service's names
+hostname_rule() {
+    local rule=$2 hosts="" l n=0 rest
+    for l in $(svc_labels "$1"); do hosts+="${hosts:+ || }Host(\`$l.$CF_ZONE_REF\`)"; n=$((n + 1)); done
+    rest=$(sed -E 's/^Host\(`[^`]*`\)//' <<<"$rule")
+    if (( n > 1 )) && [[ -n "$rest" ]]; then printf '(%s)%s' "$hosts" "$rest"; else printf '%s%s' "$hosts" "$rest"; fi
+}
+# hostname_label_line SVC RULE -> the override label line
+hostname_label_line() { printf "      - 'traefik.http.routers.%s.rule=%s'\n" "$1" "$(hostname_rule "$1" "$2")"; }
+
+# render_port_overrides ENVFILE -- WEBUI_PORT_* from SERVICE_PORTS; ports no longer overridden go back to upstream's
+render_port_overrides() {
+    local envf=$1 upenv="$UPSTREAM_DIR/base-working-files/.env" prev e s k v
+    prev=$(env_get "$envf" MS_PORT_OVERRIDES 2>/dev/null || true)
+    for e in $prev; do
+        s=${e%%=*}; map_get "${CFG[SERVICE_PORTS]:-}" "$s" >/dev/null && continue
+        k=$(svc_port_key "$s"); v=$(env_get "$upenv" "$k" 2>/dev/null || true)
+        [[ -n "$v" ]] && env_set "$envf" "$k" "$v" && log_info "LAN port of $s back to upstream's $v"
+    done
+    for e in ${CFG[SERVICE_PORTS]:-}; do
+        k=$(svc_port_key "${e%%=*}")
+        if env_get "$envf" "$k" >/dev/null 2>&1; then env_set "$envf" "$k" "${e#*=}"
+        else log_warn "SERVICE_PORTS: ${e%%=*} has no $k in .env; ignored"; fi
+    done
+    env_set "$envf" MS_PORT_OVERRIDES "${CFG[SERVICE_PORTS]:-}"
+}
+
+# url_services -> "svc|hasrouter|portkey-present" for every enabled service with a hostname or a LAN port, sorted
+url_services() {
+    local compose="$FOLDER_FOR_YAML/docker-compose.yaml" envf="$FOLDER_FOR_YAML/.env" s r p
+    while IFS= read -r s; do
+        [[ -n "$s" ]] && svc_enabled "$s" || continue
+        r=0; p=0
+        if is_addon "$s"; then render_addon "$s" | grep -q "traefik.http.routers.$s.rule=" && r=1
+        else [[ -n "$(router_rule "$compose" "$s")" ]] && r=1; fi
+        env_get "$envf" "$(svc_port_key "$s")" >/dev/null 2>&1 && p=1
+        (( r || p )) && printf '%s|%s|%s\n' "$s" "$r" "$p"
+    done < <(all_services) | sort
+}
+
+hostname_problems() {   # names used by two services
+    local -A owner=(); local row s r l
+    while IFS='|' read -r s r _; do
+        (( r )) || continue
+        for l in $(svc_labels "$s"); do
+            if [[ -n "${owner[$l]:-}" ]]; then printf '%s.%s is used by %s and %s\n' "$l" "$(tls_zone)" "${owner[$l]}" "$s"
+            else owner[$l]=$s; fi
+        done
+    done < <(url_services)
+    return 0
+}
+
+port_in_use_by() {   # port_in_use_by PORT [EXCEPT_KEY] -> the other .env key holding PORT
+    local envf="$FOLDER_FOR_YAML/.env" k
+    for k in $(env_keys "$envf"); do
+        [[ "$k" == *PORT* && "$k" != "${2:-}" ]] || continue
+        [[ "$(env_get "$envf" "$k" 2>/dev/null)" == "$1" ]] && { printf '%s' "$k"; return 0; }
+    done
+    return 1
+}
+
+cfg_urls() {
+    section "Hostnames and LAN ports"
+    [[ -f "$FOLDER_FOR_YAML/.env" ]] || { log_warn "Install first: the service list comes from the installed stack."; return 0; }
+    local envf="$FOLDER_FOR_YAML/.env" z i row s r p pick v k other def
+    z=$(tls_zone)
+    log_info "Hostnames are subdomains of $z (the first one is used in links); ports are the LAN port on $(eff_local_ip)."
+    while :; do
+        local -a rows=(); mapfile -t rows < <(url_services)
+        printf '\n   %3s  %-20s %-44s %s\n' "#" "Service" "Hostnames (.$z)" "LAN port"
+        for i in "${!rows[@]}"; do
+            IFS='|' read -r s r p <<<"${rows[$i]}"
+            printf '   %3d  %-20s %-44s %s\n' $((i + 1)) "$s" \
+                "$( (( r )) && svc_labels "$s" | paste -sd, - || echo -)$(map_get "${CFG[SERVICE_HOSTNAMES]:-}" "$s" >/dev/null && echo ' *')" \
+                "$( (( p )) && env_get "$envf" "$(svc_port_key "$s")" 2>/dev/null || echo -)$(map_get "${CFG[SERVICE_PORTS]:-}" "$s" >/dev/null && echo ' *')"
+        done
+        printf '   (* = changed from the default)\n'
+        ask pick "Service to change (number or name, Enter = done)" ""
+        [[ -n "$pick" ]] || break
+        s=""
+        if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#rows[@]} )); then s=${rows[$((pick - 1))]%%|*}
+        else for row in "${rows[@]}"; do [[ "${row%%|*}" == "$pick" ]] && s=$pick; done; fi
+        [[ -n "$s" ]] || { log_warn "No service '$pick' in the list."; continue; }
+        IFS='|' read -r _ r p <<<"$(printf '%s\n' "${rows[@]}" | grep "^$s|")"
+        if (( r )); then
+            def=$(svc_default_label "$s")
+            while :; do
+                ask v "Hostnames for $s, comma-separated (first = main; '-' = default '$def')" "$(svc_labels "$s" | paste -sd, -)"
+                [[ "$v" == - || "$v" == "$def" ]] && { CFG[SERVICE_HOSTNAMES]=$(map_set "${CFG[SERVICE_HOSTNAMES]:-}" "$s" ""); break; }
+                v_labels "$v" || { log_warn "Use names like tv or tv,sonarr (lowercase letters, digits, '-'; no dots)."; continue; }
+                local old=${CFG[SERVICE_HOSTNAMES]:-}
+                CFG[SERVICE_HOSTNAMES]=$(map_set "$old" "$s" "$v")
+                if [[ -n "$(hostname_problems)" ]]; then log_warn "$(hostname_problems | head -n1)"; CFG[SERVICE_HOSTNAMES]=$old; continue; fi
+                break
+            done
+            [[ "$s" == headscale ]] && log_warn "Changing Headscale's name changes its server_url; devices already joined must log in again."
+        fi
+        if (( p )); then
+            k=$(svc_port_key "$s"); def=$(env_get "$UPSTREAM_DIR/base-working-files/.env" "$k" 2>/dev/null || true)
+            while :; do
+                ask v "LAN port for $s ('-' = default ${def:-upstream})" "$(env_get "$envf" "$k" 2>/dev/null)"
+                [[ "$v" == - || ( -n "$def" && "$v" == "$def" ) ]] && { CFG[SERVICE_PORTS]=$(map_set "${CFG[SERVICE_PORTS]:-}" "$s" ""); break; }
+                v_port "$v" || { log_warn "A port is 1-65535."; continue; }
+                if other=$(port_in_use_by "$v" "$k"); then log_warn "Port $v is already $other."; continue; fi
+                CFG[SERVICE_PORTS]=$(map_set "${CFG[SERVICE_PORTS]:-}" "$s" "$v")
+                break
+            done
+        fi
+        log_ok "$s: $( (( r )) && svc_labels "$s" | paste -sd, - | sed "s/,/.$z, /g; s/\$/.$z/")$( (( p )) && printf ' port %s' "$(map_get "${CFG[SERVICE_PORTS]:-}" "$s" || env_get "$envf" "$k")") (Save + apply to use it)"
+    done
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -6092,6 +6282,8 @@ declare -A CONF_HELP=(
     [DDNS_PROXIED]="cloudflare: yes | no -- route the records through Cloudflare's proxy"
     [DDNS_IP_VERSION]="ipv4 | ipv6 | ipv4 or ipv6"
     [DDNS_CONFIG_FILE]="custom: path of your ddns-updater config.json (any provider it supports)"
+    [SERVICE_HOSTNAMES]="svc=name1,name2 ... -- subdomains per service (first = main), e.g. sonarr=tv,sonarr plex=watch"
+    [SERVICE_PORTS]="svc=port ... -- LAN port per service (WEBUI_PORT_*), e.g. plex=32401"
     [CERT_FETCH_SOURCE]="fetch mode: user@host:/folder holding the certificate files"
     [CERT_FETCH_CERT]="fetch mode: full-chain certificate file name in that folder"
     [CERT_FETCH_KEY]="fetch mode: private key file name in that folder"
@@ -6164,6 +6356,8 @@ validate_key() {   # validate_key KEY VALUE
         DDNS_TTL) [[ "$v" =~ ^[0-9]+$ ]] ;;
         DDNS_PROXIED) v_yesno "$v" ;;
         DDNS_IP_VERSION) [[ "$v" =~ ^(ipv4|ipv6|ipv4\ or\ ipv6)$ ]] ;;
+        SERVICE_HOSTNAMES) [[ -z "$v" ]] || v_hostmap "$v" ;;
+        SERVICE_PORTS)     [[ -z "$v" ]] || v_portmap "$v" ;;
         DDNS_CONFIG_FILE) [[ -z "$v" ]] || v_path "$v" ;;
         VPN_UPDATER_PROTON_EMAIL) [[ -z "$v" || "$v" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ;;
         CLOUDFLARE_EMAIL|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
@@ -6787,6 +6981,26 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "Headscale: no web page links"      '( no_webui headscale && ! no_webui headplane && f="headscale|service:x|headscale.x.org||" && o=$(F() { render_homepage_services "$f"; }; F) && awk "/- Headscale:/{f=1;next} /^    - /{f=0} f" <<<"$o" | grep -q "description:" && ! awk "/- Headscale:/{f=1;next} /^    - /{f=0} f" <<<"$o" | grep -q "href:" )'
     st "Headscale join: key, state, routes" '( st_prep internet jellyfin headscale core; FOLDER_FOR_DATA=$t/hj; FOLDER_FOR_YAML=$t/hj; mkdir -p $t/hj/tailscale; printf "DOCKER_SUBNET=172.28.10.0/24\n" >$t/hj/.env; echo old >$t/hj/tailscale/tailscaled.state; CFG[LOCAL_SUBNET]=192.168.11.0/24; LOG_FILE=/dev/null; SECRETS[TAILSCALE_AUTHKEY]=tskey-auth-old; save_secrets() { :; }; sleep() { :; }; compose_run() { echo "compose $*" >>$t/hj/calls; }; docker() { shift 3; case "$*" in "apikeys list") ;; "users list -o json") [[ -f $t/hj/u ]] && printf "[\n  {\n    \"id\": \"4\",\n    \"name\": \"exit-node\"\n  }\n]\n" || echo "[]" ;; "users create exit-node") touch $t/hj/u ;; "preauthkeys create --user 4 --reusable --expiration 365d") echo hskey-auth-Ab12-xyzxyzxyzxyzxyz ;; "nodes list -o json") echo "[{\"id\":\"9\",\"name\":\"exit-node\",\"online\":true}]" ;; nodes\ approve-routes*) echo "$*" >>$t/hj/calls ;; *) return 1 ;; esac; }; headscale_join_tailscale >/dev/null; [[ "${SECRETS[TAILSCALE_AUTHKEY]}" == hskey-auth-Ab12-xyzxyzxyzxyzxyz && ! -e $t/hj/tailscale/tailscaled.state && $(ls $t/hj/tailscale/tailscaled.state.bak-* | wc -l) == 1 && "$(cat $t/hj/tailscale/.control-server)" == http://headscale:8080 ]] && grep -q "compose up -d --force-recreate tailscale" $t/hj/calls && grep -q "approve-routes --identifier 9 --routes 192.168.11.0/24,172.28.10.0/24,0.0.0.0/0,::/0" $t/hj/calls && : >$t/hj/calls && headscale_join_tailscale >/dev/null && ! grep -q force-recreate $t/hj/calls )'
     st "Guacamole DB: create + schema once" '( st_prep internet jellyfin tailscale full; FOLDER_FOR_YAML=$t/gq; mkdir -p $t/gq; printf "POSTGRESQL_USERNAME=pg\nAUTHENTIK_DATABASE=ak\nGUACAMOLE_DATABASE=guac\n" >$t/gq/.env; : >$t/gq/calls; wait_postgres() { :; }; compose_run() { echo guacamole/guacamole:1.6.0; }; pg_query() { case "$2" in *pg_database*) [[ -f $t/gq/db ]] && echo 1 ;; *to_regclass*) [[ -f $t/gq/schema ]] && echo t || echo f ;; esac; }; pg_sql() { local q; q=$(cat); case "$q" in *"CREATE DATABASE \"guac\""*) touch $t/gq/db ;; *guacamole_user*) touch $t/gq/schema ;; esac; echo "sql $1" >>$t/gq/calls; }; docker() { case "$1" in run) echo "CREATE TABLE guacamole_user (x int);"; echo "run $*" >>$t/gq/calls ;; restart) echo "restart $2" >>$t/gq/calls ;; esac; }; svc_enabled() { [[ "$1" == guacamole || "$1" == postgresql ]]; }; guacamole_ensure_db >/dev/null 2>&1; [[ -f $t/gq/db && -f $t/gq/schema ]] && grep -q "run run --rm guacamole/guacamole:1.6.0 /opt/guacamole/bin/initdb.sh --postgresql" $t/gq/calls && grep -q "restart guacamole" $t/gq/calls && : >$t/gq/calls && guacamole_ensure_db >/dev/null 2>&1 && [[ ! -s $t/gq/calls ]] && rm $t/gq/schema && guacamole_ensure_db >/dev/null 2>&1 && grep -q initdb $t/gq/calls && ! grep -q "CREATE" $t/gq/calls )'
+    st "hostnames: rules keep paths"        '( CFG[SERVICE_HOSTNAMES]="plex=watch,plex sonarr=tv"; [[ "$(hostname_rule plex "Host(\`plex.\${CLOUDFLARE_DNS_ZONE:?err}\`) && PathPrefix(\`/web/\`)")" == "(Host(\`watch.\${CLOUDFLARE_DNS_ZONE:?err}\`) || Host(\`plex.\${CLOUDFLARE_DNS_ZONE:?err}\`)) && PathPrefix(\`/web/\`)" && "$(hostname_rule sonarr "Host(\`sonarr.\${CLOUDFLARE_DNS_ZONE:?err}\`)")" == "Host(\`tv.\${CLOUDFLARE_DNS_ZONE:?err}\`)" && "$(svc_labels radarr)" == radarr && "$(svc_labels authentik)" == auth ]] && v_hostmap "a=x,y b=z" && ! v_hostmap "a=x b=x" && ! v_hostmap "a=x.y" && ! v_labels "tv," && v_portmap "plex=32401" && ! v_portmap "plex=70000" && [[ "$(map_set "b=2 a=1" c 3)" == "a=1 b=2 c=3" && "$(map_set "a=1 b=2" a "")" == "b=2" ]] )'
+    mkdir -p "$t/hz"; cat >"$t/hz/docker-compose.yaml" <<'FIX'
+services:
+  sonarr:
+    image: s
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.sonarr.rule=Host(`sonarr.${CLOUDFLARE_DNS_ZONE:?err}`)
+  plex:
+    image: p
+    labels:
+      - traefik.http.routers.plex.rule=Host(`plex.${CLOUDFLARE_DNS_ZONE:?err}`) && PathPrefix(`/web/`)
+  homarr:
+    image: ghcr.io/ajnart/homarr:latest
+    labels:
+      - traefik.http.routers.homarr.rule=Host(`homarr.${CLOUDFLARE_DNS_ZONE:?err}`)
+  qbittorrent:
+    image: q
+FIX
+    st "hostnames: override merge"          '( st_prep internet both tailscale core; CFG[SERVICE_HOSTNAMES]="sonarr=tv,sonarr homarr=home statusboard=board qbittorrent=qb plex=watch"; o=$(render_override "$t/hz/docker-compose.yaml"); [[ $(grep -c "^  sonarr:" <<<"$o") == 1 && $(grep -c "^  homarr:" <<<"$o") == 1 ]] && grep -qF "routers.sonarr.rule=Host(\`tv.\${CLOUDFLARE_DNS_ZONE:?err}\`) || Host(\`sonarr.\${CLOUDFLARE_DNS_ZONE:?err}\`)" <<<"$o" && grep -qF "routers.plex.rule=Host(\`watch.\${CLOUDFLARE_DNS_ZONE:?err}\`) && PathPrefix(\`/web/\`)" <<<"$o" && grep -qF "routers.homarr.rule=Host(\`home." <<<"$o" && grep -qF "routers.statusboard.rule=Host(\`board." <<<"$o" && ! grep -qF "Host(\`status." <<<"$o" && grep -q "qbittorrent: no Traefik router" <<<"$o" && [[ $(awk "/^  homarr:/{f=1;next} /^  [a-z]/{f=0} f && /^    labels:/" <<<"$o" | wc -l) == 1 ]] )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
