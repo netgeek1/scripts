@@ -3,6 +3,14 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.9.2 — 2026-11-24
+
+### Fixed
+- **Plex and Traefik links gave 404** (Homepage and `--urls`). Upstream's routers for them match only a path:
+  `PathPrefix(/web/)` for Plex, `/api` and `/dashboard` for Traefik. Links now go to `https://plex.<domain>/web/`
+  and `https://traefik.<domain>/dashboard/`, and the LAN links use the same paths.
+- Self-test: 86 checks.
+
 ## v2.9.1 — 2026-11-24
 
 ### Fixed
