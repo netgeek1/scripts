@@ -495,7 +495,11 @@ later.
   LAN-only.
   - Create a reusable auth key in the Tailscale admin console.
   - Approve the advertised subnet routes and exit node there.
-- **`headscale`** keeps upstream's setup and enables Headscale and Headplane. Create the key with
+- **`headscale`** keeps upstream's setup and enables Headscale and Headplane. Apply updates upstream's Headscale config for
+  Headscale 0.29+ (removed `randomize_client_port`, moved `ephemeral_node_inactivity_timeout`). Headplane needs
+  Headscale running: its health check is Headscale's, and Traefik doesn't route to an unhealthy container.
+  Headplane is at `https://headplane.<domain>/admin/`; sign in with a Headscale API key
+  (`docker exec headscale headscale apikeys create`). Create the key with
   `docker exec headscale headscale preauthkeys create --user <user> --reusable` once Headscale runs.
 
 ---
@@ -950,7 +954,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 88 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 89 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
