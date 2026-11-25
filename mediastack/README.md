@@ -908,7 +908,7 @@ password**.
 | Helper | Does |
 |---|---|
 | Secure Authentik DB | Waits for PostgreSQL and applies upstream's grants |
-| Create Guacamole DB | Creates the database, grants access, loads the schema and restarts Guacamole. The default login is `guacadmin`/`guacadmin`, so change it |
+| Guacamole DB | Apply does this by itself whenever Guacamole is on: creates the database if missing, loads the schema if its tables are missing, grants access and restarts Guacamole. The first login is `guacadmin`/`guacadmin`, so change it |
 | Reset akadmin | Runs `ak changepassword akadmin` once Authentik is healthy |
 | *ARR API keys | Reads each app's key and optionally stores the keys in the vault for unpackerr/homepage |
 | VPN check | Settings problems, Gluetun's health, its recent errors with hints, and (WireGuard) the handshake state read inside Gluetun's network namespace (`--helper vpn-check`) |
@@ -972,7 +972,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 92 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 93 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
