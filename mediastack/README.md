@@ -494,6 +494,33 @@ the free servers. Without them, automatic updates are off for ProtonVPN and "upd
 credentials reach the updater as environment variables. They are never on this host's `docker` command line, but
 inside the one-off update container Gluetun's updater takes them as arguments for the few seconds it runs.
 
+### Custom WireGuard vs. a listed provider
+
+Provider `custom` connects to the one server in your `wg0.conf`, so it has no server list, no filters and no list
+updates. Many providers that hand out `wg0.conf` files are also in Gluetun's list. With ProtonVPN, the private key
+works for every Proton server. When you import a ProtonVPN `wg0.conf` (recognised by its `10.2.0.2` address) and
+keep `custom`, Settings → VPN offers to switch to `protonvpn`: the key and address are kept, and Gluetun then
+picks the server from your filters. Staying on `custom` still works; the status board lets you change the server
+endpoint (IP, port, public key) from another config of the same provider.
+
+### Port forwarding
+
+| Key | Default | Notes |
+|---|---|---|
+| `VPN_PORT_FORWARDING` | `off` | `on` asks the VPN server for a forwarded port (Gluetun's native support: `protonvpn`, `private internet access`, `perfect privacy`, `privatevpn`; and `custom` WireGuard) |
+| `VPN_PORT_FORWARDING_PROVIDER` | blank | `custom` only: whose port forwarding the server uses, e.g. `protonvpn` |
+| `VPN_PF_QBITTORRENT` | `yes` | Set qBittorrent's listening port to the forwarded port |
+
+- **ProtonVPN:** the WireGuard config must be generated with **NAT-PMP (Port Forwarding)** on, and the server must
+  be a P2P one. With provider `protonvpn` the installer also sets `PORT_FORWARD_ONLY=on`, so Gluetun only picks P2P
+  servers.
+- **qBittorrent:** Gluetun runs `<data>/gluetun/mediastack-pf-qbittorrent.sh` (written by Apply) whenever the
+  forwarded port changes, which sets qBittorrent's listening port through its Web API on `127.0.0.1`. qBittorrent
+  shares Gluetun's network, so Apply turns on qBittorrent's "Bypass authentication for clients on localhost"
+  (`WebUI\LocalHostAuth=false`). Other apps that share Gluetun's network can then reach qBittorrent's Web UI
+  without a login.
+- The forwarded port shows on the status board's Gluetun tab, and in `docker logs gluetun`.
+
 ---
 
 ## Service presets
@@ -689,7 +716,7 @@ no capabilities, **no Docker socket**) and uses each tool's own API:
 | Tab | Shows | Can do | Through |
 |---|---|---|---|
 | **Tailscale** | state, tailnet, this node, advertised routes/exit node, home relay; every peer with online state, IP, OS, direct/relay connection, traffic, last seen | ping a peer; a link to **Tailscale's own web interface** (`http://<tailscale-ip>:5252`, enabled by Apply) for exit node, routes and SSH changes | LocalAPI over the `tailscaled` socket (shared `<data>/tailscale/run`, read-only mount) |
-| **Gluetun VPN** | VPN state, provider/type, public IP and location, forwarded port, server-list updater | restart / stop / start the VPN, update the server list now; **change the server selection** (countries, cities, hostnames, regions) or recreate Gluetun | control server with a generated API key (`HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE`) |
+| **Gluetun VPN** | VPN state, provider/type, public IP and location, forwarded port, when the server list was last updated (and how many servers) | restart / stop / start the VPN, update the server list now; **change the server selection** (countries, cities, hostnames, regions), or for provider `custom` WireGuard the **server endpoint** (IP, port, public key); **port forwarding on/off**; recreate Gluetun | control server with a generated API key (`HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE`) |
 | **DDNS** | provider, records, last update and current IP per record (from DDNS-Updater's `updates.json`), a link to its page | **change the records** (Cloudflare provider) | DDNS-Updater's data folder, read-only |
 | **CrowdSec** | metrics (decisions, alerts, log lines read and parsed, bouncer requests), active decisions, recent alerts | ban an IP or range (duration, reason), unban | LAPI: the Traefik bouncer key for decisions, a `statusboard` machine login (registered by Apply) for alerts/ban/unban; metrics on :6060 |
 
@@ -1001,7 +1028,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 96 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 99 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
