@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.9.0"
+readonly SCRIPT_VERSION="2.9.1"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2210,6 +2210,42 @@ traefik_router_errors() {
         }'
 }
 
+# ini_whitelist_add FILE HOST -> 0 when HOST was added to [misc] host_whitelist (1: already there or no such key)
+ini_whitelist_add() {
+    local f=$1 h=$2 tmp
+    tmp=$(mktemp)
+    awk -v h="$h" '
+        /^\[/ { sec = $0 }
+        sec == "[misc]" && /^host_whitelist[[:space:]]*=/ && !done {
+            v = $0; sub(/^host_whitelist[[:space:]]*=[[:space:]]*/, "", v); sub(/[[:space:],]+$/, "", v)
+            n = split(v, a, /[[:space:]]*,[[:space:]]*/)
+            for (i = 1; i <= n; i++) if (tolower(a[i]) == tolower(h)) { print; done = 1; next }
+            print "host_whitelist = " (v != "" ? v ", " : "") h; done = 1; added = 1; next
+        }
+        { print }
+        END { exit added ? 0 : 1 }' "$f" >"$tmp" || { rm -f "$tmp"; return 1; }
+    cat "$tmp" >"$f"; rm -f "$tmp"      # cat keeps the file's owner and mode
+    return 0
+}
+
+# ensure_app_hostnames -- apps that check the Host header must know their Traefik hostname.
+#   SABnzbd: "Access denied - Hostname verification failed" until sabnzbd.<domain> is in host_whitelist.
+#   It rewrites sabnzbd.ini when it stops, so the edit is made while it is stopped.
+ensure_app_hostnames() {
+    (( DRY_RUN )) && return 0
+    svc_enabled traefik && svc_enabled sabnzbd || return 0
+    local ini="$FOLDER_FOR_DATA/sabnzbd/sabnzbd.ini" h i
+    h="sabnzbd.$(tls_zone)"
+    for (( i = 0; i < 12; i++ )); do [[ -s "$ini" ]] && break; sleep 5; done     # first start creates it
+    [[ -s "$ini" ]] || { log_warn "SABnzbd has not created $ini yet; run Apply again later to allow $h."; return 0; }
+    grep -qiE "^host_whitelist[[:space:]]*=.*(^|[ ,=])${h//./\.}([ ,]|$)" "$ini" && return 0
+    docker stop sabnzbd >/dev/null 2>&1 || true
+    if ini_whitelist_add "$ini" "$h"; then log_ok "SABnzbd: allowed hostname $h (host_whitelist)"
+    else log_warn "SABnzbd: no host_whitelist key in $ini; add $h there (Config -> Special -> host_whitelist)."; fi
+    docker start sabnzbd >/dev/null 2>&1 || true
+    return 0
+}
+
 # traefik_ensure_middlewares -- Traefik downloads the CrowdSec bouncer plugin when it starts. If that download fails
 # (no internet yet, a timeout, an integrity-check error) plugins stay off for the container's lifetime, the
 # traefik-bouncer@file middleware does not exist and every router that uses it answers 404. Retry once.
@@ -3335,6 +3371,7 @@ stack_apply() {
     fi
     verify_services 180 || true
     traefik_ensure_middlewares
+    ensure_app_hostnames
     log_info "URLs, ports and DNS names: menu L, or sudo $MS_INSTALL_BIN --urls"
     if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ ! "$(tls_ensure_live)" =~ ^(yes|n/a)$ ]]; then
         log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem yet; check: sudo $MS_INSTALL_BIN --cert-show"
@@ -5356,6 +5393,7 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "CrowdSec bouncer key wiring"      '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"BOUNCER_KEY_traefik=\${CROWDSEC_BOUNCER_KEY:?err}"* ]] && in_list CROWDSEC_BOUNCER_KEY "${SECRET_GENERATED[@]}" && f="$t/dyn.yaml" && printf "x:\n          crowdsecLapiKey: 8andilX0JKYIu8z+R4imPkIgG+TMdCttAuMaHrsV7ZU\n          crowdsecLapiHost: crowdsec:8080\n" >"$f" && sed -i -E "s|^([[:space:]]*crowdsecLapiKey:).*|\\1 abc123|" "$f" && grep -qx "          crowdsecLapiKey: abc123" "$f" && grep -q "crowdsecLapiHost: crowdsec:8080" "$f" )'
     st "Authentik blueprint + patch"       '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; b=$(render_authentik_blueprint); [[ "$b" == *"mode: forward_domain"* && "$b" == *"cookie_domain: certifiedgeeks.net"* && "$b" == *"external_host: https://auth.certifiedgeeks.net"* && "$b" == *"authentik_host: https://auth.certifiedgeeks.net/"* && "$b" == *"managed: goauthentik.io/outposts/embedded"* ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ $(grep -c "/blueprints/mediastack:ro" <<<"$o") -ge 1 && "$o" == *"AUTHENTIK_BOOTSTRAP_PASSWORD=\${AUTHENTIK_BOOTSTRAP_PASSWORD:?err}"* ]] )'
     st "Homepage services from compose"   '( st_prep internet jellyfin tailscale core; FOLDER_FOR_YAML="$t/hp"; mkdir -p "$t/hp"; printf "WEBUI_PORT_SONARR=8989\nWEBUI_PORT_JELLYFIN=8096\n" >"$t/hp/.env"; CFG[LOCAL_DOCKER_IP]=10.0.0.5; SECRETS[SONARR_API_TOKEN]=abc; f=$(printf "%s\n" "sonarr|service:gluetun|sonarr.x.org|1|" "jellyfin|service:gluetun|jellyfin.x.org|1|" "postgresql|||0|5432/tcp" "zeta|||0|"); y=$(render_homepage_services "$f"); [[ "$y" == *"- Media:"*"- Jellyfin:"*"href: https://jellyfin.x.org"* && "$y" == *"- Sonarr:"*"url: http://gluetun:8989"*"{{HOMEPAGE_VAR_SONARR_API_TOKEN}}"* && "$y" == *"- Infrastructure:"*"- PostgreSQL:"*"icon: postgres.png"* && "$y" == *"- Other:"*"- Zeta:"* && "$y" != *"PostgreSQL:"*"href:"*"- Other"* ]] && svc_enabled traefik )'
+    st "SABnzbd host_whitelist edit"       '( f="$t/sab.ini"; printf "[misc]\nhost_whitelist = 9f2c1a, \nport = 8080\n[servers]\nhost_whitelist = x\n" >"$f"; ini_whitelist_add "$f" sabnzbd.example.org && grep -qx "host_whitelist = 9f2c1a, sabnzbd.example.org" "$f" && grep -qx "host_whitelist = x" "$f" && ! ini_whitelist_add "$f" SABnzbd.example.org && printf "[misc]\nhost_whitelist = \n" >"$f" && ini_whitelist_add "$f" a.b && grep -qx "host_whitelist = a.b" "$f" )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
