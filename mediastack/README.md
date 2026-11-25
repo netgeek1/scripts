@@ -143,6 +143,7 @@ You can re-run detection any time with **Settings → D**.
    8) VPN / email        openvpn / mullvad
    9) Upstream / secrets / backups  8e908ae60bf4 full-download-vpn mode=vault
    E) Dynamic DNS        cloudflare (media.example.org,*.media.example.org)
+   U) Hostnames / ports  2 change(s) from the defaults
    D) Re-run detection   T) Test share mount   V) View all
    W) Save   A) Save + apply   0) Back
 ```
@@ -184,6 +185,33 @@ The compose folder also gets wrappers, so the upstream workflow keeps working:
 ---
 
 ## URLs, ports and DNS
+
+### Changing hostnames and LAN ports
+
+**Settings → U) Hostnames / ports** lists the enabled services in alphabetical order, numbered, with their
+hostnames and LAN port. Pick one by number or name to change it:
+
+```
+     #  Service              Hostnames (.example.org)                     LAN port
+     1  audiobookshelf       audiobookshelf                               13378
+    ...
+    18  sonarr               tv,sonarr *                                  18989 *
+   (* = changed from the default)
+```
+
+- **Hostnames:** one or more subdomains, comma-separated. The first is the main one, used in links and on the
+  dashboards. Every name keeps working. Names are single labels (`tv`, not `tv.media`), so the `*.<domain>`
+  wildcard certificate and the wildcard DNS record cover them. Path rules stay (Plex `/web/`, Headplane `/admin/`).
+  A name already used by another service is refused. `-` goes back to the default.
+- **LAN port:** sets the service's `WEBUI_PORT_*` in `.env`. A port already used by another `.env` port is refused.
+  `-` goes back to upstream's default.
+- Stored as `SERVICE_HOSTNAMES` (`sonarr=tv,sonarr plex=watch`) and `SERVICE_PORTS` (`sonarr=18989`); Save + apply
+  to use them. Apply writes the router rules into the managed override, and everything that names a service
+  follows: Homepage, Homarr, Heimdall, the status board link, the URL view, Authentik's own address (`auth`),
+  Headscale's `server_url` and SABnzbd's allowed hostnames.
+- Renaming `headscale` changes its `server_url`: devices already joined must log in again.
+
+### The URL view
 
 Menu **L** or `--urls` lists what the running configuration actually publishes, for enabled services only. It is
 read from `docker compose config`, not from a fixed list, and also prints at the end of a full install:
@@ -230,6 +258,7 @@ or by hand followed by **Apply**.
 | `DOMAIN` | *detected / required* (`mediastack.lan` in LAN mode) | `auth.<domain>`, `sonarr.<domain>`, … |
 | `CLOUDFLARE_DNS_ZONE` / `CLOUDFLARE_EMAIL` | `= DOMAIN` / blank | Traefik DNS-01 (Let's Encrypt only) |
 | `LOCAL_DOCKER_IP` / `LOCAL_SUBNET` | `auto` | Or a fixed IPv4 / CIDR |
+| `SERVICE_HOSTNAMES` / `SERVICE_PORTS` | blank | Per-service subdomains and LAN ports (see [Changing hostnames and LAN ports](#changing-hostnames-and-lan-ports)) |
 | `TIMEZONE` | detected | |
 | `MEDIA_STORAGE` | `local` | `local`, `smb`, `nfs` or `external` |
 | `MEDIA_REMOTE` | | `//server/share` or `server:/export` |
@@ -972,7 +1001,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 93 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 95 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
