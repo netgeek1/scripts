@@ -3,6 +3,21 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.3.2 — 2026-11-25 — Server-list date, status screen
+
+### Fixed
+- **Status board: "Gluetun has not written its server list yet".** Current Gluetun keeps its server data in
+  `/gluetun/servers/` (`manifest.json` plus one file per provider) and removes the old `/gluetun/servers.json`;
+  the board read only the old file. It now reads either layout.
+- **Status screen warned "WIREGUARD_PRIVATE_KEY is not set"** although the key was in the vault: the screen checked
+  secrets without loading the vault. It now loads it (and still shows the status when the vault can't be opened).
+
+### Added
+- Status board, Server list card: how the list is kept current: "updated by Gluetun every 480h", "automatic
+  updates off", or, for ProtonVPN without account credentials, that updates need a Proton account (Settings → 8);
+  "Update server list now" is hidden in that case.
+- Status screen (menu 7): **Forwarded port** line with the port Gluetun holds now and whether qBittorrent took it.
+
 ## v3.3.1 — 2026-11-25 — Board feedback, port-forward timeout
 
 ### Fixed
