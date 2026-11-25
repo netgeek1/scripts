@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.1.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -102,7 +102,8 @@ CONF_KEYS=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA FOLDER_FOR_YAML DOMAIN CLOUDFLARE_D
             BACKUP_DIR BACKUP_KEEP BACKUP_FORMAT BACKUP_PASSPHRASE_FILE BACKUP_STOP_STACK
             VPN_CUSTOM_OVPN_FILE VPN_ENDPOINT_IP VPN_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES
             CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY CERT_PUSH_USER CERT_PUSH_FROM
-            SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES VPN_SERVERS_UPDATE_PERIOD VPN_UPDATER_PROTON_EMAIL )
+            SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES VPN_SERVERS_UPDATE_PERIOD VPN_UPDATER_PROTON_EMAIL
+            DDNS_PROVIDER DDNS_RECORDS DDNS_CF_ZONE_ID DDNS_TTL DDNS_PROXIED DDNS_IP_VERSION DDNS_CONFIG_FILE )
 # Settings that did not exist before v2.0.0: an existing config without them keeps its old behaviour
 declare -A CONF_LEGACY=( [ACCESS_MODE]=internet [CERT_MODE]=letsencrypt [SERVICE_PRESET]=custom
                          [TAILSCALE_CONTROL]=headscale [PLAYER]=both )
@@ -121,9 +122,9 @@ SECRET_KEYS=( VPN_USERNAME VPN_PASSWORD PLEX_CLAIM CLOUDFLARE_DNS_API_TOKEN EMAI
               HEADPLANE_COOKIE_SECRET SONARR_API_TOKEN RADARR_API_TOKEN LIDARR_API_TOKEN READARR_API_TOKEN
               WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD SECRET_ENCRYPTION_KEY
               TLS_KEY_PASSPHRASE UPDATER_PROTONVPN_PASSWORD CROWDSEC_BOUNCER_KEY AUTHENTIK_BOOTSTRAP_PASSWORD
-              STATUSBOARD_GLUETUN_KEY CROWDSEC_STATUSBOARD_PASSWORD )
+              STATUSBOARD_GLUETUN_KEY CROWDSEC_STATUSBOARD_PASSWORD HOMARR_API_KEY )
 # Vault entries that are not .env variables
-SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE )
+SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE HOMARR_API_KEY )
 SECRET_PROMPTED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY EMAIL_PASSWORD PLEX_CLAIM )
 SECRET_WIREGUARD=( WIREGUARD_PRIVATE_KEY )   # WIREGUARD_PRESHARED_KEY is optional: taken from wg0.conf only
 SECRET_REQUIRED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY )   # compose :?err
@@ -410,6 +411,13 @@ set_default_config() {
         [SERVER_HOSTNAMES]=""
         [VPN_SERVERS_UPDATE_PERIOD]="480h"
         [VPN_UPDATER_PROTON_EMAIL]=""
+        [DDNS_PROVIDER]="none"
+        [DDNS_RECORDS]=""
+        [DDNS_CF_ZONE_ID]=""
+        [DDNS_TTL]="1"
+        [DDNS_PROXIED]="no"
+        [DDNS_IP_VERSION]="ipv4"
+        [DDNS_CONFIG_FILE]=""
     )
 }
 
@@ -573,7 +581,8 @@ secret_needed() {
         WIREGUARD_PRIVATE_KEY) svc_enabled gluetun && [[ "${CFG[VPN_TYPE]}" == wireguard ]] ;;
         WIREGUARD_PRESHARED_KEY) return 1 ;;   # optional; most providers do not use one
         UPDATER_PROTONVPN_PASSWORD) svc_enabled gluetun && [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -n "${CFG[VPN_UPDATER_PROTON_EMAIL]}" ]] ;;
-        CLOUDFLARE_DNS_API_TOKEN) svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == letsencrypt ]] ;;
+        CLOUDFLARE_DNS_API_TOKEN) { svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == letsencrypt ]]; } \
+                                  || { svc_enabled ddns-updater && [[ "${CFG[DDNS_PROVIDER]}" == cloudflare ]]; } ;;
         TAILSCALE_AUTHKEY) svc_enabled tailscale ;;
         PLEX_CLAIM) svc_enabled plex ;;
         EMAIL_PASSWORD) svc_enabled authentik && [[ -n "${CFG[EMAIL_SERVER_HOST]}" ]] ;;
@@ -1129,6 +1138,10 @@ render_env() {
     done
     env_set "$envf" PUID "$PUID"
     env_set "$envf" PGID "$PGID"
+    # status board: DDNS view (MS_ prefix: not upstream keys)
+    env_set "$envf" MS_DDNS_PROVIDER "${CFG[DDNS_PROVIDER]:-none}"
+    env_set "$envf" MS_DDNS_RECORDS "${CFG[DDNS_RECORDS]}"
+    env_set "$envf" MS_DDNS_URL "$(ddns_ui_url)"
     vpn_normalize
     # Endpoint: only provider 'custom' takes it (for listed providers it pins a server that is often not in
     # Gluetun's list: "target IP address not found"). Upstream passes the deprecated VPN_ENDPOINT_IP/PORT names,
@@ -1235,7 +1248,7 @@ svc_enabled() { svc_exists "$1" && [[ "$(eff_state "$1")" == on ]]; }
 # -----------------------------------------------------------------------------
 # SERVICE PRESETS (chosen in the wizard; 'custom' keeps the lists as they are)
 # -----------------------------------------------------------------------------
-readonly PRESET_CORE_COMMON="gluetun qbittorrent sabnzbd prowlarr flaresolverr unpackerr sonarr radarr lidarr bazarr seerr homepage tailscale audiobookshelf statusboard"
+readonly PRESET_CORE_COMMON="gluetun qbittorrent sabnzbd prowlarr flaresolverr unpackerr sonarr radarr lidarr bazarr seerr homepage homarr heimdall tailscale audiobookshelf statusboard"
 readonly PRESET_CORE_INTERNET="traefik traefik-certs-dumper crowdsec authentik authentic-worker postgresql valkey"
 readonly PRESET_ALWAYS_REMOVED="readarr"       # retired upstream
 readonly PRESET_FULL_DISABLED="whisparr"
@@ -1246,7 +1259,20 @@ preset_core_on() {   # services ON in the Core preset for the current settings
     if [[ "${CFG[ACCESS_MODE]}" == internet ]]; then read -ra extra <<<"$PRESET_CORE_INTERNET"; on+=("${extra[@]}"); fi
     case "${CFG[PLAYER]}" in jellyfin) on+=(jellyfin) ;; plex) on+=(plex) ;; *) on+=(jellyfin plex) ;; esac
     [[ "${CFG[TAILSCALE_CONTROL]}" == headscale ]] && on+=(headscale headplane)
+    [[ "${CFG[DDNS_PROVIDER]:-none}" != none ]] && on+=(ddns-updater)
     printf '%s\n' "${on[@]}"
+}
+
+# sync_preset -- keep a Core/Full install in step with the preset of this version (new add-ons, DDNS on/off, ...)
+sync_preset() {
+    [[ "${CFG[SERVICE_PRESET]:-custom}" == custom ]] && return 0
+    local d0=${CFG[DISABLED_SERVICES]} r0=${CFG[REMOVED_SERVICES]}
+    apply_preset
+    if [[ "${CFG[DISABLED_SERVICES]}" != "$d0" || "${CFG[REMOVED_SERVICES]}" != "$r0" ]]; then
+        log_ok "Preset '${CFG[SERVICE_PRESET]}' updated: disabled now ${CFG[DISABLED_SERVICES]:-none}"
+        save_config
+    fi
+    return 0
 }
 
 # apply_preset -- rewrite DISABLED_SERVICES / REMOVED_SERVICES from SERVICE_PRESET
@@ -1341,8 +1367,13 @@ render_addon() {   # render_addon NAME -> service body (4-space indented, no key
       - ${FOLDER_FOR_DATA:?err}/statusboard/app:/app:ro
       - ${FOLDER_FOR_DATA:?err}/statusboard/requests:/requests
       - ${FOLDER_FOR_DATA:?err}/tailscale/run:/var/run/tailscale:ro
+      - ${FOLDER_FOR_DATA:?err}/ddns-updater:/ddns:ro
     environment:
       - TZ=${TIMEZONE:?err}
+      - DOMAIN=${CLOUDFLARE_DNS_ZONE:?err}
+      - DDNS_PROVIDER=${MS_DDNS_PROVIDER:-none}
+      - DDNS_RECORDS=${MS_DDNS_RECORDS:-}
+      - DDNS_URL=${MS_DDNS_URL:-}
       - TS_SOCKET=/var/run/tailscale/tailscaled.sock
       - GLUETUN_URL=http://gluetun:${GLUETUN_CONTROL_PORT:?err}
       - GLUETUN_API_KEY=${STATUSBOARD_GLUETUN_KEY:?err}
@@ -1433,6 +1464,15 @@ EOF
       - HOMEPAGE_VAR_READARR_API_TOKEN=${READARR_API_TOKEN:-}
 EOF
             ;;
+        ddns-updater)
+            printf '    # DDNS-Updater: records from the installer settings (DDNS_*); the API token comes from the vault\n'
+            printf '    environment:\n'
+            if [[ "${CFG[DDNS_PROVIDER]}" == cloudflare ]]; then
+                printf "      - 'CONFIG=%s'\n" "$(ddns_config_json)"
+            else
+                printf '      - CONFIG=\n'      # custom: <data>/ddns-updater/config.json
+            fi
+            ;;
         authentik|authentic-worker)
             cat <<'EOF'
     # Authentik: first-start admin password (akadmin) and the installer's blueprint (forward auth for the domain)
@@ -1488,7 +1528,7 @@ active_patches() {   # upstream services this installer modifies
     [[ -f "$compose" ]] || return 0
     if grep -qE '^  homarr:[[:space:]]*$' "$compose" && ! is_removed homarr; then echo homarr; fi
     local a
-    for a in homepage authentik authentic-worker; do
+    for a in homepage authentik authentic-worker ddns-updater; do
         if grep -qE "^  ${a}:[[:space:]]*\$" "$compose" && ! is_removed "$a"; then echo "$a"; fi
     done
     if grep -qE '^  crowdsec:[[:space:]]*$' "$compose" && ! is_removed crowdsec; then echo crowdsec; fi
@@ -3399,6 +3439,7 @@ stack_apply() {
     (( DRY_RUN )) || docker_up || die "Docker is not running/installed. Run the full install first."
     ensure_service_account
     fetch_upstream
+    sync_preset
     deploy_files
     render_env
     write_override
@@ -3408,6 +3449,7 @@ stack_apply() {
     ensure_tls
     write_homepage_config
     write_statusboard_app
+    write_ddns_custom_config
     cert_units
     requests_units
     report_dependencies die
@@ -3434,6 +3476,8 @@ stack_apply() {
     traefik_ensure_middlewares
     ensure_app_hostnames
     statusboard_wire
+    sync_heimdall
+    sync_homarr
     log_info "URLs, ports and DNS names: menu L, or sudo $MS_INSTALL_BIN --urls"
     if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ ! "$(tls_ensure_live)" =~ ^(yes|n/a)$ ]]; then
         log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem yet; check: sudo $MS_INSTALL_BIN --cert-show"
@@ -3472,6 +3516,10 @@ show_status() {
         push)  printf '  %-22s %s\n' "Certificate push" "user ${CFG[CERT_PUSH_USER]} from ${CFG[CERT_PUSH_FROM]:-any}; last push $(date -r "$(cert_push_dir)/fullchain.pem" '+%F %T' 2>/dev/null || echo 'never (temporary self-signed)')" ;;
     esac
     report_dependencies warn
+    if svc_enabled ddns-updater; then
+        printf '  %-22s %s\n' "Dynamic DNS" "${CFG[DDNS_PROVIDER]}: ${CFG[DDNS_RECORDS]:-${CFG[DDNS_CONFIG_FILE]:-<none>}}"
+        local dl; while IFS= read -r dl; do [[ -n "$dl" ]] && log_warn "DDNS: $dl"; done <<<"$(ddns_problems)"
+    fi
     if svc_enabled gluetun; then
         printf '  %-22s %s\n' "VPN" "${CFG[VPN_SERVICE_PROVIDER]:-<not set>} / ${CFG[VPN_TYPE]}"
         local vl; while IFS= read -r vl; do [[ -n "$vl" ]] && log_warn "VPN: $vl"; done <<<"$(vpn_problems)"
@@ -3760,6 +3808,11 @@ v_access()   { [[ "$1" =~ ^(internet|lan)$ ]]; }
 v_cert()     { [[ "$1" =~ ^(letsencrypt|selfsigned|manual|fetch|push)$ ]]; }
 v_fetchsrc() { [[ -z "$1" || "$1" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.:_-]+:/[^[:space:]\']*$ ]]; }
 v_fname()    { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+v_ddns_records() {   # comma-separated DNS names, each a domain or *.domain
+    local x; [[ -z "$1" ]] && return 0
+    for x in ${1//,/ }; do valid_domain "${x#\*.}" || return 1; done
+    return 0
+}
 v_period()   { [[ "$1" == off || "$1" =~ ^[0-9]+h$ ]]; }
 v_email_opt(){ [[ -z "$1" || "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]]; }
 v_from_opt() { [[ -z "$1" || "$1" =~ ^[0-9A-Fa-f.:/,*?]+$ ]]; }
@@ -4232,6 +4285,7 @@ menu_settings() {
         printf '   7) Services           preset=%s player=%s tailscale=%s\n' "${CFG[SERVICE_PRESET]}" "${CFG[PLAYER]}" "${CFG[TAILSCALE_CONTROL]}"
         printf '   8) VPN / email        %s / %s\n' "${CFG[VPN_TYPE]}" "${CFG[VPN_SERVICE_PROVIDER]}"
         printf '   9) Upstream / secrets / backups  %s %s mode=%s\n' "${CFG[UPSTREAM_REF]:0:12}" "${CFG[UPSTREAM_VARIANT]}" "${CFG[SECRETS_MODE]}"
+        printf '   E) Dynamic DNS        %s%s\n' "${CFG[DDNS_PROVIDER]}" "$([[ -n "${CFG[DDNS_RECORDS]}" && "${CFG[DDNS_PROVIDER]}" == cloudflare ]] && printf ' (%s)' "${CFG[DDNS_RECORDS]}")"
         printf '   D) Re-run detection   T) Test share mount   V) View all\n'
         printf '   W) Save   A) Save + apply   0) Back\n'
         read -rp "  Choice: " ch || return 0
@@ -4246,6 +4300,7 @@ menu_settings() {
             7) cfg_services; dirty=1 ;;
             8) cfg_vpn_email; dirty=1 ;;
             9) cfg_stack; dirty=1 ;;
+            e) cfg_ddns; [[ "${CFG[SERVICE_PRESET]}" == custom ]] || apply_preset; dirty=1 ;;
             d) detect_defaults; dirty=1 ;;
             t) ask w "Test which share (MEDIA/DATA)" MEDIA; w=${w^^}
                [[ "$w" =~ ^(MEDIA|DATA)$ ]] && menu_action storage_test "$w" ;;
@@ -4292,7 +4347,7 @@ full_install() {
 # -----------------------------------------------------------------------------
 render_statusboard_app() {
     cat <<'STATUSBOARD_APP_PY'
-"""MediaStack status board -- Tailscale, Gluetun and CrowdSec in one page.
+"""MediaStack status board -- Tailscale, Gluetun, CrowdSec and DDNS-Updater in one page.
 
 Python standard library only (no pip). Data comes from each tool's own API:
   Tailscale : LocalAPI over the tailscaled unix socket (shared volume)
@@ -4331,6 +4386,9 @@ LAN_ACTIONS = E("ALLOW_LAN_ACTIONS", "no") == "yes"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 FILTER_KEYS = ("SERVER_COUNTRIES", "SERVER_CITIES", "SERVER_HOSTNAMES", "SERVER_REGIONS")
 CONFIG = {k: E(k, "") for k in ("VPN_SERVICE_PROVIDER", "VPN_TYPE", "DOMAIN") + FILTER_KEYS}
+DDNS_DIR = E("DDNS_DIR", "/ddns")
+DDNS = {k: E(k, "") for k in ("DDNS_PROVIDER", "DDNS_RECORDS", "DDNS_URL", "DOMAIN")}
+REQUEST_KEYS = {"vpn_filters": FILTER_KEYS, "gluetun_recreate": (), "ddns_records": ("DDNS_RECORDS",)}
 TIMEOUT = 6
 
 
@@ -4560,17 +4618,39 @@ def crowdsec_unban(ip):
     return cs_machine("DELETE", "/v1/decisions?" + q)
 
 
+# ---------------------------------------------------------------- DDNS-Updater (reads its updates.json)
+def ddns_status():
+    out = {"config": DDNS, "records": []}
+    path = os.path.join(DDNS_DIR, "updates.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        out["note"] = "no updates.json yet (DDNS-Updater writes it after its first update)"
+        return out
+    except (OSError, ValueError) as e:
+        raise APIError("updates.json: %s" % e)
+    for r in (data.get("records") or []):
+        dom, host = r.get("domain", ""), r.get("host", "")
+        name = dom if host in ("", "@") else ("%s.%s" % (host, dom) if host != "*" else "*." + dom)
+        ips = sorted(r.get("ips") or [], key=lambda x: x.get("time", ""), reverse=True)
+        out["records"].append({"name": name, "ip": ips[0].get("ip", "") if ips else "",
+                               "since": ips[0].get("time", "") if ips else "",
+                               "history": [{"ip": x.get("ip", ""), "time": x.get("time", "")} for x in ips[:10]]})
+    return out
+
+
 # ---------------------------------------------------------------- requests to the installer (host side)
 REQ_ID = re.compile(r"^req-[0-9a-z-]{1,40}$")
 VALUE_OK = re.compile(r"^[^=\[\]#/\n\r\x00]{0,200}$")
 
 
 def write_request(action, fields):
-    if action not in ("vpn_filters", "gluetun_recreate"):
+    if action not in REQUEST_KEYS:
         raise APIError("unknown request")
     lines = ["ACTION=" + action]
     for k, v in fields.items():
-        if k not in FILTER_KEYS or not VALUE_OK.match(v or ""):
+        if k not in REQUEST_KEYS[action] or not VALUE_OK.match(v or ""):
             raise APIError("invalid value for %s" % k)
         lines.append("%s=%s" % (k, ",".join(x.strip() for x in (v or "").split(",") if x.strip())))
     rid = "req-%s-%s" % (time.strftime("%Y%m%d%H%M%S"), secrets.token_hex(3))
@@ -4660,6 +4740,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/tailscale": tailscale_status,
             "/api/gluetun": gluetun_status,
             "/api/crowdsec": crowdsec_status,
+            "/api/ddns": ddns_status,
             "/api/requests": list_requests,
         }
         if p in routes:
@@ -4685,6 +4766,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/gluetun/action": lambda: gluetun_action(s("action")),
             "/api/gluetun/request": lambda: write_request(s("action") or "vpn_filters",
                                                           {k: s(k) for k in FILTER_KEYS if k in body}),
+            "/api/ddns/request": lambda: write_request("ddns_records", {"DDNS_RECORDS": s("DDNS_RECORDS")}),
             "/api/crowdsec/ban": lambda: crowdsec_ban(s("ip"), s("duration") or "4h", s("reason")),
             "/api/crowdsec/unban": lambda: crowdsec_unban(s("ip")),
         }
@@ -4735,13 +4817,14 @@ input { background:var(--bg); color:var(--fg); border:1px solid var(--line); bor
 <body>
 <header>
   <h1>MediaStack Status</h1>
-  <nav><button data-t="ts" class="on">Tailscale</button><button data-t="gl">Gluetun VPN</button><button data-t="cs">CrowdSec</button></nav>
+  <nav><button data-t="ts" class="on">Tailscale</button><button data-t="gl">Gluetun VPN</button><button data-t="cs">CrowdSec</button><button data-t="dd">DDNS</button></nav>
   <span class="sp"></span><span id="who"></span>
 </header>
 <main>
   <section id="ts" class="on"></section>
   <section id="gl"></section>
   <section id="cs"></section>
+  <section id="dd"></section>
 </main>
 <div id="toast"></div>
 <script>
@@ -4812,7 +4895,7 @@ async function loadGL() {
       <input id="f_${k}" value="${esc(c[k])}" placeholder="any" style="flex:1" ${c.VPN_SERVICE_PROVIDER === "custom" ? "disabled" : ""}></div>`).join("")}
     <div class="row">${c.VPN_SERVICE_PROVIDER === "custom" ? '<span class="mut">Provider custom connects to the server in your config: no filters.</span>' :
       btn("Apply server selection", 'id="applyf"')} ${btn("Recreate Gluetun", 'id="recreate"', true)}</div></div>
-  <h2>Recent change requests</h2><div id="reqs" class="mut">…</div>`;
+  <h2>Recent change requests</h2><div class="reqs mut">…</div>`;
   el.querySelectorAll("[data-a]").forEach(b => b.onclick = () => post("/api/gluetun/action", {action: b.dataset.a},
       b.dataset.a === "stop" ? "Stop the VPN? The download apps lose their connection until it is started again." : null).then(() => setTimeout(loadGL, 2500)));
   const af = $("#applyf"); if (af) af.onclick = () => { const body = {action: "vpn_filters"};
@@ -4822,7 +4905,8 @@ async function loadGL() {
   loadReqs();
 }
 async function loadReqs() {
-  const j = await get("/api/requests"), el = $("#reqs"); if (!el) return;
+  const el = document.querySelector("section.on .reqs"); if (!el) return;
+  const j = await get("/api/requests");
   if (!j.ok || !Array.isArray(j.data)) { el.innerHTML = fail(j.error || "unavailable"); return; }
   el.innerHTML = j.data.length ? `<table><tr><th>Request</th><th>State</th><th>Result</th></tr>${j.data.map(r => `<tr><td><code>${esc(r.id)}</code></td>
     <td>${esc(r.state)}</td><td>${r.status ? dot(r.status === "ok") + esc(r.message || r.status) : ""}<div class="mut">${esc(r.finished || "")}</div></td></tr>`).join("")}</table>` : "none yet";
@@ -4849,7 +4933,29 @@ async function loadCS() {
   el.querySelectorAll("[data-unban]").forEach(x => x.onclick = () => post("/api/crowdsec/unban", {ip: x.dataset.unban}, "Unban " + x.dataset.unban + "?").then(loadCS));
 }
 
-const loaders = {ts: loadTS, gl: loadGL, cs: loadCS};
+async function loadDD() {
+  const j = await get("/api/ddns"); const el = $("#dd");
+  if (!j.ok) { el.innerHTML = fail(j.error); return; }
+  const d = j.data, c = d.config, recs = (c.DDNS_RECORDS || "").split(",").map(x => x.trim()).filter(Boolean);
+  const byName = Object.fromEntries((d.records || []).map(r => [r.name, r]));
+  el.innerHTML = `<div class="grid">${card("Provider", esc(c.DDNS_PROVIDER || "none"))}${card("Records", esc(recs.length))}
+    ${card("Current public IP", esc(((d.records || [])[0] || {}).ip || "—"), (d.records || [])[0] ? esc(ago((d.records || [])[0].since)) : esc(d.note || ""))}</div>
+  ${c.DDNS_URL ? `<div class="row"><span class="mut">DDNS-Updater's own status page:</span> <a href="${esc(c.DDNS_URL)}" target="_blank" rel="noopener">${esc(c.DDNS_URL)}</a></div>` : ""}
+  <h2>Records</h2>
+  ${c.DDNS_PROVIDER === "custom" ? '<div class="card mut">Provider custom: records come from your own config.json (Settings in the installer).</div>' : `
+  <table><tr><th>Record</th><th>IP</th><th>Changed</th><th>History</th><th></th></tr>
+  ${recs.map(n => { const r = byName[n] || {}; return `<tr><td><code>${esc(n)}</code></td><td>${esc(r.ip || "not updated yet")}</td><td class="mut">${esc(ago(r.since))}</td>
+    <td class="mut">${(r.history || []).slice(1, 4).map(h => esc(h.ip)).join(", ")}</td><td>${btn("Remove", `data-rm="${esc(n)}"`, true)}</td></tr>`; }).join("") || '<tr><td colspan="5" class="mut">none</td></tr>'}</table>
+  <div class="row"><input id="ddnew" placeholder="host.${esc(c.DOMAIN || "example.org")} or *.${esc(c.DOMAIN || "example.org")}" style="flex:1">${btn("Add record", 'id="ddadd"')}</div>
+  <div class="mut">Changes are applied by the installer on the host (DDNS-Updater is recreated); see the result below.</div>`}
+  <h2>Recent change requests</h2><div class="reqs mut">…</div>`;
+  const send = list => post("/api/ddns/request", {DDNS_RECORDS: list.join(",")}, "Update the DDNS records to: " + (list.join(", ") || "none") + "?").then(loadReqs);
+  el.querySelectorAll("[data-rm]").forEach(b => b.onclick = () => send(recs.filter(x => x !== b.dataset.rm)));
+  const add = $("#ddadd"); if (add) add.onclick = () => { const v = $("#ddnew").value.trim(); if (v) send(recs.concat([v])); };
+  loadReqs();
+}
+
+const loaders = {ts: loadTS, gl: loadGL, cs: loadCS, dd: loadDD};
 function show(t) { TAB = t; document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.t === t));
   document.querySelectorAll("section").forEach(s => s.classList.toggle("on", s.id === t)); try { localStorage.setItem("tab", t); } catch (e) {} refresh(); }
 async function refresh() { const el = $("#" + TAB); if (!el.innerHTML) el.innerHTML = '<div class="mut">Loading…</div>';
@@ -4989,6 +5095,17 @@ process_requests() {
                 ( stack_apply nopull ) >>"$LOG_FILE" 2>&1 || rc=$?
                 if (( rc == 0 )); then req_result "$dir/$id.res" ok "Server selection applied (countries: ${CFG[SERVER_COUNTRIES]:-any}); Gluetun recreated." "$action"
                 else req_result "$dir/$id.res" error "Apply failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
+            ddns_records)
+                v=${kv[DDNS_RECORDS]:-}
+                if [[ "${CFG[DDNS_PROVIDER]}" != cloudflare ]]; then
+                    req_result "$dir/$id.res" error "Records can be edited here only with DDNS_PROVIDER=cloudflare." "$action"; rm -f "$dir/$id.run"; continue
+                elif ! v_ddns_records "$v" || ! ddns_records_in_zone "$v"; then
+                    req_result "$dir/$id.res" error "Not a list of names under $(tls_zone): '$v'" "$action"; rm -f "$dir/$id.run"; continue
+                fi
+                CFG[DDNS_RECORDS]=$v; save_config
+                ( stack_apply nopull ) >>"$LOG_FILE" 2>&1 || rc=$?
+                if (( rc == 0 )); then req_result "$dir/$id.res" ok "DDNS records now: ${v:-none}; DDNS-Updater recreated." "$action"
+                else req_result "$dir/$id.res" error "Apply failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
             gluetun_recreate)
                 { compose_run up -d --force-recreate gluetun && compose_run up -d --remove-orphans; } >>"$LOG_FILE" 2>&1 || rc=$?
                 if (( rc == 0 )); then req_result "$dir/$id.res" ok "Gluetun and the apps behind it were recreated." "$action"
@@ -5000,6 +5117,232 @@ process_requests() {
     # keep the newest 20 results
     ls -1t "$dir"/req-*.res 2>/dev/null | tail -n +21 | while IFS= read -r f; do rm -f -- "$f"; done
     return 0
+}
+
+# -----------------------------------------------------------------------------
+# DDNS-UPDATER (qmcgaw/ddns-updater): records from the installer settings
+#   cloudflare: CONFIG env built here; the token is the vault's CLOUDFLARE_DNS_API_TOKEN (interpolated by compose)
+#   custom    : your own config.json (any provider) copied to <data>/ddns-updater/config.json
+# -----------------------------------------------------------------------------
+ddns_records_in_zone() {   # every name must be the zone or under it
+    local x z; z=$(tls_zone)
+    for x in ${1//,/ }; do [[ "${x#\*.}" == "$z" || "$x" == *".$z" ]] || return 1; done
+    return 0
+}
+ddns_config_json() {
+    local x out="" ttl=${CFG[DDNS_TTL]:-1} prox=false
+    [[ "${CFG[DDNS_PROXIED]}" == yes ]] && prox=true
+    for x in ${CFG[DDNS_RECORDS]//,/ }; do
+        out+="${out:+,}{\"provider\":\"cloudflare\",\"zone_identifier\":\"${CFG[DDNS_CF_ZONE_ID]}\",\"domain\":\"$x\",\"ttl\":$ttl,\"token\":\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\",\"proxied\":$prox,\"ip_version\":\"${CFG[DDNS_IP_VERSION]:-ipv4}\"}"
+    done
+    printf '{"settings":[%s]}' "$out"
+}
+ddns_ui_url() {
+    svc_enabled ddns-updater 2>/dev/null || return 0
+    if svc_enabled traefik 2>/dev/null; then printf 'https://ddns-updater.%s' "$(tls_zone)"
+    else printf 'http://%s:%s' "$(eff_local_ip)" "$(env_get "$FOLDER_FOR_YAML/.env" WEBUI_PORT_DDNS_UPDATER 2>/dev/null || echo 8310)"; fi
+}
+write_ddns_custom_config() {
+    [[ "${CFG[DDNS_PROVIDER]}" == custom ]] && svc_enabled ddns-updater || return 0
+    local f=${CFG[DDNS_CONFIG_FILE]} d="$FOLDER_FOR_DATA/ddns-updater"
+    [[ -f "$f" ]] || { log_warn "DDNS: DDNS_CONFIG_FILE '$f' not found; DDNS-Updater has no records."; return 0; }
+    [[ -d "$d" ]] || return 0
+    put_file "$f" "$d/config.json" 600
+    log_ok "DDNS: your config.json placed for DDNS-Updater"
+}
+ddns_problems() {
+    svc_enabled ddns-updater || return 0
+    case "${CFG[DDNS_PROVIDER]}" in
+        cloudflare)
+            [[ -n "${CFG[DDNS_RECORDS]}" ]] || echo "DDNS_RECORDS is empty"
+            [[ -n "${CFG[DDNS_CF_ZONE_ID]}" ]] || echo "DDNS_CF_ZONE_ID is not set (Cloudflare: domain overview page -> Zone ID)"
+            secret_is_set CLOUDFLARE_DNS_API_TOKEN || echo "CLOUDFLARE_DNS_API_TOKEN is not set (token with Zone.DNS edit)" ;;
+        custom) [[ -f "${CFG[DDNS_CONFIG_FILE]}" ]] || echo "DDNS_CONFIG_FILE is not set or missing" ;;
+    esac
+    return 0
+}
+
+cfg_ddns() {
+    section "Dynamic DNS (DDNS-Updater)"
+    log_info "DDNS-Updater keeps public DNS records pointing at your current public IP. Its own web page is"
+    log_info "status-only; the records are set here (or on the status board's DDNS tab)."
+    ask_valid "CFG[DDNS_PROVIDER]" "Provider (none/cloudflare/custom)" "${CFG[DDNS_PROVIDER]}" v_ddnsprov "none, cloudflare or custom"
+    case "${CFG[DDNS_PROVIDER]}" in
+        cloudflare)
+            local z t; z=$(tls_zone)
+            [[ -n "${CFG[DDNS_RECORDS]}" ]] || CFG[DDNS_RECORDS]="$z,*.$z"
+            while :; do
+                ask_valid "CFG[DDNS_RECORDS]" "Records (comma-separated, under $z)" "${CFG[DDNS_RECORDS]}" v_ddns_records "names such as $z,*.$z"
+                ddns_records_in_zone "${CFG[DDNS_RECORDS]}" && break
+                { (( ASSUME_YES )) || ! is_tty; } && die "DDNS_RECORDS must be $z or names under it."
+                log_warn "Every record must be $z or a name under it."
+            done
+            ask_valid "CFG[DDNS_CF_ZONE_ID]" "Cloudflare Zone ID (32 hex; dashboard -> $z -> Overview)" "${CFG[DDNS_CF_ZONE_ID]}" v_zoneid "32 hex characters"
+            ask_valid "CFG[DDNS_PROXIED]" "Proxy through Cloudflare (yes/no)" "${CFG[DDNS_PROXIED]}" v_yesno "yes or no"
+            ask_valid "CFG[DDNS_IP_VERSION]" "IP version (ipv4/ipv6/ipv4 or ipv6)" "${CFG[DDNS_IP_VERSION]}" v_ipver "ipv4, ipv6 or 'ipv4 or ipv6'"
+            [[ -f "$SECRETS_FILE" ]] && load_secrets || SECRETS_LOADED=1
+            if ! secret_is_set CLOUDFLARE_DNS_API_TOKEN && is_tty && ! (( ASSUME_YES )); then
+                log_info "Cloudflare API token with Zone -> DNS -> Edit for $z (stored in the vault; also used by Let's Encrypt mode)."
+                ask_secret t "Cloudflare API token"
+                if [[ -n "$t" ]]; then SECRETS[CLOUDFLARE_DNS_API_TOKEN]=$t; SECRETS_DIRTY=1; fi
+            fi ;;
+        custom)
+            ask_valid "CFG[DDNS_CONFIG_FILE]" "Your ddns-updater config.json (path)" "${CFG[DDNS_CONFIG_FILE]}" v_file "an existing file" ;;
+    esac
+    local l; while IFS= read -r l; do [[ -n "$l" ]] && log_warn "DDNS: $l"; done <<<"$(ddns_problems)"
+    if [[ "${CFG[SERVICE_PRESET]}" == custom && "${CFG[DDNS_PROVIDER]}" != none && "$(svc_state ddns-updater)" != on ]]; then
+        log_info "Turn on ddns-updater in Settings -> Services (custom preset)."
+    fi
+    return 0
+}
+v_ddnsprov() { [[ "$1" =~ ^(none|cloudflare|custom)$ ]]; }
+v_zoneid()   { [[ "$1" =~ ^[0-9a-f]{32}$ ]]; }
+v_ipver()    { [[ "$1" =~ ^(ipv4|ipv6|ipv4\ or\ ipv6)$ ]]; }
+
+# -----------------------------------------------------------------------------
+# DASHBOARDS: Homarr (apps via its API) and Heimdall (tiles in its database), same list as Homepage
+#   Both run in a throwaway python container (no python, sqlite or curl needed on the host).
+# -----------------------------------------------------------------------------
+declare -A DASH_COLOUR=( ["Media"]="#b7791f" ["Downloads"]="#2f6fed" ["Library"]="#15803d" ["Access & security"]="#b91c1c"
+                         ["Tools"]="#6d28d9" ["Other"]="#475569" )
+
+# dash_entries -> "group|title|href|description|icon-slug|lan-url" for every enabled service with a web UI
+dash_entries() {
+    local yaml facts envf="$FOLDER_FOR_YAML/.env" ip g grp s nm hosts href lan port icon
+    local -A F_NM=() F_HOSTS=()
+    yaml=$(compose_run config 2>/dev/null) || return 0
+    facts=$(compose_service_facts "$yaml"); ip=$(eff_local_ip)
+    while IFS='|' read -r s nm hosts _ _; do [[ -n "$s" ]] && { F_NM[$s]=$nm; F_HOSTS[$s]=$hosts; }; done <<<"$facts"
+    for g in "${HOMEPAGE_GROUPS[@]}"; do
+        grp=${g%%|*}; [[ "$grp" == Infrastructure ]] && continue
+        for s in ${g#*|}; do
+            [[ -n "${F_NM[$s]+x}" ]] || continue
+            port=$(env_get "$envf" "WEBUI_PORT_$(tr 'a-z-' 'A-Z_' <<<"$s")" 2>/dev/null || true)
+            lan=""; [[ "$port" =~ ^[0-9]+$ ]] && lan="http://$ip:$port$(web_path "$s")"
+            href=$lan
+            if svc_enabled traefik && [[ -n "${F_HOSTS[$s]}" ]]; then href=$(https_urls "$s" "${F_HOSTS[$s]%% *}"); fi
+            [[ -n "$href" ]] || continue
+            icon=${HOMEPAGE_ICON[$s]:-$s.png}; icon=${icon%.png}; [[ "$icon" == mdi-* ]] && icon=docker
+            printf '%s|%s|%s|%s|%s|%s\n' "$grp" "$(homepage_title "$s")" "$href" "${HOMEPAGE_DESC[$s]:-$s}" "$icon" "$lan"
+        done
+    done
+}
+
+# py_oneoff [docker run args...] -- SCRIPT : run SCRIPT in python:3.13-alpine on the stack network, stdin passed in
+py_oneoff() {
+    local -a args=()
+    while [[ $# -gt 0 && "$1" != -- ]]; do args+=("$1"); shift; done
+    shift
+    docker run --rm -i --network "$PROJECT_NAME" "${args[@]}" python:3.13-alpine python -c "$1"
+}
+
+HEIMDALL_PY='
+import sqlite3, sys, time
+MARK = "Managed by mediastack-installer"
+rows = [l.rstrip("\n").split("|") for l in sys.stdin if l.strip()]
+con = sqlite3.connect("/config/www/app.sqlite", timeout=30); cur = con.cursor()
+cols = {r[1] for r in cur.execute("PRAGMA table_info(items)")}
+need = {"title", "url", "pinned", "order", "type", "user_id", "appdescription", "colour", "description", "deleted_at"}
+if not need <= cols:
+    print("Heimdall database has an unexpected layout; not changed"); sys.exit(3)
+if not cur.execute("select count(*) from items where id = 0").fetchone()[0]:
+    print("Heimdall has not finished its first start (no dashboard tag yet)"); sys.exit(4)
+now = time.strftime("%Y-%m-%d %H:%M:%S")
+mine = {t: i for i, t in cur.execute("select id, title from items where appdescription = ? and deleted_at is null", (MARK,))}
+keep, added = set(), 0
+for n, r in enumerate(rows):
+    group, title, href, desc, icon, lan, colour = (r + [""] * 7)[:7]
+    if title in mine:
+        cur.execute("update items set url = ?, description = ?, colour = ?, \"order\" = ?, pinned = 1, updated_at = ? where id = ?",
+                    (href, desc, colour, n, now, mine[title]))
+    else:
+        cur.execute("insert into items (title, colour, url, description, pinned, \"order\", type, user_id, appdescription,"
+                    " created_at, updated_at) values (?, ?, ?, ?, 1, ?, 0, 0, ?, ?, ?)", (title, colour, href, desc, n, MARK, now, now))
+        cur.execute("insert into item_tag (item_id, tag_id, created_at, updated_at) values (?, 0, ?, ?)", (cur.lastrowid, now, now))
+        added += 1
+    keep.add(title)
+gone = [i for t, i in mine.items() if t not in keep]
+for i in gone:
+    cur.execute("update items set deleted_at = ? where id = ?", (now, i))
+con.commit()
+print("Heimdall: %d tiles (%d new, %d removed); your own tiles untouched" % (len(rows), added, len(gone)))
+'
+
+HOMARR_PY='
+import json, os, sys, urllib.error, urllib.request
+BASE, KEY, MARK = "http://homarr:7575", os.environ["HK"], "[MediaStack] "
+HDR = {"ApiKey": KEY, "Authorization": "Bearer " + KEY, "Content-Type": "application/json", "Accept": "application/json"}
+def call(method, path, body=None):
+    req = urllib.request.Request(BASE + path, data=None if body is None else json.dumps(body).encode(), method=method, headers=HDR)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        t = r.read().decode()
+    return json.loads(t) if t.strip() else None
+try:
+    apps = call("GET", "/api/apps") or []
+    if isinstance(apps, dict):
+        apps = apps.get("items") or apps.get("apps") or apps.get("data") or []
+    mine = {a.get("name"): a for a in apps if (a.get("description") or "").startswith(MARK)}
+    taken = {a.get("name") for a in apps}
+    rows = [l.rstrip("\n").split("|") for l in sys.stdin if l.strip()]
+    added = updated = removed = 0
+    for r in rows:
+        group, title, href, desc, icon, lan = (r + [""] * 6)[:6]
+        body = {"name": title, "description": MARK + desc, "href": href,
+                "iconUrl": "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/%s.png" % icon}
+        if lan:
+            body["pingUrl"] = lan
+        if title in mine:
+            call("PATCH", "/api/apps/" + str(mine[title]["id"]), body); updated += 1
+        elif title not in taken:
+            call("POST", "/api/apps", body); added += 1
+    wanted = {(r + ["", ""])[1] for r in rows}
+    for name, a in mine.items():
+        if name not in wanted:
+            call("DELETE", "/api/apps/" + str(a["id"])); removed += 1
+except urllib.error.HTTPError as e:
+    print("Homarr API: HTTP %s %s" % (e.code, e.read().decode()[:200])); sys.exit(5)
+except Exception as e:
+    print("Homarr API not reachable: %s" % e); sys.exit(6)
+print("Homarr: %d apps added, %d updated, %d removed (your own apps untouched)" % (added, updated, removed))
+'
+
+sync_heimdall() {
+    svc_enabled heimdall || return 0
+    (( DRY_RUN )) && return 0
+    local db="$FOLDER_FOR_DATA/heimdall/www/app.sqlite" i out entries g rest
+    for (( i = 0; i < 12; i++ )); do [[ -s "$db" ]] && break; sleep 5; done   # first start creates it
+    [[ -s "$db" ]] || { log_info "Heimdall: database not created yet; its tiles are added on the next Apply."; return 0; }
+    entries=$(dash_entries | while IFS='|' read -r g rest; do printf '%s|%s|%s\n' "$g" "$rest" "${DASH_COLOUR[$g]:-#475569}"; done)
+    [[ -n "$entries" ]] || return 0
+    # runs as the service account: SQLite's journal files must stay writable for Heimdall
+    if out=$(py_oneoff --user "$PUID:$PGID" -v "$FOLDER_FOR_DATA/heimdall:/config" -- "$HEIMDALL_PY" <<<"$entries" 2>&1); then
+        log_ok "$out"
+    else
+        log_warn "Heimdall not updated: ${out##*$'\n'}"
+    fi
+}
+
+sync_homarr() {
+    svc_enabled homarr || return 0
+    (( DRY_RUN )) && return 0
+    if ! secret_is_set HOMARR_API_KEY; then
+        log_info "Homarr: to fill it with your apps, finish its first-start setup, create an API key there (Management ->"
+        log_info "Tools -> API), then run Post-install helpers -> 8 (or set HOMARR_API_KEY in Secrets) and Apply."
+        return 0
+    fi
+    local out
+    if out=$(HK=${SECRETS[HOMARR_API_KEY]} py_oneoff -e HK -- "$HOMARR_PY" <<<"$(dash_entries)" 2>&1); then log_ok "$out"
+    else log_warn "Homarr apps not synced: ${out##*$'\n'}"; fi
+}
+
+helper_homarr_key() {
+    require_config; resolve_runtime; load_secrets
+    is_tty || die "This helper is interactive."
+    log_info "In Homarr (https://homarr.$(tls_zone)): Management -> Tools -> API -> create an API key, then paste it here."
+    local k; ask_secret k "Homarr API key"
+    [[ -n "$k" ]] || die "No key entered."
+    SECRETS[HOMARR_API_KEY]=$k; save_secrets
+    sync_homarr
 }
 
 # -----------------------------------------------------------------------------
@@ -5501,6 +5844,13 @@ declare -A CONF_HELP=(
     [SERVER_HOSTNAMES]="Gluetun server filter: server hostnames, comma-separated (blank = any)"
     [VPN_SERVERS_UPDATE_PERIOD]="Gluetun updates its VPN server list this often, e.g. 480h (min 360h); off = never"
     [VPN_UPDATER_PROTON_EMAIL]="protonvpn: Proton account email for server-list updates (password in the vault)"
+    [DDNS_PROVIDER]="none | cloudflare | custom (your own ddns-updater config.json): DDNS-Updater keeps public DNS on your IP"
+    [DDNS_RECORDS]="cloudflare: comma-separated names to keep updated, e.g. example.org,*.example.org"
+    [DDNS_CF_ZONE_ID]="cloudflare: Zone ID (domain overview page in the Cloudflare dashboard)"
+    [DDNS_TTL]="cloudflare: record TTL in seconds (1 = automatic)"
+    [DDNS_PROXIED]="cloudflare: yes | no -- route the records through Cloudflare's proxy"
+    [DDNS_IP_VERSION]="ipv4 | ipv6 | ipv4 or ipv6"
+    [DDNS_CONFIG_FILE]="custom: path of your ddns-updater config.json (any provider it supports)"
     [CERT_FETCH_SOURCE]="fetch mode: user@host:/folder holding the certificate files"
     [CERT_FETCH_CERT]="fetch mode: full-chain certificate file name in that folder"
     [CERT_FETCH_KEY]="fetch mode: private key file name in that folder"
@@ -5567,6 +5917,13 @@ validate_key() {   # validate_key KEY VALUE
         VPN_SERVICE_PROVIDER) [[ -n "$v" ]] ;;
         SERVER_REGIONS|SERVER_COUNTRIES|SERVER_CITIES|SERVER_HOSTNAMES) [[ "$v" != *[=\[\]#/]* ]] ;;
         VPN_SERVERS_UPDATE_PERIOD) [[ "$v" == off || "$v" =~ ^[0-9]+h$ ]] ;;
+        DDNS_PROVIDER) [[ "$v" =~ ^(none|cloudflare|custom)$ ]] ;;
+        DDNS_RECORDS) v_ddns_records "$v" ;;
+        DDNS_CF_ZONE_ID) [[ -z "$v" || "$v" =~ ^[0-9a-f]{32}$ ]] ;;
+        DDNS_TTL) [[ "$v" =~ ^[0-9]+$ ]] ;;
+        DDNS_PROXIED) v_yesno "$v" ;;
+        DDNS_IP_VERSION) [[ "$v" =~ ^(ipv4|ipv6|ipv4\ or\ ipv6)$ ]] ;;
+        DDNS_CONFIG_FILE) [[ -z "$v" ]] || v_path "$v" ;;
         VPN_UPDATER_PROTON_EMAIL) [[ -z "$v" || "$v" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ;;
         CLOUDFLARE_EMAIL|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
         DISABLED_SERVICES|REMOVED_SERVICES|EXTRA_PACKAGES|MEDIA_SMB_DOMAIN|MEDIA_MOUNT_OPTS|DATA_MOUNT_OPTS) return 0 ;;
@@ -6020,6 +6377,10 @@ services:
     image: v
   homarr:
     image: ghcr.io/ajnart/homarr:latest
+  heimdall:
+    image: hd
+  ddns-updater:
+    image: dd
   tailscale:
     image: ts
   headscale:
@@ -6078,14 +6439,14 @@ FIX
                 CFG[SERVICE_PRESET]=$4; CFG[CERT_MODE]=${5:-letsencrypt}; apply_preset; }
     st_on()  { local s; for s in "$@"; do [[ "$(eff_state "$s")" == on ]] || return 1; done; }
     st_off() { local s; for s in "$@"; do [[ "$(eff_state "$s")" != on ]] || return 1; done; }
-    st "preset core/internet"              '( st_prep internet jellyfin tailscale core; st_on gluetun qbittorrent sonarr jellyfin traefik traefik-certs-dumper crowdsec authentik postgresql valkey tailscale audiobookshelf && st_off plex homarr headscale headplane whisparr && [[ $(svc_state readarr) == removed && -z "$(check_dependencies)" ]] )'
+    st "preset core/internet"              '( st_prep internet jellyfin tailscale core; st_on gluetun qbittorrent sonarr jellyfin traefik traefik-certs-dumper crowdsec authentik postgresql valkey tailscale audiobookshelf homarr heimdall statusboard && st_off plex headscale headplane whisparr ddns-updater && [[ $(svc_state readarr) == removed && -z "$(check_dependencies)" ]] )'
     st "preset core/lan"                   '( st_prep lan plex tailscale core selfsigned; st_on plex gluetun tailscale && st_off jellyfin traefik crowdsec authentik postgresql valkey && [[ -z "$(check_dependencies)" ]] )'
     st "preset core + headscale"           '( st_prep internet both headscale core; st_on headscale headplane jellyfin plex && [[ -z "$(check_dependencies)" ]] )'
     st "preset full"                       '( st_prep internet jellyfin tailscale full; st_on homarr headscale plex traefik && [[ $(svc_state whisparr) == disabled && $(svc_state readarr) == removed ]] )'
     st "compose_deps (map, list, network_mode)" '( d=$(compose_deps "$t/y/docker-compose.yaml"); grep -qx "jellyfin gluetun" <<<"$d" && grep -qx "headplane headscale" <<<"$d" && grep -qx "sonarr gluetun" <<<"$d" && grep -qx "authentik valkey" <<<"$d" )'
     st "dependency problems detected"      '( st_prep internet jellyfin tailscale core; CFG[SERVICE_PRESET]=custom; set_svc_state gluetun disabled; set_svc_state crowdsec disabled; set_svc_state postgresql removed; d=$(check_dependencies); grep -qx "jellyfin needs gluetun" <<<"$d" && grep -qx "traefik needs crowdsec" <<<"$d" && grep -qx "authentik needs postgresql" <<<"$d" )'
     st "homarr patch: homarr-labs + !override" '( st_prep internet jellyfin tailscale full; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"image: ghcr.io/homarr-labs/homarr:latest"* && "$o" == *"volumes: !override"* && "$o" == *"SECRET_ENCRYPTION_KEY=\${SECRET_ENCRYPTION_KEY:?err}"* ]] )'
-    st "disabled + patched -> one block"   '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ $(grep -c "^  homarr:" <<<"$o") == 1 ]] && [[ "$(awk "/^  homarr:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o")" == *profiles* ]] )'
+    st "disabled + patched -> one block"   '( st_prep internet jellyfin tailscale core; CFG[SERVICE_PRESET]=custom; set_svc_state homarr disabled; o=$(render_override "$t/y/docker-compose.yaml"); [[ $(grep -c "^  homarr:" <<<"$o") == 1 ]] && [[ "$(awk "/^  homarr:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o")" == *profiles* ]] )'
     st "tailscale patch follows control"   '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"TS_EXTRA_ARGS=--hostname=exit-node --advertise-exit-node"* && "$o" != *login-server* ]] && st_prep internet jellyfin headscale core && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *TS_EXTRA_ARGS* ]] )'
     st "certs-dumper auto-off unless LE"   '( st_prep internet jellyfin tailscale core selfsigned; [[ $(svc_state traefik-certs-dumper) == on && $(eff_state traefik-certs-dumper) == disabled ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$(awk "/^  traefik-certs-dumper:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o")" == *profiles* ]] )'
     st "secrets needed follow services"    '( st_prep lan jellyfin tailscale core selfsigned; ! secret_needed CLOUDFLARE_DNS_API_TOKEN && secret_needed TAILSCALE_AUTHKEY && secret_needed VPN_PASSWORD && ! secret_needed PLEX_CLAIM && st_prep internet plex tailscale core letsencrypt && secret_needed CLOUDFLARE_DNS_API_TOKEN && secret_needed PLEX_CLAIM )'
@@ -6183,6 +6544,7 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "SABnzbd host_whitelist edit"       '( f="$t/sab.ini"; printf "[misc]\nhost_whitelist = 9f2c1a, \nport = 8080\n[servers]\nhost_whitelist = x\n" >"$f"; ini_whitelist_add "$f" sabnzbd.example.org && grep -qx "host_whitelist = 9f2c1a, sabnzbd.example.org" "$f" && grep -qx "host_whitelist = x" "$f" && ! ini_whitelist_add "$f" SABnzbd.example.org && printf "[misc]\nhost_whitelist = \n" >"$f" && ini_whitelist_add "$f" a.b && grep -qx "host_whitelist = a.b" "$f" )'
     st "web UI paths (Plex, Traefik)"      '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
+    st "DDNS settings and config"          '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; CFG[DDNS_PROVIDER]=cloudflare; CFG[DDNS_RECORDS]="certifiedgeeks.net,*.certifiedgeeks.net"; CFG[DDNS_CF_ZONE_ID]=0123456789abcdef0123456789abcdef; j=$(ddns_config_json); [[ "$j" == "{\"settings\":[{\"provider\":\"cloudflare\",\"zone_identifier\":\"0123456789abcdef0123456789abcdef\",\"domain\":\"certifiedgeeks.net\""* && "$j" == *"\"domain\":\"*.certifiedgeeks.net\""* && "$j" == *"\"token\":\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\""* ]] && { ! command -v python3 >/dev/null || python3 -c "import json,sys; json.loads(sys.argv[1].replace(\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\",\"t\"))" "$j"; } && ddns_records_in_zone "certifiedgeeks.net,*.certifiedgeeks.net,a.certifiedgeeks.net" && ! ddns_records_in_zone "evil.org" && v_ddns_records "*.x.org,y.org" && ! v_ddns_records "a b" && apply_preset && st_on ddns-updater && o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"- '"'"'CONFIG={\"settings\""* ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
@@ -6226,7 +6588,8 @@ menu_helpers() {
     printf '  1) Secure Authentik database (grants)\n  2) Create Guacamole database + schema\n'
     printf '  3) Reset Authentik akadmin password\n  4) Show *ARR API keys (optionally store in vault)\n'
     printf '  5) Update Gluetun VPN server list now\n  6) VPN check (Gluetun health, errors, WireGuard handshake)\n'
-    printf '  7) Traefik check (router errors, config files, served certificate)\n  0) Back\n'
+    printf '  7) Traefik check (router errors, config files, served certificate)\n'
+    printf '  8) Homarr: store API key and add the apps\n  0) Back\n'
     local ch; read -rp "  Choice: " ch || return 0
     case "$ch" in
         1) menu_action helper_authentik_db ;;
@@ -6236,6 +6599,7 @@ menu_helpers() {
         5) menu_action vpn_update_servers ;;
         6) menu_action vpn_check ;;
         7) menu_action traefik_check ;;
+        8) menu_action helper_homarr_key ;;
     esac
 }
 
@@ -6327,6 +6691,7 @@ Actions (default: interactive menu)
   --cert-receive         Push receiver: read chain + key on stdin (run by the forced SSH command)
   --process-requests     Apply status board change requests (run by the mediastack-requests.path unit)
   --helper NAME          authentik-db | guacamole | akadmin | apikeys | vpn-servers | vpn-check | traefik-check
+                         | homarr-key
   --settings             Settings menu (paths, network, storage, services, ...)
   --test-storage T       Trial-mount MEDIA or DATA share; check write + hardlinks
   --secrets              Secrets menu
@@ -6464,7 +6829,8 @@ main() {
                 vpn-servers)  vpn_update_servers ;;
                 vpn-check)    vpn_check ;;
                 traefik-check) traefik_check ;;
-                *)            die "Unknown helper '$helper' (authentik-db|guacamole|akadmin|apikeys|vpn-servers|vpn-check|traefik-check)" ;;
+                homarr-key)   helper_homarr_key ;;
+                *)            die "Unknown helper '$helper' (authentik-db|guacamole|akadmin|apikeys|vpn-servers|vpn-check|traefik-check|homarr-key)" ;;
             esac ;;
     esac
     _log_file INFO "Finished action=$action"
