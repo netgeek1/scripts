@@ -603,6 +603,28 @@ Upstream still ships the legacy `ghcr.io/ajnart/homarr` (0.x) image. The install
 
 Homarr is off in the Core preset and on in Full.
 
+### Authentik sign-in (forward auth)
+
+With Traefik and Authentik enabled, every app hostname goes through Authentik's sign-in. The installer sets this up
+with no clicks in the admin console:
+
+- **Blueprint** `<data>/authentik/blueprints/mediastack-forward-auth.yaml`, mounted read-only into Authentik's server
+  and worker as `/blueprints/mediastack`. It is rewritten on every apply, and Authentik applies it when it changes.
+  It creates or updates:
+  - the proxy provider **Provider for Authentik**: *Forward auth (domain level)*, external host
+    `https://auth.<domain>`, cookie domain `<domain>`, default authorization/authentication/invalidation flows
+  - the application **Authentik** (slug `authentik`) using it
+  - the **authentik Embedded Outpost**: serves that provider, with `authentik_host: https://auth.<domain>/`. Without
+    it, the outpost sends browsers to `http://0.0.0.0:9000/...`.
+  These names match upstream's manual steps, so objects you created by hand are updated in place, not duplicated.
+  Changes you make to these three objects in the admin console are overwritten when the blueprint is re-applied;
+  use other names for your own objects.
+- **First admin password:** `AUTHENTIK_BOOTSTRAP_PASSWORD` is generated into the vault and passed to Authentik.
+  Authentik uses it only when it creates `akadmin` on a new database. Reveal it with Secrets → 4. On an Authentik
+  that is already set up, set the password with Post-install helpers → 3.
+
+Sign in once at any app hostname, and the cookie covers all of `*.<domain>`.
+
 ### CrowdSec bouncer (Traefik plugin)
 
 Every HTTPS router upstream uses the `traefik-bouncer@file` middleware, which is the CrowdSec bouncer
@@ -831,7 +853,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 82 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 83 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
