@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.3.0"
+readonly SCRIPT_VERSION="3.3.1"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2292,20 +2292,29 @@ render_pf_script() {
 #!/bin/sh
 # Managed by mediastack-installer -- Gluetun runs it when the forwarded port changes:
 #   up PORT INTERFACE QBT_PORT | down - - QBT_PORT
-# qBittorrent shares Gluetun's network, so its Web API is on 127.0.0.1 (localhost needs no login; set by the installer).
-case "$1" in
-    up)   data="json={\"listen_port\":$2,\"current_network_interface\":\"$3\",\"random_port\":false,\"upnp\":false}" ;;
-    down) data='json={"listen_port":0,"current_network_interface":"lo"}' ;;
-    *)    exit 2 ;;
-esac
-i=0
+# Gluetun waits for this hook while holding its port-forwarding lock (its control server can't report the port
+# meanwhile), so the hook starts the work in the background and returns at once. The outcome goes to
+# /gluetun/mediastack-pf-qbittorrent.status (shown on the status board).
+# qBittorrent shares Gluetun's network: its Web API is on 127.0.0.1 (no login from localhost; set by the installer).
+st=${MS_PF_STATUS:-/gluetun/mediastack-pf-qbittorrent.status}
+case "$1" in up|down) ;; *) exit 2 ;; esac
+if [ "$5" != bg ]; then
+    nohup /bin/sh "$0" "$1" "$2" "$3" "$4" bg >/dev/null 2>&1 &
+    echo "qBittorrent: setting the listening port ($1 $2) in the background; result in $st"
+    exit 0
+fi
+if [ "$1" = up ]; then data="json={\"listen_port\":$2,\"current_network_interface\":\"$3\",\"random_port\":false,\"upnp\":false}"
+else data='json={"listen_port":0,"current_network_interface":"lo"}'; fi
+report() { printf 'time=%s\naction=%s\nport=%s\nresult=%s\ndetail=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" >"$st.tmp" && mv -f "$st.tmp" "$st"; }
+report "$1" "$2" pending "waiting for qBittorrent on 127.0.0.1:$4"
+i=0; err=""
 while [ "$i" -lt 30 ]; do
-    if wget -q -O- -T 10 --post-data "$data" "http://127.0.0.1:$4/api/v2/app/setPreferences" >/dev/null 2>&1; then
-        echo "qBittorrent: listening port set ($1 $2)"; exit 0
+    if err=$(wget -q -O /dev/null -T 10 --post-data "$data" "http://127.0.0.1:$4/api/v2/app/setPreferences" 2>&1); then
+        report "$1" "$2" ok "qBittorrent listening port set"; exit 0
     fi
     i=$((i + 1)); sleep 10
 done
-echo "qBittorrent: Web API on 127.0.0.1:$4 did not answer; port not set"
+report "$1" "$2" failed "qBittorrent Web API on 127.0.0.1:$4 did not accept it: $(echo "$err" | tr '\n' ' ' | cut -c1-160)"
 exit 1
 SH
 }
@@ -4759,8 +4768,22 @@ def servers_info(provider):
         return {"error": str(e)[:120]}
 
 
+def pf_qbt_status():
+    """Outcome of the installer's port hook (qBittorrent listening port), written by the hook in Gluetun's folder."""
+    out = {}
+    try:
+        with open(os.path.join(GLUETUN_DIR, "mediastack-pf-qbittorrent.status")) as f:
+            for line in f:
+                k, _, v = line.rstrip("\n").partition("=")
+                if k in ("time", "action", "port", "result", "detail"):
+                    out[k] = v[:240]
+    except OSError:
+        pass
+    return out
+
+
 def gluetun_status():
-    out = {"config": CONFIG, "servers": servers_info(CONFIG.get("VPN_SERVICE_PROVIDER", ""))}
+    out = {"config": CONFIG, "servers": servers_info(CONFIG.get("VPN_SERVICE_PROVIDER", "")), "qbt": pf_qbt_status()}
     for key, path in (("vpn", "/v1/vpn/status"), ("public_ip", "/v1/publicip/ip"), ("port_forward", "/v1/portforward"),
                       ("updater", "/v1/updater/status"), ("dns", "/v1/dns/status")):
         try:
@@ -5088,7 +5111,11 @@ button.act { border:1px solid var(--line); background:var(--card); color:var(--f
 button.act:hover { border-color:var(--acc) } button.act.danger:hover { border-color:var(--bad); color:var(--bad) } button:disabled { opacity:.45; cursor:not-allowed }
 input { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:inherit; min-width:0 }
 .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0 } a { color:var(--acc) } code { font-size:12px }
-#toast { position:fixed; right:16px; bottom:16px; max-width:420px; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px; display:none; box-shadow:0 6px 24px rgba(0,0,0,.18) }
+#toast { position:fixed; right:16px; bottom:16px; max-width:440px; background:var(--card); border:1px solid var(--line); border-left:4px solid var(--acc); border-radius:10px; padding:10px 14px; display:none; box-shadow:0 6px 24px rgba(0,0,0,.18); z-index:10 }
+#toast.ok { border-left-color:var(--ok) } #toast.bad { border-left-color:var(--bad) } #toast .t { font-weight:600; margin-bottom:2px }
+.spin { display:inline-block; width:.9em; height:.9em; border:2px solid var(--line); border-top-color:var(--acc); border-radius:50%; animation:spin .8s linear infinite; vertical-align:-2px; margin-right:6px }
+@keyframes spin { to { transform:rotate(360deg) } }
+@media (prefers-reduced-motion: reduce) { .spin { animation:none; border-top-color:var(--acc) } }
 @media (max-width:640px) { header { flex-wrap:wrap } td,th { padding:6px } }
 </style>
 </head>
@@ -5104,7 +5131,7 @@ input { background:var(--bg); color:var(--fg); border:1px solid var(--line); bor
   <section id="cs"></section>
   <section id="dd"></section>
 </main>
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite"></div>
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
@@ -5114,13 +5141,52 @@ const ago = t => { if (!t || t.startsWith("0001")) return ""; const s = (Date.no
   return s < 90 ? "just now" : s < 5400 ? Math.round(s/60) + " min ago" : s < 129600 ? Math.round(s/3600) + " h ago" : Math.round(s/86400) + " d ago"; };
 const dot = ok => `<span class="dot ${ok === true ? "ok" : ok === false ? "bad" : ""}"></span>`;
 let CAN = false, TAB = "ts";
-function toast(msg, bad) { const t = $("#toast"); t.innerHTML = (bad ? '<span class="err">' : "<span>") + esc(msg) + "</span>"; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 6000); }
+// toast(msg, bad) -- short result; status(title, detail, state) -- state: "busy" (stays, spinner) | "ok" | "bad"
+function toast(msg, bad) { status(bad ? "Failed" : "Done", msg, bad ? "bad" : "ok"); }
+function status(title, detail, state) {
+  const t = $("#toast"); clearTimeout(t._h);
+  t.className = state === "busy" ? "" : state;
+  t.innerHTML = `<div class="t">${state === "busy" ? '<span class="spin"></span>' : ""}${esc(title)}</div>${detail ? `<div class="mut">${esc(detail)}</div>` : ""}`;
+  t.style.display = "block";
+  if (state !== "busy") t._h = setTimeout(() => t.style.display = "none", state === "bad" ? 12000 : 7000);
+}
+let lastBtn = null;
+document.addEventListener("click", e => { const b = e.target.closest && e.target.closest("button.act"); if (b) lastBtn = b; }, true);
+const REQ_STATE = {queued: "Queued: waiting for the installer on the host", running: "The installer is applying it (Gluetun restarts; up to a few minutes)"};
+async function followRequest(id, what) {
+  const until = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < until) {
+    await new Promise(r => setTimeout(r, 3000));
+    const j = await get("/api/requests").catch(() => null);
+    const r = j && j.ok && Array.isArray(j.data) ? j.data.find(x => x.id === id) : null;
+    loadReqs();
+    if (!r) continue;
+    if (r.state === "done") {
+      status(r.status === "ok" ? what + ": done" : what + ": failed", r.message || r.status, r.status === "ok" ? "ok" : "bad");
+      const cur = document.querySelector("nav button.on"); if (cur) setTimeout(() => cur.click(), 1500);
+      return;
+    }
+    status(what, REQ_STATE[r.state] || r.state, "busy");
+  }
+  status(what + ": still pending", "No result after 10 minutes. Check sudo journalctl -u mediastack-requests on the host.", "bad");
+}
 async function get(p) { const r = await fetch(p, {cache: "no-store"}); return r.json(); }
 async function post(p, body, confirmText) {
+  const b = lastBtn; lastBtn = null;
   if (confirmText && !confirm(confirmText)) return null;
-  const r = await fetch(p, {method: "POST", headers: {"Content-Type": "application/json", "X-Statusboard": "1"}, body: JSON.stringify(body || {})});
-  const j = await r.json().catch(() => ({ok: false, error: "HTTP " + r.status}));
-  toast(j.ok ? "Done" : j.error, !j.ok); return j;
+  const what = b ? b.textContent.trim() : "Action", label = b ? b.innerHTML : "";
+  if (b) { b.disabled = true; b.innerHTML = '<span class="spin"></span>Working…'; }
+  status(what, p.endsWith("/request") ? "Sending the change request…" : "Working…", "busy");
+  let j;
+  try {
+    const r = await fetch(p, {method: "POST", headers: {"Content-Type": "application/json", "X-Statusboard": "1"}, body: JSON.stringify(body || {})});
+    j = await r.json().catch(() => ({ok: false, error: "HTTP " + r.status}));
+  } catch (e) { j = {ok: false, error: "no answer from the status board (" + e.message + ")"}; }
+  if (b) { b.disabled = false; b.innerHTML = label; }
+  if (!j.ok) status(what + ": failed", j.error, "bad");
+  else if (j.data && j.data.id && p.endsWith("/request")) { status(what, REQ_STATE.queued, "busy"); followRequest(j.data.id, what); }
+  else if (!p.endsWith("/tailscale/ping")) status(what + ": done", typeof j.data === "string" ? j.data : "", "ok");
+  return j;
 }
 const btn = (label, attrs, danger) => `<button class="act${danger ? " danger" : ""}" ${CAN ? "" : 'disabled title="Changes need https://status.&lt;domain&gt; with Authentik sign-in"'} ${attrs}>${esc(label)}</button>`;
 const card = (k, v, sub) => `<div class="card"><div class="k">${esc(k)}</div><div class="v">${v}</div>${sub ? `<div class="mut">${sub}</div>` : ""}</div>`;
@@ -5163,7 +5229,10 @@ async function loadGL() {
   el.innerHTML = `<div class="grid">
     ${card("VPN", dot(vpn.error ? null : running) + esc(vpn.error ? "unreachable" : vpn.status), vpn.error ? '<span class="err">' + esc(vpn.error) + "</span>" : esc(c.VPN_SERVICE_PROVIDER + " / " + c.VPN_TYPE))}
     ${card("Public IP", esc(ip.public_ip || "—"), esc([ip.city, ip.region, ip.country].filter(Boolean).join(", ")) + (ip.organization ? "<br>" + esc(ip.organization) : ""))}
-    ${card("Forwarded port", esc(pf.port || "none"), pf.error ? '<span class="mut">' + esc(pf.error) + "</span>" : "")}
+    ${card("Forwarded port", esc(pf.port || (pf.ports && pf.ports[0]) || "none"), (pf.error ? '<span class="mut">' + esc(pf.error) + "</span>" : "") +
+        (d.qbt && d.qbt.result ? (pf.error ? "<br>" : "") + dot(d.qbt.result === "ok" ? true : d.qbt.result === "pending" ? null : false) +
+          esc("qBittorrent " + (d.qbt.result === "ok" ? "uses port " + d.qbt.port : d.qbt.result === "pending" ? "being set to " + d.qbt.port : "not set: " + (d.qbt.detail || ""))) +
+          '<div class="mut">' + esc(d.qbt.time ? new Date(d.qbt.time).toLocaleString() : "") + "</div>" : ""))}
     ${card("Server list", c.VPN_SERVICE_PROVIDER === "custom" ? "—" : (d.servers && d.servers.timestamp ? esc(new Date(d.servers.timestamp * 1000).toLocaleString()) : "—"),
         c.VPN_SERVICE_PROVIDER === "custom" ? '<span class="mut">provider custom has no server list</span>' :
         (d.servers && d.servers.timestamp ? esc(d.servers.count + " servers · updater " + (up.status || "?")) : '<span class="mut">' + esc((d.servers && d.servers.error) || "unknown") + "</span>"))}
@@ -7235,7 +7304,7 @@ FIX
     st "hostnames: override merge"          '( st_prep internet both tailscale core; CFG[SERVICE_HOSTNAMES]="sonarr=tv,sonarr homarr=home statusboard=board qbittorrent=qb plex=watch"; o=$(render_override "$t/hz/docker-compose.yaml"); [[ $(grep -c "^  sonarr:" <<<"$o") == 1 && $(grep -c "^  homarr:" <<<"$o") == 1 ]] && grep -qF "routers.sonarr.rule=Host(\`tv.\${CLOUDFLARE_DNS_ZONE:?err}\`) || Host(\`sonarr.\${CLOUDFLARE_DNS_ZONE:?err}\`)" <<<"$o" && grep -qF "routers.plex.rule=Host(\`watch.\${CLOUDFLARE_DNS_ZONE:?err}\`) && PathPrefix(\`/web/\`)" <<<"$o" && grep -qF "routers.homarr.rule=Host(\`home." <<<"$o" && grep -qF "routers.statusboard.rule=Host(\`board." <<<"$o" && ! grep -qF "Host(\`status." <<<"$o" && grep -q "qbittorrent: no Traefik router" <<<"$o" && [[ $(awk "/^  homarr:/{f=1;next} /^  [a-z]/{f=0} f && /^    labels:/" <<<"$o" | wc -l) == 1 ]] )'
     st "hostnames menu: fresh menu session" '( st_prep internet both tailscale core; CFG[FOLDER_FOR_YAML]=$t/hz; FOLDER_FOR_YAML=""; printf "WEBUI_PORT_SONARR=8989\n" >$t/hz/.env; detect_network() { :; }; ask() { printf -v "$1" "%s" ""; }; o=$(cfg_urls 2>&1); [[ "$o" == *"Hostnames (."* && "$o" == *" sonarr "* && "$o" == *8989* && "$o" != *"Install first"* ]] )'
     st "port forwarding: gluetun patch"     '( st_prep internet jellyfin tailscale core; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=protonvpn; CFG[VPN_PORT_FORWARDING]=on; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"VPN_PORT_FORWARDING=on"* && "$o" == *"PORT_FORWARD_ONLY=on"* && "$o" == *"VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh /gluetun/mediastack-pf-qbittorrent.sh up {{PORT}} {{VPN_INTERFACE}} \${WEBUI_PORT_QBITTORRENT:?err}"* && "$o" != *"VPN_PORT_FORWARDING_PROVIDER=protonvpn"* ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[VPN_ENDPOINT_IP]=203.0.113.9 && CFG[VPN_PORT_FORWARDING_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"VPN_PORT_FORWARDING_PROVIDER=protonvpn"* && "$o" != *PORT_FORWARD_ONLY* ]] && CFG[VPN_PF_QBITTORRENT]=no && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UP_COMMAND* ]] && CFG[VPN_PORT_FORWARDING]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *"- VPN_PORT_FORWARDING=on"* && "$o" != *UP_COMMAND* ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && CFG[VPN_PORT_FORWARDING]=on && ! vpn_pf_on )'
-    st "port forwarding: hook + qbt conf"   '( mkdir -p $t/pf/bin; printf "#!/bin/sh\nfor a; do case \"\$a\" in json=*) printf \"%%s\\\\n\" \"\$a\" >>$t/pf/data;; http*) printf \"%%s\\\\n\" \"\$a\" >>$t/pf/url;; esac; done\nexit 0\n" >$t/pf/bin/wget; chmod +x $t/pf/bin/wget; render_pf_script >$t/pf/s.sh; sh -n $t/pf/s.sh && PATH=$t/pf/bin:$PATH sh $t/pf/s.sh up 45123 wg0 8200 >/dev/null && grep -qx "json={\"listen_port\":45123,\"current_network_interface\":\"wg0\",\"random_port\":false,\"upnp\":false}" $t/pf/data && grep -qx "http://127.0.0.1:8200/api/v2/app/setPreferences" $t/pf/url && st_prep internet jellyfin tailscale core && CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=protonvpn && CFG[VPN_PORT_FORWARDING]=on && FOLDER_FOR_DATA=$t/pf && mkdir -p $t/pf/qbittorrent/qBittorrent && printf "[BitTorrent]\nSession\\\\Port=1\n\n[Preferences]\nWebUI\\\\Port=8200\nWebUI\\\\LocalHostAuth=true\n" >$t/pf/qbittorrent/qBittorrent/qBittorrent.conf && docker() { :; } && sleep() { :; } && ensure_qbt_localhost >/dev/null && [[ $(grep -c "^WebUI\\\\LocalHostAuth=" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf) == 1 ]] && grep -q "^WebUI\\\\LocalHostAuth=false" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf && grep -q "^Session\\\\Port=1" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf && CFG[WIREGUARD_ADDRESSES]=10.2.0.2/32 && looks_like_proton && CFG[WIREGUARD_ADDRESSES]=10.64.1.2/32 && ! looks_like_proton && v_wgpub "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=" && ! v_wgpub "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgy=" )'
+    st "port forwarding: hook + qbt conf"   '( mkdir -p $t/pf/bin; printf "#!/bin/sh\nfor a; do case \"\$a\" in json=*) printf \"%%s\\\\n\" \"\$a\" >>$t/pf/data;; http*) printf \"%%s\\\\n\" \"\$a\" >>$t/pf/url;; esac; done\nexit 0\n" >$t/pf/bin/wget; chmod +x $t/pf/bin/wget; render_pf_script >$t/pf/s.sh; sh -n $t/pf/s.sh && PATH=$t/pf/bin:$PATH MS_PF_STATUS=$t/pf/st sh $t/pf/s.sh up 45123 wg0 8200 bg >/dev/null && grep -q "^result=ok" $t/pf/st && grep -q "^port=45123" $t/pf/st && grep -qx "json={\"listen_port\":45123,\"current_network_interface\":\"wg0\",\"random_port\":false,\"upnp\":false}" $t/pf/data && grep -qx "http://127.0.0.1:8200/api/v2/app/setPreferences" $t/pf/url && st_prep internet jellyfin tailscale core && CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=protonvpn && CFG[VPN_PORT_FORWARDING]=on && FOLDER_FOR_DATA=$t/pf && mkdir -p $t/pf/qbittorrent/qBittorrent && printf "[BitTorrent]\nSession\\\\Port=1\n\n[Preferences]\nWebUI\\\\Port=8200\nWebUI\\\\LocalHostAuth=true\n" >$t/pf/qbittorrent/qBittorrent/qBittorrent.conf && docker() { :; } && sleep() { :; } && ensure_qbt_localhost >/dev/null && [[ $(grep -c "^WebUI\\\\LocalHostAuth=" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf) == 1 ]] && grep -q "^WebUI\\\\LocalHostAuth=false" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf && grep -q "^Session\\\\Port=1" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf && CFG[WIREGUARD_ADDRESSES]=10.2.0.2/32 && looks_like_proton && CFG[WIREGUARD_ADDRESSES]=10.64.1.2/32 && ! looks_like_proton && v_wgpub "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=" && ! v_wgpub "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgy=" )'
     st "custom ProtonVPN -> protonvpn offer" '( st_prep internet jellyfin tailscale core; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[WIREGUARD_ADDRESSES]=10.2.0.2/32; CFG[VPN_ENDPOINT_IP]=203.0.113.9; CFG[VPN_ENDPOINT_PORT]=51820; CFG[WIREGUARD_PUBLIC_KEY]=bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=; is_tty() { return 0; }; ASSUME_YES=0; confirm() { return 0; }; vpn_offer_provider_switch >/dev/null; [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -z "${CFG[VPN_ENDPOINT_IP]}" && "${CFG[WIREGUARD_ADDRESSES]}" == 10.2.0.2/32 ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[WIREGUARD_ADDRESSES]=10.64.0.2/32 && vpn_offer_provider_switch >/dev/null && [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]] )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
