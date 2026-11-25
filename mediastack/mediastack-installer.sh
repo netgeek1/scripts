@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.6.0"
+readonly SCRIPT_VERSION="2.7.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -119,13 +119,13 @@ SECRET_KEYS=( VPN_USERNAME VPN_PASSWORD PLEX_CLAIM CLOUDFLARE_DNS_API_TOKEN EMAI
               WIREGUARD_PRIVATE_KEY WIREGUARD_PRESHARED_KEY POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY
               HEADPLANE_COOKIE_SECRET SONARR_API_TOKEN RADARR_API_TOKEN LIDARR_API_TOKEN READARR_API_TOKEN
               WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD SECRET_ENCRYPTION_KEY
-              TLS_KEY_PASSPHRASE UPDATER_PROTONVPN_PASSWORD )
+              TLS_KEY_PASSPHRASE UPDATER_PROTONVPN_PASSWORD CROWDSEC_BOUNCER_KEY )
 # Vault entries that are not .env variables
 SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE )
 SECRET_PROMPTED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY EMAIL_PASSWORD PLEX_CLAIM )
 SECRET_WIREGUARD=( WIREGUARD_PRIVATE_KEY )   # WIREGUARD_PRESHARED_KEY is optional: taken from wg0.conf only
 SECRET_REQUIRED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY )   # compose :?err
-SECRET_GENERATED=( POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY HEADPLANE_COOKIE_SECRET SECRET_ENCRYPTION_KEY )
+SECRET_GENERATED=( POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY HEADPLANE_COOKIE_SECRET SECRET_ENCRYPTION_KEY CROWDSEC_BOUNCER_KEY )
 readonly SECRET_UNSET="not-set"
 declare -A SECRETS=()
 SECRETS_LOADED=0
@@ -606,6 +606,24 @@ secrets_import_env() {
 }
 
 # secrets_init -- import, generate, and prompt for anything missing; then save
+# ensure_generated_secrets -- secrets added by newer versions (e.g. CROWDSEC_BOUNCER_KEY) are generated on apply,
+# so an existing install does not need a full reinstall. PostgreSQL is left to secrets_init (it may need the old one).
+ensure_generated_secrets() {
+    local k changed=0
+    for k in "${SECRET_GENERATED[@]}"; do
+        [[ "$k" == POSTGRESQL_PASSWORD ]] && continue
+        secret_is_set "$k" && continue
+        case "$k" in
+            AUTHENTIK_SECRET_KEY)    SECRETS[$k]=$(gen_hex 48) ;;
+            HEADPLANE_COOKIE_SECRET) SECRETS[$k]=$(gen_hex 16) ;;
+            *)                       SECRETS[$k]=$(gen_hex 32) ;;
+        esac
+        log_ok "Generated $k (new in this version; stored once)"; changed=1
+    done
+    (( changed )) && save_secrets
+    return 0
+}
+
 secrets_init() {
     load_secrets
     local k v changed=0
@@ -632,6 +650,7 @@ secrets_init() {
                 AUTHENTIK_SECRET_KEY)    SECRETS[$k]=$(gen_hex 48) ;;
                 HEADPLANE_COOKIE_SECRET) SECRETS[$k]=$(gen_hex 16) ;;
                 SECRET_ENCRYPTION_KEY)   SECRETS[$k]=$(gen_hex 32) ;;   # Homarr 1.x: 64 hex chars
+                CROWDSEC_BOUNCER_KEY)    SECRETS[$k]=$(gen_hex 32) ;;   # Traefik bouncer <-> CrowdSec LAPI
             esac
             log_ok "Generated $k (stored once; reused on every run)"; changed=1
         fi
@@ -1348,6 +1367,14 @@ render_patch() {   # render_patch NAME -> body that changes an upstream service
       - SECRET_ENCRYPTION_KEY=${SECRET_ENCRYPTION_KEY:?err}
 EOF
             ;;
+        crowdsec)
+            cat <<'EOF'
+    # CrowdSec: register this install's Traefik bouncer key, install the Traefik/HTTP detection collections
+    environment:
+      - BOUNCER_KEY_traefik=${CROWDSEC_BOUNCER_KEY:?err}
+      - COLLECTIONS=crowdsecurity/traefik crowdsecurity/http-cve
+EOF
+            ;;
         gluetun)
             printf '    # Gluetun: server-list updates (VPN_SERVERS_UPDATE_PERIOD) / custom WireGuard endpoint\n    environment:\n'
             [[ -n "$(vpn_update_period)" ]] && printf '      - UPDATER_PERIOD=%s\n' "$(vpn_update_period)"
@@ -1378,6 +1405,7 @@ active_patches() {   # upstream services this installer modifies
     local compose=$1
     [[ -f "$compose" ]] || return 0
     if grep -qE '^  homarr:[[:space:]]*$' "$compose" && ! is_removed homarr; then echo homarr; fi
+    if grep -qE '^  crowdsec:[[:space:]]*$' "$compose" && ! is_removed crowdsec; then echo crowdsec; fi
     if grep -qE '^  gluetun:[[:space:]]*$' "$compose" && ! is_removed gluetun \
         && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint; }; then echo gluetun; fi
     if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale \
@@ -1833,6 +1861,12 @@ copy_app_configs() {
         put_file "${CFG[VPN_CUSTOM_OVPN_FILE]}" "$FOLDER_FOR_DATA/gluetun/${GLUETUN_OVPN_PATH#/gluetun/}" 600
         log_ok "Custom OpenVPN config placed for Gluetun ($GLUETUN_OVPN_PATH)"
     fi
+    # The Traefik CrowdSec bouncer: upstream ships a sample LAPI key that no CrowdSec knows (every request would be
+    # refused once the plugin runs). Use this install's own key; CrowdSec registers it via BOUNCER_KEY_traefik.
+    local dyn="$FOLDER_FOR_DATA/traefik/dynamic.yaml"
+    if [[ -f "$dyn" ]] && secret_is_set CROWDSEC_BOUNCER_KEY && ! (( DRY_RUN )); then
+        sed -i -E "s|^([[:space:]]*crowdsecLapiKey:).*|\1 ${SECRETS[CROWDSEC_BOUNCER_KEY]}|" "$dyn"
+    fi
     log_ok "App config files placed (traefik, headscale, headplane, crowdsec); acme.json 600"
 }
 
@@ -2074,6 +2108,78 @@ gluetun_image() {
     [[ -f "$FOLDER_FOR_YAML/docker-compose.yaml" ]] && \
         img=$(awk '/^  gluetun:[[:space:]]*$/ {f = 1; next} f && /^  [a-z]/ {exit} f && $1 == "image:" {print $2; exit}' "$FOLDER_FOR_YAML/docker-compose.yaml")
     printf '%s' "${img:-qmcgaw/gluetun:latest}"
+}
+
+# traefik_api PATH -> JSON from Traefik's API (port 8080 inside the container; wget is in the image)
+traefik_api() { docker exec traefik wget -qO- -T 5 "http://127.0.0.1:8080$1" 2>/dev/null; }
+
+# traefik_router_errors JSON -> "router: error" lines for routers Traefik could not build
+traefik_router_errors() {
+    sed 's/},{/}\n{/g' <<<"$1" | awk '
+        /"error":\[/ {
+            n = $0; sub(/.*"name":"/, "", n); sub(/".*/, "", n)
+            e = $0; sub(/.*"error":\[/, "", e); sub(/\].*/, "", e); gsub(/\\"/, "\x27", e); gsub(/"/, "", e)
+            print n ": " e
+        }'
+}
+
+# traefik_ensure_middlewares -- Traefik downloads the CrowdSec bouncer plugin when it starts. If that download fails
+# (no internet yet, a timeout, an integrity-check error) plugins stay off for the container's lifetime, the
+# traefik-bouncer@file middleware does not exist and every router that uses it answers 404. Retry once.
+traefik_ensure_middlewares() {
+    svc_enabled traefik && docker ps -q --filter 'name=^traefik$' 2>/dev/null | grep -q . || return 0
+    (( DRY_RUN )) && return 0
+    local errs i
+    for (( i = 0; i < 6; i++ )); do       # the API needs a few seconds after a (re)start
+        errs=$(traefik_router_errors "$(traefik_api /api/http/routers)")
+        [[ -n "$(traefik_api /api/http/routers)" ]] && break
+        sleep 5
+    done
+    [[ "$errs" == *"traefik-bouncer@file"*"does not exist"* ]] || { [[ -z "$errs" ]] || log_warn "Traefik routers in error: run Post-install helpers -> 7 (Traefik check)"; return 0; }
+    log_warn "Traefik's CrowdSec plugin is not loaded (Traefik fetches it from plugins.traefik.io at start), so every router"
+    log_warn "using traefik-bouncer@file answers 404. Restarting Traefik once to retry the download..."
+    docker restart traefik </dev/null >/dev/null 2>&1 3>&- 9>&- || true
+    for (( i = 0; i < 12; i++ )); do
+        sleep 5
+        errs=$(traefik_router_errors "$(traefik_api /api/http/routers)")
+        [[ -n "$(traefik_api /api/http/routers)" && "$errs" != *"traefik-bouncer@file"* ]] && { log_ok "CrowdSec plugin loaded; routers enabled"; return 0; }
+    done
+    log_warn "The plugin still did not load. Traefik's plugin messages:"
+    docker logs --tail 300 traefik 2>&1 | grep -iE 'plugin' | awk '!seen[$0]++' | tail -n 6 | sed 's/^/    /'
+    log_warn "Without it the HTTPS hostnames stay at 404. Check that containers reach the internet (Post-install helpers -> 6)."
+    return 0
+}
+
+# traefik_check -- why HTTPS hostnames fail: router errors, file-provider state, served certificate, log errors
+traefik_check() {
+    require_config; resolve_runtime
+    svc_enabled traefik || { log_info "Traefik is not enabled."; return 0; }
+    docker ps -q --filter 'name=^traefik$' | grep -q . || die "The traefik container is not running."
+    log_step "Traefik check"
+    local rj mj errs n lg
+    rj=$(traefik_api /api/http/routers) || rj=""
+    if [[ -z "$rj" ]]; then
+        log_warn "Traefik's API did not answer (http://127.0.0.1:8080 inside the container)."
+    else
+        n=$(grep -o '"name":"' <<<"$rj" | wc -l)
+        errs=$(traefik_router_errors "$rj")
+        if [[ -n "$errs" ]]; then
+            log_warn "$(grep -c . <<<"$errs") of $n router(s) are in error (these hostnames answer 404):"
+            printf '%s\n' "$errs" | sed 's/^/    /' | head -n 20
+        else
+            log_ok "All $n router(s) are enabled"
+        fi
+        mj=$(traefik_api /api/http/middlewares) || mj=""
+        if [[ "$mj" != *'@file"'* ]]; then
+            log_warn "No middlewares from Traefik's config files (@file) are loaded: the file provider failed, so the routers"
+            log_warn "that use authentik-forwardauth@file / security-headers@file / traefik-bouncer@file cannot start, and"
+            log_warn "the certificate in dynamic.yaml is not used either (Traefik serves its own default certificate)."
+        fi
+    fi
+    log_info "Certificate served for $(tls_probe_name): $(echo | timeout 5 openssl s_client -connect "127.0.0.1:$(tls_https_port)" -servername "$(tls_probe_name)" 2>/dev/null | openssl x509 -noout -subject -issuer 2>/dev/null | tr '\n' ' ')"
+    lg=$(docker logs --tail 400 traefik 2>&1 | grep -iE '(^| )(ERR|ERROR|FTL)( |$)|level=(error|fatal)|plugin' | sed -E 's/^[^ ]+ //' | awk '!seen[$0]++' | tail -n 12 || true)
+    if [[ -n "$lg" ]]; then log_info "Recent Traefik errors:"; printf '%s\n' "$lg" | sed 's/^/    /'; fi
+    return 0
 }
 
 # vpn_check -- on-demand VPN diagnosis (settings, Gluetun health, log errors with hints, WireGuard state)
@@ -3107,6 +3213,7 @@ verify_services() {   # verify_services TIMEOUT_SECONDS -- wait (visibly) until 
 stack_apply() {
     local mode=${1:-pull}
     require_config; resolve_runtime; load_secrets
+    [[ -f "$SECRETS_FILE" ]] && ensure_generated_secrets
     (( DRY_RUN )) || docker_up || die "Docker is not running/installed. Run the full install first."
     ensure_service_account
     fetch_upstream
@@ -3139,6 +3246,7 @@ stack_apply() {
         die "Some containers could not start (causes above). Fix them, then run Apply again."
     fi
     verify_services 180 || true
+    traefik_ensure_middlewares
     log_info "URLs, ports and DNS names: menu L, or sudo $MS_INSTALL_BIN --urls"
     if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ ! "$(tls_ensure_live)" =~ ^(yes|n/a)$ ]]; then
         log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem yet; check: sudo $MS_INSTALL_BIN --cert-show"
@@ -5041,6 +5149,8 @@ networks:
   mediastack:
     name: mediastack"; f=$(compose_service_facts "$y"); [[ "$f" == "gluetun|||0|8888/tcp 8388/udp
 sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
+    st "Traefik router errors parsed"      '( j="[{\"entryPoints\":[\"secureweb\"],\"service\":\"sonarr\",\"rule\":\"Host(\`sonarr.x\`)\",\"error\":[\"middleware \\\"traefik-bouncer@file\\\" does not exist\"],\"status\":\"disabled\",\"name\":\"sonarr@docker\"},{\"service\":\"api@internal\",\"status\":\"enabled\",\"name\":\"traefik@docker\"}]"; e=$(traefik_router_errors "$j"); [[ "$e" == "sonarr@docker: middleware '"'"'traefik-bouncer@file'"'"' does not exist" ]] )'
+    st "CrowdSec bouncer key wiring"      '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"BOUNCER_KEY_traefik=\${CROWDSEC_BOUNCER_KEY:?err}"* ]] && in_list CROWDSEC_BOUNCER_KEY "${SECRET_GENERATED[@]}" && f="$t/dyn.yaml" && printf "x:\n          crowdsecLapiKey: 8andilX0JKYIu8z+R4imPkIgG+TMdCttAuMaHrsV7ZU\n          crowdsecLapiHost: crowdsec:8080\n" >"$f" && sed -i -E "s|^([[:space:]]*crowdsecLapiKey:).*|\\1 abc123|" "$f" && grep -qx "          crowdsecLapiKey: abc123" "$f" && grep -q "crowdsecLapiHost: crowdsec:8080" "$f" )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
@@ -5083,7 +5193,8 @@ menu_helpers() {
     printf '\n  %sPost-install helpers%s\n' "$B" "$NC"
     printf '  1) Secure Authentik database (grants)\n  2) Create Guacamole database + schema\n'
     printf '  3) Reset Authentik akadmin password\n  4) Show *ARR API keys (optionally store in vault)\n'
-    printf '  5) Update Gluetun VPN server list now\n  6) VPN check (Gluetun health, errors, WireGuard handshake)\n  0) Back\n'
+    printf '  5) Update Gluetun VPN server list now\n  6) VPN check (Gluetun health, errors, WireGuard handshake)\n'
+    printf '  7) Traefik check (router errors, config files, served certificate)\n  0) Back\n'
     local ch; read -rp "  Choice: " ch || return 0
     case "$ch" in
         1) menu_action helper_authentik_db ;;
@@ -5092,6 +5203,7 @@ menu_helpers() {
         4) menu_action helper_apikeys ;;
         5) menu_action vpn_update_servers ;;
         6) menu_action vpn_check ;;
+        7) menu_action traefik_check ;;
     esac
 }
 
@@ -5181,7 +5293,7 @@ Actions (default: interactive menu)
   --cert-push-setup [F|-] Set up the push receiver (user, forced-command key, sudoers); public key
                          from file F, stdin (-) or a prompt (CERT_MODE=push)
   --cert-receive         Push receiver: read chain + key on stdin (run by the forced SSH command)
-  --helper NAME          authentik-db | guacamole | akadmin | apikeys | vpn-servers | vpn-check
+  --helper NAME          authentik-db | guacamole | akadmin | apikeys | vpn-servers | vpn-check | traefik-check
   --settings             Settings menu (paths, network, storage, services, ...)
   --test-storage T       Trial-mount MEDIA or DATA share; check write + hardlinks
   --secrets              Secrets menu
@@ -5314,7 +5426,8 @@ main() {
                 apikeys)      helper_apikeys ;;
                 vpn-servers)  vpn_update_servers ;;
                 vpn-check)    vpn_check ;;
-                *)            die "Unknown helper '$helper' (authentik-db|guacamole|akadmin|apikeys|vpn-servers|vpn-check)" ;;
+                traefik-check) traefik_check ;;
+                *)            die "Unknown helper '$helper' (authentik-db|guacamole|akadmin|apikeys|vpn-servers|vpn-check|traefik-check)" ;;
             esac ;;
     esac
     _log_file INFO "Finished action=$action"
