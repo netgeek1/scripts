@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.2.1"
+readonly SCRIPT_VERSION="3.3.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -104,7 +104,7 @@ CONF_KEYS=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA FOLDER_FOR_YAML DOMAIN CLOUDFLARE_D
             CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY CERT_PUSH_USER CERT_PUSH_FROM
             SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES VPN_SERVERS_UPDATE_PERIOD VPN_UPDATER_PROTON_EMAIL
             DDNS_PROVIDER DDNS_RECORDS DDNS_CF_ZONE_ID DDNS_TTL DDNS_PROXIED DDNS_IP_VERSION DDNS_CONFIG_FILE
-            SERVICE_HOSTNAMES SERVICE_PORTS )
+            SERVICE_HOSTNAMES SERVICE_PORTS VPN_PORT_FORWARDING VPN_PORT_FORWARDING_PROVIDER VPN_PF_QBITTORRENT )
 # Settings that did not exist before v2.0.0: an existing config without them keeps its old behaviour
 declare -A CONF_LEGACY=( [ACCESS_MODE]=internet [CERT_MODE]=letsencrypt [SERVICE_PRESET]=custom
                          [TAILSCALE_CONTROL]=headscale [PLAYER]=both )
@@ -291,7 +291,8 @@ safe_path() {
 
 valid_abs_path() { [[ "$1" == /* && "$1" != *..* && "$1" != *" "* ]]; }
 valid_domain()   { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; }
-valid_ipv4()     { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+valid_ipv4()     { [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+                   local o; for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done; }
 valid_cidr()     { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]; }
 sed_escape()     { printf '%s' "$1" | sed -e 's/[.[\*^$/&]/\\&/g'; }
 gen_hex()        { openssl rand -hex "$1"; }
@@ -421,6 +422,9 @@ set_default_config() {
         [DDNS_CONFIG_FILE]=""
         [SERVICE_HOSTNAMES]=""
         [SERVICE_PORTS]=""
+        [VPN_PORT_FORWARDING]="off"
+        [VPN_PORT_FORWARDING_PROVIDER]=""
+        [VPN_PF_QBITTORRENT]="yes"
     )
 }
 
@@ -1146,6 +1150,13 @@ render_env() {
     env_set "$envf" MS_DDNS_PROVIDER "${CFG[DDNS_PROVIDER]:-none}"
     env_set "$envf" MS_DDNS_RECORDS "${CFG[DDNS_RECORDS]}"
     env_set "$envf" MS_DDNS_URL "$(ddns_ui_url)"
+    # status board: VPN endpoint (custom) and port forwarding
+    env_set "$envf" MS_VPN_ENDPOINT_IP "${CFG[VPN_ENDPOINT_IP]:-}"
+    env_set "$envf" MS_VPN_ENDPOINT_PORT "${CFG[VPN_ENDPOINT_PORT]:-}"
+    env_set "$envf" MS_WIREGUARD_PUBLIC_KEY "${CFG[WIREGUARD_PUBLIC_KEY]:-}"
+    env_set "$envf" MS_VPN_PORT_FORWARDING "$(vpn_pf_on && echo on || echo off)"
+    env_set "$envf" MS_VPN_PORT_FORWARDING_PROVIDER "${CFG[VPN_PORT_FORWARDING_PROVIDER]:-}"
+    env_set "$envf" MS_VPN_PF_CAPABLE "$(vpn_pf_capable && echo yes || echo no)"
     vpn_normalize
     # Endpoint: only provider 'custom' takes it (for listed providers it pins a server that is often not in
     # Gluetun's list: "target IP address not found"). Upstream passes the deprecated VPN_ENDPOINT_IP/PORT names,
@@ -1373,6 +1384,7 @@ render_addon() {   # render_addon NAME -> service body (4-space indented, no key
       - ${FOLDER_FOR_DATA:?err}/statusboard/requests:/requests
       - ${FOLDER_FOR_DATA:?err}/tailscale/run:/var/run/tailscale:ro
       - ${FOLDER_FOR_DATA:?err}/ddns-updater:/ddns:ro
+      - ${FOLDER_FOR_DATA:?err}/gluetun:/gluetun:ro             # server-list timestamp (servers.json)
     environment:
       - TZ=${TIMEZONE:?err}
       - DOMAIN=${CLOUDFLARE_DNS_ZONE:?err}
@@ -1393,6 +1405,12 @@ render_addon() {   # render_addon NAME -> service body (4-space indented, no key
       - SERVER_CITIES=${SERVER_CITIES}
       - SERVER_HOSTNAMES=${SERVER_HOSTNAMES}
       - SERVER_REGIONS=${SERVER_REGIONS}
+      - VPN_ENDPOINT_IP=${MS_VPN_ENDPOINT_IP:-}
+      - VPN_ENDPOINT_PORT=${MS_VPN_ENDPOINT_PORT:-}
+      - WIREGUARD_PUBLIC_KEY=${MS_WIREGUARD_PUBLIC_KEY:-}
+      - VPN_PORT_FORWARDING=${MS_VPN_PORT_FORWARDING:-off}
+      - VPN_PORT_FORWARDING_PROVIDER=${MS_VPN_PORT_FORWARDING_PROVIDER:-}
+      - VPN_PF_CAPABLE=${MS_VPN_PF_CAPABLE:-no}
       - TRUSTED_PROXY_HOST=traefik
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)"]
@@ -1496,7 +1514,7 @@ EOF
 EOF
             ;;
         gluetun)
-            printf '    # Gluetun: server-list updates (VPN_SERVERS_UPDATE_PERIOD) / custom WireGuard endpoint\n    environment:\n'
+            printf '    # Gluetun: server-list updates / custom WireGuard endpoint / port forwarding / status board key\n    environment:\n'
             [[ -n "$(vpn_update_period)" ]] && printf '      - UPDATER_PERIOD=%s\n' "$(vpn_update_period)"
             if vpn_custom_wg_endpoint; then
                 printf '      - WIREGUARD_ENDPOINT_IP=%s\n      - WIREGUARD_ENDPOINT_PORT=%s\n' "${CFG[VPN_ENDPOINT_IP]}" "${CFG[VPN_ENDPOINT_PORT]}"
@@ -1504,6 +1522,15 @@ EOF
             if [[ -n "$(vpn_update_period)" && "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -n "${CFG[VPN_UPDATER_PROTON_EMAIL]}" ]]; then
                 printf '      - UPDATER_PROTONVPN_EMAIL=%s\n' "${CFG[VPN_UPDATER_PROTON_EMAIL]}"
                 printf '      - UPDATER_PROTONVPN_PASSWORD=${UPDATER_PROTONVPN_PASSWORD:-}\n'
+            fi
+            if vpn_pf_on; then
+                printf '      - VPN_PORT_FORWARDING=on\n'
+                [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]] && printf "      - 'VPN_PORT_FORWARDING_PROVIDER=%s'\n" "${CFG[VPN_PORT_FORWARDING_PROVIDER]}"
+                [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn ]] && printf '      - PORT_FORWARD_ONLY=on\n'
+                if vpn_pf_qbt; then
+                    printf '      - VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh /gluetun/%s up {{PORT}} {{VPN_INTERFACE}} ${WEBUI_PORT_QBITTORRENT:?err}\n' "$PF_SCRIPT"
+                    printf '      - VPN_PORT_FORWARDING_DOWN_COMMAND=/bin/sh /gluetun/%s down - - ${WEBUI_PORT_QBITTORRENT:?err}\n' "$PF_SCRIPT"
+                fi
             fi
             if svc_enabled statusboard; then   # control-server API key for the status board (all routes)
                 printf "      - 'HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}'\n"
@@ -1540,7 +1567,7 @@ active_patches() {   # upstream services this installer modifies
     done
     if grep -qE '^  crowdsec:[[:space:]]*$' "$compose" && ! is_removed crowdsec; then echo crowdsec; fi
     if grep -qE '^  gluetun:[[:space:]]*$' "$compose" && ! is_removed gluetun \
-        && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint || svc_enabled statusboard; }; then echo gluetun; fi
+        && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint || vpn_pf_on || svc_enabled statusboard; }; then echo gluetun; fi
     if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale; then echo tailscale; fi
     return 0
 }
@@ -2237,6 +2264,115 @@ vpn_dir() { printf '%s/vpn' "$MS_CONF_DIR"; }
 readonly GLUETUN_OVPN_PATH="/gluetun/custom.ovpn"
 
 # vpn_problems -> one line per reason Gluetun cannot connect with the current settings
+# -----------------------------------------------------------------------------
+# VPN PORT FORWARDING (Gluetun native: protonvpn, private internet access, perfect privacy, privatevpn;
+#   provider 'custom' + WireGuard names the provider in VPN_PORT_FORWARDING_PROVIDER). With qBittorrent behind
+#   Gluetun, Gluetun's up/down hook sets qBittorrent's listening port to the forwarded port.
+# -----------------------------------------------------------------------------
+readonly PF_PROVIDERS="protonvpn|private internet access|perfect privacy|privatevpn"
+readonly PF_SCRIPT=mediastack-pf-qbittorrent.sh
+v_onoff()    { [[ "$1" =~ ^(on|off)$ ]]; }
+v_pfprov()   { [[ -z "$1" || "$1" =~ ^($PF_PROVIDERS)$ ]]; }
+v_wgpub()    { [[ "$1" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$ ]]; }
+vpn_pf_capable() {   # the current provider can forward a port (natively or via VPN_PORT_FORWARDING_PROVIDER)
+    local p=${CFG[VPN_SERVICE_PROVIDER]:-}
+    [[ "$p" =~ ^($PF_PROVIDERS)$ ]] || [[ "$p" == custom && "${CFG[VPN_TYPE]:-}" == wireguard ]]
+}
+vpn_pf_on() {
+    [[ "${CFG[VPN_PORT_FORWARDING]:-off}" == on ]] && vpn_pf_capable || return 1
+    [[ "${CFG[VPN_SERVICE_PROVIDER]}" != custom || -n "${CFG[VPN_PORT_FORWARDING_PROVIDER]:-}" ]]
+}
+vpn_pf_qbt() { vpn_pf_on && svc_enabled qbittorrent && [[ "${CFG[VPN_PF_QBITTORRENT]:-yes}" == yes ]]; }
+
+# looks_like_proton -- a wg0.conf from ProtonVPN: Address 10.2.0.2/32 (their fixed client address)
+looks_like_proton() { [[ "${CFG[VPN_TYPE]:-}" == wireguard && "${CFG[WIREGUARD_ADDRESSES]:-}" == 10.2.0.2/32* ]]; }
+
+render_pf_script() {
+    cat <<'SH'
+#!/bin/sh
+# Managed by mediastack-installer -- Gluetun runs it when the forwarded port changes:
+#   up PORT INTERFACE QBT_PORT | down - - QBT_PORT
+# qBittorrent shares Gluetun's network, so its Web API is on 127.0.0.1 (localhost needs no login; set by the installer).
+case "$1" in
+    up)   data="json={\"listen_port\":$2,\"current_network_interface\":\"$3\",\"random_port\":false,\"upnp\":false}" ;;
+    down) data='json={"listen_port":0,"current_network_interface":"lo"}' ;;
+    *)    exit 2 ;;
+esac
+i=0
+while [ "$i" -lt 30 ]; do
+    if wget -q -O- -T 10 --post-data "$data" "http://127.0.0.1:$4/api/v2/app/setPreferences" >/dev/null 2>&1; then
+        echo "qBittorrent: listening port set ($1 $2)"; exit 0
+    fi
+    i=$((i + 1)); sleep 10
+done
+echo "qBittorrent: Web API on 127.0.0.1:$4 did not answer; port not set"
+exit 1
+SH
+}
+
+write_pf_script() {
+    local d="$FOLDER_FOR_DATA/gluetun" f tmp
+    [[ -d "$d" ]] && ! (( DRY_RUN )) || return 0
+    f="$d/$PF_SCRIPT"
+    if vpn_pf_qbt; then
+        tmp=$(mktemp); render_pf_script >"$tmp"
+        cmp -s "$tmp" "$f" || put_file "$tmp" "$f" 755
+        rm -f "$tmp"
+    else
+        rm -f "$f"
+    fi
+    return 0
+}
+
+# ensure_qbt_localhost -- qBittorrent: no login for 127.0.0.1 (Gluetun's port hook). It rewrites its config when it
+# stops, so the edit is made while it is stopped.
+ensure_qbt_localhost() {
+    vpn_pf_qbt && ! (( DRY_RUN )) || return 0
+    local f="$FOLDER_FOR_DATA/qbittorrent/qBittorrent/qBittorrent.conf" i tmp
+    for (( i = 0; i < 12; i++ )); do [[ -s "$f" ]] && break; sleep 5; done
+    [[ -s "$f" ]] || { log_warn "qBittorrent has not created $f yet; run Apply again so it takes the forwarded port."; return 0; }
+    grep -qE '^WebUI\\LocalHostAuth=false' "$f" && return 0
+    docker stop qbittorrent >/dev/null 2>&1 || true
+    tmp=$(mktemp)
+    awk '
+        /^\[/ { if (insec && !done) { print "WebUI\\LocalHostAuth=false"; done = 1 } insec = ($0 == "[Preferences]") }
+        insec && /^WebUI\\LocalHostAuth=/ { if (!done) print "WebUI\\LocalHostAuth=false"; done = 1; next }
+        { print }
+        END { if (!done) { if (!insec) print "[Preferences]"; print "WebUI\\LocalHostAuth=false" } }' "$f" >"$tmp" && cat "$tmp" >"$f"
+    rm -f "$tmp"
+    docker start qbittorrent >/dev/null 2>&1 || true
+    log_ok "qBittorrent: localhost login bypass on (Gluetun sets its listening port to the forwarded port)"
+}
+
+cfg_vpn_pf() {
+    vpn_pf_capable || { CFG[VPN_PORT_FORWARDING]=off; return 0; }
+    log_info "Port forwarding: the VPN server forwards one public port to you (better torrent connectivity)."
+    [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn || "${CFG[VPN_PORT_FORWARDING_PROVIDER]:-}" == protonvpn ]] && \
+        log_info "ProtonVPN: needs a P2P server and a WireGuard config made with 'NAT-PMP (Port Forwarding)' on."
+    ask_valid "CFG[VPN_PORT_FORWARDING]" "VPN port forwarding (on/off)" "${CFG[VPN_PORT_FORWARDING]:-off}" v_onoff "on or off"
+    [[ "${CFG[VPN_PORT_FORWARDING]}" == on ]] || return 0
+    if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]]; then
+        local d=${CFG[VPN_PORT_FORWARDING_PROVIDER]:-}; [[ -n "$d" ]] || { looks_like_proton && d=protonvpn; }
+        ask_valid "CFG[VPN_PORT_FORWARDING_PROVIDER]" "Whose port forwarding does your server use (${PF_PROVIDERS//|/, })" "$d" v_pfprov "one of: ${PF_PROVIDERS//|/, }"
+    fi
+    if svc_enabled qbittorrent; then
+        ask_valid "CFG[VPN_PF_QBITTORRENT]" "Set qBittorrent's listening port to the forwarded port automatically (yes/no)" "${CFG[VPN_PF_QBITTORRENT]:-yes}" v_yesno "yes or no"
+    fi
+}
+
+# vpn_offer_provider_switch -- custom WireGuard from a provider Gluetun lists: offer the listed provider (same key)
+vpn_offer_provider_switch() {
+    [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom && "${CFG[VPN_TYPE]}" == wireguard ]] && looks_like_proton || return 0
+    log_info "This WireGuard config is from ProtonVPN. With provider 'protonvpn' the same private key works for every"
+    log_info "Proton server: you can pick servers by country/city, use P2P/port-forwarding servers and update the list."
+    is_tty && ! (( ASSUME_YES )) || return 0
+    confirm "Switch the provider from custom to protonvpn?" y || return 0
+    CFG[VPN_SERVICE_PROVIDER]=protonvpn
+    CFG[VPN_PORT_FORWARDING_PROVIDER]=""
+    vpn_normalize
+    log_ok "Provider: protonvpn (private key and address kept; the server endpoint is now chosen by Gluetun)"
+}
+
 vpn_problems() {
     svc_enabled gluetun || return 0
     local p=${CFG[VPN_SERVICE_PROVIDER]:-} f=${CFG[VPN_CUSTOM_OVPN_FILE]:-}
@@ -2245,6 +2381,10 @@ vpn_problems() {
     for fk in SERVER_REGIONS SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES; do
         validate_key "$fk" "${CFG[$fk]:-}" || echo "$fk '${CFG[$fk]}' is not a list of names (clear it in Settings -> VPN)"
     done
+    if [[ "${CFG[VPN_PORT_FORWARDING]:-off}" == on ]]; then
+        vpn_pf_capable || echo "VPN_PORT_FORWARDING=on, but provider '$p' has no port forwarding in Gluetun"
+        [[ "$p" != custom || -n "${CFG[VPN_PORT_FORWARDING_PROVIDER]:-}" ]] || echo "VPN_PORT_FORWARDING=on with provider custom needs VPN_PORT_FORWARDING_PROVIDER"
+    fi
     if [[ "$p" == protonvpn && -n "${CFG[VPN_UPDATER_PROTON_EMAIL]:-}" ]] && ! secret_is_set UPDATER_PROTONVPN_PASSWORD; then
         echo "VPN_UPDATER_PROTON_EMAIL is set but UPDATER_PROTONVPN_PASSWORD is not (Settings -> VPN or the Secrets menu)"
     fi
@@ -2736,6 +2876,7 @@ cfg_vpn() {
         fi
     fi
     vpn_normalize
+    vpn_offer_provider_switch; v=${CFG[VPN_SERVICE_PROVIDER]}
     local k lbl
     [[ "$v" == custom ]] && log_info "Provider 'custom' connects to the server in your config, so server filters are not used."
     [[ "$v" == custom ]] || log_info "Server filters (all optional, comma-separated; blank = any server of the provider):"
@@ -2769,6 +2910,7 @@ cfg_vpn() {
             fi
         fi
     fi
+    cfg_vpn_pf
     local probs l; probs=$(vpn_problems)
     if [[ -n "$probs" ]]; then while IFS= read -r l; do log_warn "VPN: $l"; done <<<"$probs"; else log_ok "VPN settings complete"; fi
 }
@@ -3511,6 +3653,7 @@ stack_apply() {
     write_homepage_config
     write_statusboard_app
     write_ddns_custom_config
+    write_pf_script
     cert_units
     requests_units
     report_dependencies die
@@ -3536,6 +3679,7 @@ stack_apply() {
     verify_services 240 || true
     traefik_ensure_middlewares
     ensure_app_hostnames
+    ensure_qbt_localhost
     guacamole_ensure_db
     statusboard_wire
     sync_heimdall
@@ -4480,10 +4624,19 @@ TRUSTED_PROXY = E("TRUSTED_PROXY_HOST", "traefik")
 LAN_ACTIONS = E("ALLOW_LAN_ACTIONS", "no") == "yes"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 FILTER_KEYS = ("SERVER_COUNTRIES", "SERVER_CITIES", "SERVER_HOSTNAMES", "SERVER_REGIONS")
-CONFIG = {k: E(k, "") for k in ("VPN_SERVICE_PROVIDER", "VPN_TYPE", "DOMAIN") + FILTER_KEYS}
+ENDPOINT_KEYS = ("VPN_ENDPOINT_IP", "VPN_ENDPOINT_PORT", "WIREGUARD_PUBLIC_KEY")
+CONFIG = {k: E(k, "") for k in ("VPN_SERVICE_PROVIDER", "VPN_TYPE", "DOMAIN", "VPN_PORT_FORWARDING",
+                                "VPN_PORT_FORWARDING_PROVIDER", "VPN_PF_CAPABLE") + FILTER_KEYS + ENDPOINT_KEYS}
+GLUETUN_DIR = E("GLUETUN_DIR", "/gluetun")
 DDNS_DIR = E("DDNS_DIR", "/ddns")
 DDNS = {k: E(k, "") for k in ("DDNS_PROVIDER", "DDNS_RECORDS", "DDNS_URL", "DOMAIN")}
-REQUEST_KEYS = {"vpn_filters": FILTER_KEYS, "gluetun_recreate": (), "ddns_records": ("DDNS_RECORDS",)}
+REQUEST_KEYS = {"vpn_filters": FILTER_KEYS, "gluetun_recreate": (), "ddns_records": ("DDNS_RECORDS",),
+                "vpn_endpoint": ENDPOINT_KEYS, "vpn_portforward": ("VPN_PORT_FORWARDING",)}
+# values that need more than VALUE_OK allows (a WireGuard key has / + =); the installer validates every value again
+KEY_RE = {"VPN_ENDPOINT_IP": re.compile(r"^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$"),
+          "VPN_ENDPOINT_PORT": re.compile(r"^([1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$"),
+          "WIREGUARD_PUBLIC_KEY": re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$"),
+          "VPN_PORT_FORWARDING": re.compile(r"^(on|off)$")}
 TIMEOUT = 6
 
 
@@ -4584,8 +4737,30 @@ def gl(method, path, body=None, timeout=TIMEOUT):
     return http_json(method, GLUETUN_URL + path, {"X-API-Key": GLUETUN_KEY}, body, timeout)
 
 
+def servers_info(provider):
+    """Last server-list update for PROVIDER from Gluetun's data folder (servers.json, or the per-provider file it names)."""
+    if not provider or provider == "custom":
+        return {}
+    try:
+        with open(os.path.join(GLUETUN_DIR, "servers.json")) as f:
+            entry = (json.load(f) or {}).get(provider.lower()) or {}
+        fp = entry.get("filepath")
+        if fp:
+            rel = os.path.relpath(os.path.normpath(fp), "/gluetun")
+            if rel.startswith(".."):
+                return {"error": "unexpected server file location"}
+            with open(os.path.join(GLUETUN_DIR, rel)) as f:
+                entry = json.load(f) or {}
+        ts = int(entry.get("timestamp") or 0)
+        return {"timestamp": ts, "count": len(entry.get("servers") or [])} if ts else {"error": "no timestamp yet"}
+    except FileNotFoundError:
+        return {"error": "Gluetun has not written its server list yet"}
+    except (OSError, ValueError) as e:
+        return {"error": str(e)[:120]}
+
+
 def gluetun_status():
-    out = {"config": CONFIG}
+    out = {"config": CONFIG, "servers": servers_info(CONFIG.get("VPN_SERVICE_PROVIDER", ""))}
     for key, path in (("vpn", "/v1/vpn/status"), ("public_ip", "/v1/publicip/ip"), ("port_forward", "/v1/portforward"),
                       ("updater", "/v1/updater/status"), ("dns", "/v1/dns/status")):
         try:
@@ -4745,7 +4920,14 @@ def write_request(action, fields):
         raise APIError("unknown request")
     lines = ["ACTION=" + action]
     for k, v in fields.items():
-        if k not in REQUEST_KEYS[action] or not VALUE_OK.match(v or ""):
+        if k not in REQUEST_KEYS[action]:
+            raise APIError("invalid value for %s" % k)
+        if k in KEY_RE:
+            if not KEY_RE[k].match(v or ""):
+                raise APIError("invalid value for %s" % k)
+            lines.append("%s=%s" % (k, v))
+            continue
+        if not VALUE_OK.match(v or ""):
             raise APIError("invalid value for %s" % k)
         lines.append("%s=%s" % (k, ",".join(x.strip() for x in (v or "").split(",") if x.strip())))
     rid = "req-%s-%s" % (time.strftime("%Y%m%d%H%M%S"), secrets.token_hex(3))
@@ -4860,7 +5042,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/tailscale/ping": lambda: tailscale_ping(s("ip")),
             "/api/gluetun/action": lambda: gluetun_action(s("action")),
             "/api/gluetun/request": lambda: write_request(s("action") or "vpn_filters",
-                                                          {k: s(k) for k in FILTER_KEYS if k in body}),
+                                                          {k: s(k) for k in REQUEST_KEYS.get(s("action") or "vpn_filters", ())
+                                                           if k in body}),
             "/api/ddns/request": lambda: write_request("ddns_records", {"DDNS_RECORDS": s("DDNS_RECORDS")}),
             "/api/crowdsec/ban": lambda: crowdsec_ban(s("ip"), s("duration") or "4h", s("reason")),
             "/api/crowdsec/unban": lambda: crowdsec_unban(s("ip")),
@@ -4981,21 +5164,35 @@ async function loadGL() {
     ${card("VPN", dot(vpn.error ? null : running) + esc(vpn.error ? "unreachable" : vpn.status), vpn.error ? '<span class="err">' + esc(vpn.error) + "</span>" : esc(c.VPN_SERVICE_PROVIDER + " / " + c.VPN_TYPE))}
     ${card("Public IP", esc(ip.public_ip || "—"), esc([ip.city, ip.region, ip.country].filter(Boolean).join(", ")) + (ip.organization ? "<br>" + esc(ip.organization) : ""))}
     ${card("Forwarded port", esc(pf.port || "none"), pf.error ? '<span class="mut">' + esc(pf.error) + "</span>" : "")}
-    ${card("Server list updater", esc(up.status || "—"))}
+    ${card("Server list", c.VPN_SERVICE_PROVIDER === "custom" ? "—" : (d.servers && d.servers.timestamp ? esc(new Date(d.servers.timestamp * 1000).toLocaleString()) : "—"),
+        c.VPN_SERVICE_PROVIDER === "custom" ? '<span class="mut">provider custom has no server list</span>' :
+        (d.servers && d.servers.timestamp ? esc(d.servers.count + " servers · updater " + (up.status || "?")) : '<span class="mut">' + esc((d.servers && d.servers.error) || "unknown") + "</span>"))}
   </div>
-  <div class="row">${btn("Restart VPN", 'data-a="restart"')} ${btn("Stop VPN", 'data-a="stop"', true)} ${btn("Start VPN", 'data-a="start"')} ${btn("Update server list now", 'data-a="update_servers"')}</div>
+  <div class="row">${btn("Restart VPN", 'data-a="restart"')} ${btn("Stop VPN", 'data-a="stop"', true)} ${btn("Start VPN", 'data-a="start"')} ${c.VPN_SERVICE_PROVIDER === "custom" ? "" : btn("Update server list now", 'data-a="update_servers"')}</div>
   <h2>Server selection</h2>
   <div class="card"><div class="mut">Changing these recreates Gluetun (the download apps restart with it). The installer validates and applies the change on the host.</div>
+  ${c.VPN_SERVICE_PROVIDER === "custom" ? `
+    <div class="mut">Provider custom connects to one server. To move to another server of the same provider, copy its Endpoint and PublicKey from that server's WireGuard config.${c.VPN_TYPE === "wireguard" ? "" : " (OpenVPN: change the .ovpn file in the installer.)"}</div>
+    ${c.VPN_TYPE === "wireguard" ? [["VPN_ENDPOINT_IP","server IP","203.0.113.10"],["VPN_ENDPOINT_PORT","port","51820"],["WIREGUARD_PUBLIC_KEY","server public key","44 characters ending in ="]].map(([k,l,ph]) => `<div class="row"><label style="width:150px">${l}</label>
+      <input id="e_${k}" value="${esc(c[k])}" placeholder="${ph}" style="flex:1"></div>`).join("") + `<div class="row">${btn("Apply server", 'id="applye"')} ${btn("Recreate Gluetun", 'id="recreate"', true)}</div>` : `<div class="row">${btn("Recreate Gluetun", 'id="recreate"', true)}</div>`}` : `
     ${["SERVER_COUNTRIES","SERVER_CITIES","SERVER_HOSTNAMES","SERVER_REGIONS"].map(k => `<div class="row"><label style="width:150px">${esc(k.replace("SERVER_","").toLowerCase())}</label>
-      <input id="f_${k}" value="${esc(c[k])}" placeholder="any" style="flex:1" ${c.VPN_SERVICE_PROVIDER === "custom" ? "disabled" : ""}></div>`).join("")}
-    <div class="row">${c.VPN_SERVICE_PROVIDER === "custom" ? '<span class="mut">Provider custom connects to the server in your config: no filters.</span>' :
-      btn("Apply server selection", 'id="applyf"')} ${btn("Recreate Gluetun", 'id="recreate"', true)}</div></div>
+      <input id="f_${k}" value="${esc(c[k])}" placeholder="any" style="flex:1"></div>`).join("")}
+    <div class="row">${btn("Apply server selection", 'id="applyf"')} ${btn("Recreate Gluetun", 'id="recreate"', true)}</div>`}</div>
+  ${c.VPN_PF_CAPABLE === "yes" ? `<h2>Port forwarding</h2>
+  <div class="card"><div class="row">${dot(c.VPN_PORT_FORWARDING === "on")} ${c.VPN_PORT_FORWARDING === "on" ? "on" : "off"}${c.VPN_PORT_FORWARDING_PROVIDER ? ' <span class="mut">(' + esc(c.VPN_PORT_FORWARDING_PROVIDER) + ")</span>" : ""}
+    ${btn(c.VPN_PORT_FORWARDING === "on" ? "Turn off" : "Turn on", 'id="pftoggle"')}</div>
+    <div class="mut">${c.VPN_SERVICE_PROVIDER === "protonvpn" || c.VPN_PORT_FORWARDING_PROVIDER === "protonvpn" ? "ProtonVPN: needs a P2P server and a WireGuard config made with NAT-PMP (Port Forwarding) on. " : ""}With qBittorrent behind Gluetun, its listening port follows the forwarded port.${c.VPN_SERVICE_PROVIDER === "custom" && !c.VPN_PORT_FORWARDING_PROVIDER ? " Provider custom: set whose port forwarding to use in the installer (Settings → 8) first." : ""}</div></div>` : ""}
   <h2>Recent change requests</h2><div class="reqs mut">…</div>`;
   el.querySelectorAll("[data-a]").forEach(b => b.onclick = () => post("/api/gluetun/action", {action: b.dataset.a},
       b.dataset.a === "stop" ? "Stop the VPN? The download apps lose their connection until it is started again." : null).then(() => setTimeout(loadGL, 2500)));
   const af = $("#applyf"); if (af) af.onclick = () => { const body = {action: "vpn_filters"};
     ["SERVER_COUNTRIES","SERVER_CITIES","SERVER_HOSTNAMES","SERVER_REGIONS"].forEach(k => body[k] = $("#f_" + k).value);
     post("/api/gluetun/request", body, "Apply the new server selection? Gluetun and the apps behind it restart.").then(loadReqs); };
+  const ae = $("#applye"); if (ae) ae.onclick = () => { const body = {action: "vpn_endpoint"};
+    ["VPN_ENDPOINT_IP","VPN_ENDPOINT_PORT","WIREGUARD_PUBLIC_KEY"].forEach(k => body[k] = $("#e_" + k).value.trim());
+    post("/api/gluetun/request", body, "Connect to this server? Gluetun and the apps behind it restart.").then(loadReqs); };
+  const pt = $("#pftoggle"); if (pt) pt.onclick = () => post("/api/gluetun/request", {action: "vpn_portforward", VPN_PORT_FORWARDING: c.VPN_PORT_FORWARDING === "on" ? "off" : "on"},
+    "Turn port forwarding " + (c.VPN_PORT_FORWARDING === "on" ? "off" : "on") + "? Gluetun and the apps behind it restart.").then(loadReqs);
   $("#recreate").onclick = () => post("/api/gluetun/request", {action: "gluetun_recreate"}, "Recreate Gluetun and the apps behind it?").then(loadReqs);
   loadReqs();
 }
@@ -5200,6 +5397,31 @@ process_requests() {
                 CFG[DDNS_RECORDS]=$v; save_config
                 ( stack_apply nopull ) >>"$LOG_FILE" 2>&1 || rc=$?
                 if (( rc == 0 )); then req_result "$dir/$id.res" ok "DDNS records now: ${v:-none}; DDNS-Updater recreated." "$action"
+                else req_result "$dir/$id.res" error "Apply failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
+            vpn_endpoint)
+                if [[ "${CFG[VPN_SERVICE_PROVIDER]}" != custom || "${CFG[VPN_TYPE]}" != wireguard ]]; then
+                    req_result "$dir/$id.res" error "The server endpoint is set only for provider custom with WireGuard." "$action"; rm -f "$dir/$id.run"; continue
+                fi
+                if ! valid_ipv4 "${kv[VPN_ENDPOINT_IP]:-}" || ! v_port "${kv[VPN_ENDPOINT_PORT]:-}" || ! v_wgpub "${kv[WIREGUARD_PUBLIC_KEY]:-}"; then
+                    req_result "$dir/$id.res" error "Need a server IPv4 address, a port (1-65535) and a WireGuard public key." "$action"; rm -f "$dir/$id.run"; continue
+                fi
+                CFG[VPN_ENDPOINT_IP]=${kv[VPN_ENDPOINT_IP]}; CFG[VPN_ENDPOINT_PORT]=${kv[VPN_ENDPOINT_PORT]}
+                CFG[WIREGUARD_PUBLIC_KEY]=${kv[WIREGUARD_PUBLIC_KEY]}
+                save_config
+                ( stack_apply nopull ) >>"$LOG_FILE" 2>&1 || rc=$?
+                if (( rc == 0 )); then req_result "$dir/$id.res" ok "Server ${CFG[VPN_ENDPOINT_IP]}:${CFG[VPN_ENDPOINT_PORT]} applied; Gluetun recreated." "$action"
+                else req_result "$dir/$id.res" error "Apply failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
+            vpn_portforward)
+                v=${kv[VPN_PORT_FORWARDING]:-}
+                if ! v_onoff "$v" || ! vpn_pf_capable; then
+                    req_result "$dir/$id.res" error "Port forwarding is not available for provider ${CFG[VPN_SERVICE_PROVIDER]}." "$action"; rm -f "$dir/$id.run"; continue
+                fi
+                if [[ "$v" == on && "${CFG[VPN_SERVICE_PROVIDER]}" == custom && -z "${CFG[VPN_PORT_FORWARDING_PROVIDER]:-}" ]]; then
+                    req_result "$dir/$id.res" error "Provider custom: set whose port forwarding to use in the installer (Settings -> 8) first." "$action"; rm -f "$dir/$id.run"; continue
+                fi
+                CFG[VPN_PORT_FORWARDING]=$v; save_config
+                ( stack_apply nopull ) >>"$LOG_FILE" 2>&1 || rc=$?
+                if (( rc == 0 )); then req_result "$dir/$id.res" ok "Port forwarding $v; Gluetun recreated." "$action"
                 else req_result "$dir/$id.res" error "Apply failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
             gluetun_recreate)
                 { compose_run up -d --force-recreate gluetun && compose_run up -d --remove-orphans; } >>"$LOG_FILE" 2>&1 || rc=$?
@@ -6288,6 +6510,9 @@ declare -A CONF_HELP=(
     [DDNS_CONFIG_FILE]="custom: path of your ddns-updater config.json (any provider it supports)"
     [SERVICE_HOSTNAMES]="svc=name1,name2 ... -- subdomains per service (first = main), e.g. sonarr=tv,sonarr plex=watch"
     [SERVICE_PORTS]="svc=port ... -- LAN port per service (WEBUI_PORT_*), e.g. plex=32401"
+    [VPN_PORT_FORWARDING]="on | off -- VPN server port forwarding (protonvpn, private internet access, perfect privacy, privatevpn; custom WireGuard)"
+    [VPN_PORT_FORWARDING_PROVIDER]="custom provider only: whose port forwarding the server uses (protonvpn, ...)"
+    [VPN_PF_QBITTORRENT]="yes | no -- set qBittorrent's listening port to the forwarded port"
     [CERT_FETCH_SOURCE]="fetch mode: user@host:/folder holding the certificate files"
     [CERT_FETCH_CERT]="fetch mode: full-chain certificate file name in that folder"
     [CERT_FETCH_KEY]="fetch mode: private key file name in that folder"
@@ -6362,6 +6587,9 @@ validate_key() {   # validate_key KEY VALUE
         DDNS_IP_VERSION) [[ "$v" =~ ^(ipv4|ipv6|ipv4\ or\ ipv6)$ ]] ;;
         SERVICE_HOSTNAMES) [[ -z "$v" ]] || v_hostmap "$v" ;;
         SERVICE_PORTS)     [[ -z "$v" ]] || v_portmap "$v" ;;
+        VPN_PORT_FORWARDING) v_onoff "$v" ;;
+        VPN_PORT_FORWARDING_PROVIDER) v_pfprov "$v" ;;
+        VPN_PF_QBITTORRENT) v_yesno "$v" ;;
         DDNS_CONFIG_FILE) [[ -z "$v" ]] || v_path "$v" ;;
         VPN_UPDATER_PROTON_EMAIL) [[ -z "$v" || "$v" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ;;
         CLOUDFLARE_EMAIL|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
@@ -7006,6 +7234,9 @@ services:
 FIX
     st "hostnames: override merge"          '( st_prep internet both tailscale core; CFG[SERVICE_HOSTNAMES]="sonarr=tv,sonarr homarr=home statusboard=board qbittorrent=qb plex=watch"; o=$(render_override "$t/hz/docker-compose.yaml"); [[ $(grep -c "^  sonarr:" <<<"$o") == 1 && $(grep -c "^  homarr:" <<<"$o") == 1 ]] && grep -qF "routers.sonarr.rule=Host(\`tv.\${CLOUDFLARE_DNS_ZONE:?err}\`) || Host(\`sonarr.\${CLOUDFLARE_DNS_ZONE:?err}\`)" <<<"$o" && grep -qF "routers.plex.rule=Host(\`watch.\${CLOUDFLARE_DNS_ZONE:?err}\`) && PathPrefix(\`/web/\`)" <<<"$o" && grep -qF "routers.homarr.rule=Host(\`home." <<<"$o" && grep -qF "routers.statusboard.rule=Host(\`board." <<<"$o" && ! grep -qF "Host(\`status." <<<"$o" && grep -q "qbittorrent: no Traefik router" <<<"$o" && [[ $(awk "/^  homarr:/{f=1;next} /^  [a-z]/{f=0} f && /^    labels:/" <<<"$o" | wc -l) == 1 ]] )'
     st "hostnames menu: fresh menu session" '( st_prep internet both tailscale core; CFG[FOLDER_FOR_YAML]=$t/hz; FOLDER_FOR_YAML=""; printf "WEBUI_PORT_SONARR=8989\n" >$t/hz/.env; detect_network() { :; }; ask() { printf -v "$1" "%s" ""; }; o=$(cfg_urls 2>&1); [[ "$o" == *"Hostnames (."* && "$o" == *" sonarr "* && "$o" == *8989* && "$o" != *"Install first"* ]] )'
+    st "port forwarding: gluetun patch"     '( st_prep internet jellyfin tailscale core; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=protonvpn; CFG[VPN_PORT_FORWARDING]=on; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"VPN_PORT_FORWARDING=on"* && "$o" == *"PORT_FORWARD_ONLY=on"* && "$o" == *"VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh /gluetun/mediastack-pf-qbittorrent.sh up {{PORT}} {{VPN_INTERFACE}} \${WEBUI_PORT_QBITTORRENT:?err}"* && "$o" != *"VPN_PORT_FORWARDING_PROVIDER=protonvpn"* ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[VPN_ENDPOINT_IP]=203.0.113.9 && CFG[VPN_PORT_FORWARDING_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"VPN_PORT_FORWARDING_PROVIDER=protonvpn"* && "$o" != *PORT_FORWARD_ONLY* ]] && CFG[VPN_PF_QBITTORRENT]=no && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UP_COMMAND* ]] && CFG[VPN_PORT_FORWARDING]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *"- VPN_PORT_FORWARDING=on"* && "$o" != *UP_COMMAND* ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && CFG[VPN_PORT_FORWARDING]=on && ! vpn_pf_on )'
+    st "port forwarding: hook + qbt conf"   '( mkdir -p $t/pf/bin; printf "#!/bin/sh\nfor a; do case \"\$a\" in json=*) printf \"%%s\\\\n\" \"\$a\" >>$t/pf/data;; http*) printf \"%%s\\\\n\" \"\$a\" >>$t/pf/url;; esac; done\nexit 0\n" >$t/pf/bin/wget; chmod +x $t/pf/bin/wget; render_pf_script >$t/pf/s.sh; sh -n $t/pf/s.sh && PATH=$t/pf/bin:$PATH sh $t/pf/s.sh up 45123 wg0 8200 >/dev/null && grep -qx "json={\"listen_port\":45123,\"current_network_interface\":\"wg0\",\"random_port\":false,\"upnp\":false}" $t/pf/data && grep -qx "http://127.0.0.1:8200/api/v2/app/setPreferences" $t/pf/url && st_prep internet jellyfin tailscale core && CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=protonvpn && CFG[VPN_PORT_FORWARDING]=on && FOLDER_FOR_DATA=$t/pf && mkdir -p $t/pf/qbittorrent/qBittorrent && printf "[BitTorrent]\nSession\\\\Port=1\n\n[Preferences]\nWebUI\\\\Port=8200\nWebUI\\\\LocalHostAuth=true\n" >$t/pf/qbittorrent/qBittorrent/qBittorrent.conf && docker() { :; } && sleep() { :; } && ensure_qbt_localhost >/dev/null && [[ $(grep -c "^WebUI\\\\LocalHostAuth=" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf) == 1 ]] && grep -q "^WebUI\\\\LocalHostAuth=false" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf && grep -q "^Session\\\\Port=1" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf && CFG[WIREGUARD_ADDRESSES]=10.2.0.2/32 && looks_like_proton && CFG[WIREGUARD_ADDRESSES]=10.64.1.2/32 && ! looks_like_proton && v_wgpub "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=" && ! v_wgpub "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgy=" )'
+    st "custom ProtonVPN -> protonvpn offer" '( st_prep internet jellyfin tailscale core; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[WIREGUARD_ADDRESSES]=10.2.0.2/32; CFG[VPN_ENDPOINT_IP]=203.0.113.9; CFG[VPN_ENDPOINT_PORT]=51820; CFG[WIREGUARD_PUBLIC_KEY]=bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=; is_tty() { return 0; }; ASSUME_YES=0; confirm() { return 0; }; vpn_offer_provider_switch >/dev/null; [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -z "${CFG[VPN_ENDPOINT_IP]}" && "${CFG[WIREGUARD_ADDRESSES]}" == 10.2.0.2/32 ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[WIREGUARD_ADDRESSES]=10.64.0.2/32 && vpn_offer_provider_switch >/dev/null && [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]] )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
