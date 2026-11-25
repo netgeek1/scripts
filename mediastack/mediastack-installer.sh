@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.1.1"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -5238,7 +5238,9 @@ py_oneoff() {
 
 HEIMDALL_PY='
 import sqlite3, sys, time
-MARK = "Managed by mediastack-installer"
+# description = Heimdall'"'"'s per-app JSON config (must stay NULL for plain links); appdescription = tooltip text.
+# Managed tiles are tracked in our own table; Heimdall never reads it.
+OLD_MARK = "Managed by mediastack-installer"   # v3.1.0 put this in appdescription and text in description
 rows = [l.rstrip("\n").split("|") for l in sys.stdin if l.strip()]
 con = sqlite3.connect("/config/www/app.sqlite", timeout=30); cur = con.cursor()
 cols = {r[1] for r in cur.execute("PRAGMA table_info(items)")}
@@ -5247,25 +5249,34 @@ if not need <= cols:
     print("Heimdall database has an unexpected layout; not changed"); sys.exit(3)
 if not cur.execute("select count(*) from items where id = 0").fetchone()[0]:
     print("Heimdall has not finished its first start (no dashboard tag yet)"); sys.exit(4)
+cur.execute("create table if not exists mediastack_managed (item_id integer primary key)")
 now = time.strftime("%Y-%m-%d %H:%M:%S")
-mine = {t: i for i, t in cur.execute("select id, title from items where appdescription = ? and deleted_at is null", (MARK,))}
+repaired = 0
+for (i,) in cur.execute("select id from items where appdescription = ?", (OLD_MARK,)).fetchall():
+    cur.execute("insert or ignore into mediastack_managed (item_id) values (?)", (i,))
+    cur.execute("update items set appdescription = description, description = null where id = ?", (i,)); repaired += 1
+mine = {t: i for i, t in cur.execute("select i.id, i.title from items i join mediastack_managed m on m.item_id = i.id"
+                                     " where i.deleted_at is null")}
 keep, added = set(), 0
 for n, r in enumerate(rows):
     group, title, href, desc, icon, lan, colour = (r + [""] * 7)[:7]
     if title in mine:
-        cur.execute("update items set url = ?, description = ?, colour = ?, \"order\" = ?, pinned = 1, updated_at = ? where id = ?",
-                    (href, desc, colour, n, now, mine[title]))
+        cur.execute("update items set url = ?, appdescription = ?, description = null, colour = ?, \"order\" = ?, pinned = 1,"
+                    " updated_at = ? where id = ?", (href, desc, colour, n, now, mine[title]))
     else:
-        cur.execute("insert into items (title, colour, url, description, pinned, \"order\", type, user_id, appdescription,"
-                    " created_at, updated_at) values (?, ?, ?, ?, 1, ?, 0, 0, ?, ?, ?)", (title, colour, href, desc, n, MARK, now, now))
-        cur.execute("insert into item_tag (item_id, tag_id, created_at, updated_at) values (?, 0, ?, ?)", (cur.lastrowid, now, now))
+        cur.execute("insert into items (title, colour, url, appdescription, pinned, \"order\", type, user_id,"
+                    " created_at, updated_at) values (?, ?, ?, ?, 1, ?, 0, 0, ?, ?)", (title, colour, href, desc, n, now, now))
+        iid = cur.lastrowid
+        cur.execute("insert or ignore into item_tag (item_id, tag_id, created_at, updated_at) values (?, 0, ?, ?)", (iid, now, now))
+        cur.execute("insert into mediastack_managed (item_id) values (?)", (iid,))
         added += 1
     keep.add(title)
 gone = [i for t, i in mine.items() if t not in keep]
 for i in gone:
     cur.execute("update items set deleted_at = ? where id = ?", (now, i))
 con.commit()
-print("Heimdall: %d tiles (%d new, %d removed); your own tiles untouched" % (len(rows), added, len(gone)))
+print("Heimdall: %d tiles (%d new, %d removed%s); your own tiles untouched"
+      % (len(rows), added, len(gone), ", %d repaired" % repaired if repaired else ""))
 '
 
 HOMARR_PY='
