@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.3.1"
+readonly SCRIPT_VERSION="3.3.2"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1157,6 +1157,11 @@ render_env() {
     env_set "$envf" MS_VPN_PORT_FORWARDING "$(vpn_pf_on && echo on || echo off)"
     env_set "$envf" MS_VPN_PORT_FORWARDING_PROVIDER "${CFG[VPN_PORT_FORWARDING_PROVIDER]:-}"
     env_set "$envf" MS_VPN_PF_CAPABLE "$(vpn_pf_capable && echo yes || echo no)"
+    if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && "${CFG[VPN_SERVERS_UPDATE_PERIOD]:-off}" != off && -z "$(vpn_update_period)" ]]; then
+        env_set "$envf" MS_VPN_UPDATER proton-account
+    else
+        env_set "$envf" MS_VPN_UPDATER "$(vpn_update_period || true)"
+    fi
     vpn_normalize
     # Endpoint: only provider 'custom' takes it (for listed providers it pins a server that is often not in
     # Gluetun's list: "target IP address not found"). Upstream passes the deprecated VPN_ENDPOINT_IP/PORT names,
@@ -1384,7 +1389,7 @@ render_addon() {   # render_addon NAME -> service body (4-space indented, no key
       - ${FOLDER_FOR_DATA:?err}/statusboard/requests:/requests
       - ${FOLDER_FOR_DATA:?err}/tailscale/run:/var/run/tailscale:ro
       - ${FOLDER_FOR_DATA:?err}/ddns-updater:/ddns:ro
-      - ${FOLDER_FOR_DATA:?err}/gluetun:/gluetun:ro             # server-list timestamp (servers.json)
+      - ${FOLDER_FOR_DATA:?err}/gluetun:/gluetun:ro             # server-list date, port-hook result
     environment:
       - TZ=${TIMEZONE:?err}
       - DOMAIN=${CLOUDFLARE_DNS_ZONE:?err}
@@ -1411,6 +1416,7 @@ render_addon() {   # render_addon NAME -> service body (4-space indented, no key
       - VPN_PORT_FORWARDING=${MS_VPN_PORT_FORWARDING:-off}
       - VPN_PORT_FORWARDING_PROVIDER=${MS_VPN_PORT_FORWARDING_PROVIDER:-}
       - VPN_PF_CAPABLE=${MS_VPN_PF_CAPABLE:-no}
+      - VPN_UPDATER=${MS_VPN_UPDATER:-off}
       - TRUSTED_PROXY_HOST=traefik
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)"]
@@ -2382,6 +2388,21 @@ vpn_offer_provider_switch() {
     log_ok "Provider: protonvpn (private key and address kept; the server endpoint is now chosen by Gluetun)"
 }
 
+# vpn_pf_status_line -- status screen: the forwarded port Gluetun holds now, and whether qBittorrent took it
+vpn_pf_status_line() {
+    vpn_pf_on || return 0
+    local port qs f="$FOLDER_FOR_DATA/gluetun/mediastack-pf-qbittorrent.status"
+    port=$(docker exec gluetun cat /tmp/gluetun/forwarded_port 2>/dev/null | head -n1 | tr -dc '0-9,')
+    if [[ -f "$f" ]] && vpn_pf_qbt; then
+        case "$(sed -n 's/^result=//p' "$f")" in
+            ok)      qs="qBittorrent uses port $(sed -n 's/^port=//p' "$f")" ;;
+            pending) qs="qBittorrent: being set" ;;
+            *)       qs="qBittorrent not set: $(sed -n 's/^detail=//p' "$f" | cut -c1-90)" ;;
+        esac
+    fi
+    printf '  %-22s %s\n' "Forwarded port" "${port:-none yet (Gluetun is connecting, or the server has no port forwarding)}${qs:+  ($qs)}"
+}
+
 vpn_problems() {
     svc_enabled gluetun || return 0
     local p=${CFG[VPN_SERVICE_PROVIDER]:-} f=${CFG[VPN_CUSTOM_OVPN_FILE]:-}
@@ -2660,7 +2681,7 @@ vpn_update_servers() {
                 exec /gluetun-entrypoint "$@"'; then
         die "The server-list update failed (see above)."
     fi
-    log_ok "Server list updated in $FOLDER_FOR_DATA/gluetun/servers.json"
+    log_ok "Server list updated in $FOLDER_FOR_DATA/gluetun (servers/ or servers.json, depending on the Gluetun version)"
     if docker ps -q --filter 'name=^gluetun$' | grep -q .; then
         run docker restart gluetun >/dev/null && log_ok "Gluetun restarted with the new list"
     fi
@@ -3713,6 +3734,8 @@ stack_stop() {
 # -----------------------------------------------------------------------------
 show_status() {
     ensure_config; resolve_runtime
+    # the checks below look at secrets: load the vault when it opens (status must never stop on a vault problem)
+    if [[ -f "$SECRETS_FILE" ]] && ! (( SECRETS_LOADED )) && secrets_decrypt >/dev/null 2>&1; then load_secrets; fi
     log_step "MediaStack status"
     printf '  %-22s %s\n' "Installer" "v$SCRIPT_VERSION ($SCRIPT_PATH)"
     printf '  %-22s %s\n' "Config" "$( [[ -f "$CONF_FILE" ]] && echo "$CONF_FILE" || echo 'not configured')"
@@ -3739,6 +3762,7 @@ show_status() {
     fi
     if svc_enabled gluetun; then
         printf '  %-22s %s\n' "VPN" "${CFG[VPN_SERVICE_PROVIDER]:-<not set>} / ${CFG[VPN_TYPE]}"
+        vpn_pf_status_line
         local vl; while IFS= read -r vl; do [[ -n "$vl" ]] && log_warn "VPN: $vl"; done <<<"$(vpn_problems)"
     fi
     local t p
@@ -4635,7 +4659,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 FILTER_KEYS = ("SERVER_COUNTRIES", "SERVER_CITIES", "SERVER_HOSTNAMES", "SERVER_REGIONS")
 ENDPOINT_KEYS = ("VPN_ENDPOINT_IP", "VPN_ENDPOINT_PORT", "WIREGUARD_PUBLIC_KEY")
 CONFIG = {k: E(k, "") for k in ("VPN_SERVICE_PROVIDER", "VPN_TYPE", "DOMAIN", "VPN_PORT_FORWARDING",
-                                "VPN_PORT_FORWARDING_PROVIDER", "VPN_PF_CAPABLE") + FILTER_KEYS + ENDPOINT_KEYS}
+                                "VPN_PORT_FORWARDING_PROVIDER", "VPN_PF_CAPABLE", "VPN_UPDATER") + FILTER_KEYS + ENDPOINT_KEYS}
 GLUETUN_DIR = E("GLUETUN_DIR", "/gluetun")
 DDNS_DIR = E("DDNS_DIR", "/ddns")
 DDNS = {k: E(k, "") for k in ("DDNS_PROVIDER", "DDNS_RECORDS", "DDNS_URL", "DOMAIN")}
@@ -4747,12 +4771,20 @@ def gl(method, path, body=None, timeout=TIMEOUT):
 
 
 def servers_info(provider):
-    """Last server-list update for PROVIDER from Gluetun's data folder (servers.json, or the per-provider file it names)."""
+    """Date of the server list Gluetun uses for PROVIDER, from its data folder: servers/manifest.json (current Gluetun,
+    one file per provider) or the older single servers.json."""
     if not provider or provider == "custom":
         return {}
     try:
-        with open(os.path.join(GLUETUN_DIR, "servers.json")) as f:
-            entry = (json.load(f) or {}).get(provider.lower()) or {}
+        for name in ("servers/manifest.json", "servers.json"):
+            try:
+                with open(os.path.join(GLUETUN_DIR, name)) as f:
+                    entry = (json.load(f) or {}).get(provider.lower()) or {}
+                break
+            except FileNotFoundError:
+                continue
+        else:
+            raise FileNotFoundError
         fp = entry.get("filepath")
         if fp:
             rel = os.path.relpath(os.path.normpath(fp), "/gluetun")
@@ -5235,9 +5267,12 @@ async function loadGL() {
           '<div class="mut">' + esc(d.qbt.time ? new Date(d.qbt.time).toLocaleString() : "") + "</div>" : ""))}
     ${card("Server list", c.VPN_SERVICE_PROVIDER === "custom" ? "—" : (d.servers && d.servers.timestamp ? esc(new Date(d.servers.timestamp * 1000).toLocaleString()) : "—"),
         c.VPN_SERVICE_PROVIDER === "custom" ? '<span class="mut">provider custom has no server list</span>' :
-        (d.servers && d.servers.timestamp ? esc(d.servers.count + " servers · updater " + (up.status || "?")) : '<span class="mut">' + esc((d.servers && d.servers.error) || "unknown") + "</span>"))}
+        (d.servers && d.servers.timestamp ? esc(d.servers.count + " servers") : '<span class="mut">' + esc((d.servers && d.servers.error) || "unknown") + "</span>") +
+        '<div class="mut">' + esc(c.VPN_UPDATER === "proton-account" ? "Updates need a Proton account (a free one is enough for free servers): Settings → 8 in the installer"
+          : c.VPN_UPDATER && c.VPN_UPDATER !== "off" ? "Updated by Gluetun every " + c.VPN_UPDATER + (up.status ? " · updater " + up.status : "")
+          : "Automatic updates off (Settings → 8); the list is the one built into Gluetun") + "</div>")}
   </div>
-  <div class="row">${btn("Restart VPN", 'data-a="restart"')} ${btn("Stop VPN", 'data-a="stop"', true)} ${btn("Start VPN", 'data-a="start"')} ${c.VPN_SERVICE_PROVIDER === "custom" ? "" : btn("Update server list now", 'data-a="update_servers"')}</div>
+  <div class="row">${btn("Restart VPN", 'data-a="restart"')} ${btn("Stop VPN", 'data-a="stop"', true)} ${btn("Start VPN", 'data-a="start"')} ${c.VPN_SERVICE_PROVIDER === "custom" || c.VPN_UPDATER === "proton-account" ? "" : btn("Update server list now", 'data-a="update_servers"')}</div>
   <h2>Server selection</h2>
   <div class="card"><div class="mut">Changing these recreates Gluetun (the download apps restart with it). The installer validates and applies the change on the host.</div>
   ${c.VPN_SERVICE_PROVIDER === "custom" ? `
@@ -7311,7 +7346,7 @@ FIX
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
     st "DDNS settings and config"          '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; CFG[DDNS_PROVIDER]=cloudflare; CFG[DDNS_RECORDS]="certifiedgeeks.net,*.certifiedgeeks.net"; CFG[DDNS_CF_ZONE_ID]=0123456789abcdef0123456789abcdef; j=$(ddns_config_json); [[ "$j" == "{\"settings\":[{\"provider\":\"cloudflare\",\"zone_identifier\":\"0123456789abcdef0123456789abcdef\",\"domain\":\"certifiedgeeks.net\""* && "$j" == *"\"domain\":\"*.certifiedgeeks.net\""* && "$j" == *"\"token\":\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\""* ]] && { ! command -v python3 >/dev/null || python3 -c "import json,sys; json.loads(sys.argv[1].replace(\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\",\"t\"))" "$j"; } && ddns_records_in_zone "certifiedgeeks.net,*.certifiedgeeks.net,a.certifiedgeeks.net" && ! ddns_records_in_zone "evil.org" && v_ddns_records "*.x.org,y.org" && ! v_ddns_records "a b" && apply_preset && st_on ddns-updater && o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"- '"'"'CONFIG={\"settings\""* ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
-    st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
+    st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* && "$o" != *UPDATER_PROTONVPN* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
     st "--set validation"                   'validate_key CERT_MODE selfsigned && ! validate_key CERT_MODE self && validate_key ACCESS_MODE lan && ! validate_key DATA_STORAGE smb && validate_key MEDIA_REMOTE "//nas/media" && validate_key BACKUP_KEEP 7 && ! validate_key BACKUP_KEEP x && ! validate_key NOPE 1 && ! validate_key DOMAIN "a b"'
     st "v1.x config keeps old behaviour"    '( MS_CONF_DIR="$t/c3"; CONF_FILE="$t/c3/m.conf"; mkdir -p "$t/c3"; printf "%s\n" "DOMAIN='"'"'x.org'"'"'" >"$CONF_FILE"; REF_OVERRIDE=""; load_config; [[ ${CFG[ACCESS_MODE]} == internet && ${CFG[CERT_MODE]} == letsencrypt && ${CFG[SERVICE_PRESET]} == custom && ${CFG[TAILSCALE_CONTROL]} == headscale ]] )'
