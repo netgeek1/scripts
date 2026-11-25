@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.2.0"
+readonly SCRIPT_VERSION="3.2.1"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -4394,7 +4394,8 @@ menu_settings() {
             8) cfg_vpn_email; dirty=1 ;;
             9) cfg_stack; dirty=1 ;;
             e) cfg_ddns; [[ "${CFG[SERVICE_PRESET]}" == custom ]] || apply_preset; dirty=1 ;;
-            u) cfg_urls; dirty=1 ;;
+            u) w="${CFG[SERVICE_HOSTNAMES]:-}|${CFG[SERVICE_PORTS]:-}"; cfg_urls
+               [[ "$w" == "${CFG[SERVICE_HOSTNAMES]:-}|${CFG[SERVICE_PORTS]:-}" ]] || dirty=1 ;;
             d) detect_defaults; dirty=1 ;;
             t) ask w "Test which share (MEDIA/DATA)" MEDIA; w=${w^^}
                [[ "$w" =~ ^(MEDIA|DATA)$ ]] && menu_action storage_test "$w" ;;
@@ -5654,6 +5655,7 @@ v_hostmap() {
     return 0
 }
 v_portmap() { local e; for e in $1; do [[ "$e" =~ ^[a-z0-9-]+=[0-9]+$ ]] && v_port "${e#*=}" || return 1; done; return 0; }
+upstream_env_file() { printf '%s/base-working-files/.env' "${UPSTREAM_DIR:-$MS_STATE_DIR/upstream/${CFG[UPSTREAM_REF]}}"; }
 svc_port_key() { printf 'WEBUI_PORT_%s' "$(tr 'a-z-' 'A-Z_' <<<"$1")"; }
 
 # router_rule COMPOSE SVC -> the rule of router SVC in upstream's file (blank when it has none)
@@ -5670,7 +5672,8 @@ hostname_label_line() { printf "      - 'traefik.http.routers.%s.rule=%s'\n" "$1
 
 # render_port_overrides ENVFILE -- WEBUI_PORT_* from SERVICE_PORTS; ports no longer overridden go back to upstream's
 render_port_overrides() {
-    local envf=$1 upenv="$UPSTREAM_DIR/base-working-files/.env" prev e s k v
+    local envf=$1 upenv prev e s k v
+    upenv=$(upstream_env_file)
     prev=$(env_get "$envf" MS_PORT_OVERRIDES 2>/dev/null || true)
     for e in $prev; do
         s=${e%%=*}; map_get "${CFG[SERVICE_PORTS]:-}" "$s" >/dev/null && continue
@@ -5721,6 +5724,7 @@ port_in_use_by() {   # port_in_use_by PORT [EXCEPT_KEY] -> the other .env key ho
 
 cfg_urls() {
     section "Hostnames and LAN ports"
+    resolve_runtime      # the Settings menu works on CFG; the folder globals are only set when an action runs
     [[ -f "$FOLDER_FOR_YAML/.env" ]] || { log_warn "Install first: the service list comes from the installed stack."; return 0; }
     local envf="$FOLDER_FOR_YAML/.env" z i row s r p pick v k other def
     z=$(tls_zone)
@@ -5756,7 +5760,7 @@ cfg_urls() {
             [[ "$s" == headscale ]] && log_warn "Changing Headscale's name changes its server_url; devices already joined must log in again."
         fi
         if (( p )); then
-            k=$(svc_port_key "$s"); def=$(env_get "$UPSTREAM_DIR/base-working-files/.env" "$k" 2>/dev/null || true)
+            k=$(svc_port_key "$s"); def=$(env_get "$(upstream_env_file)" "$k" 2>/dev/null || true)
             while :; do
                 ask v "LAN port for $s ('-' = default ${def:-upstream})" "$(env_get "$envf" "$k" 2>/dev/null)"
                 [[ "$v" == - || ( -n "$def" && "$v" == "$def" ) ]] && { CFG[SERVICE_PORTS]=$(map_set "${CFG[SERVICE_PORTS]:-}" "$s" ""); break; }
@@ -7001,6 +7005,7 @@ services:
     image: q
 FIX
     st "hostnames: override merge"          '( st_prep internet both tailscale core; CFG[SERVICE_HOSTNAMES]="sonarr=tv,sonarr homarr=home statusboard=board qbittorrent=qb plex=watch"; o=$(render_override "$t/hz/docker-compose.yaml"); [[ $(grep -c "^  sonarr:" <<<"$o") == 1 && $(grep -c "^  homarr:" <<<"$o") == 1 ]] && grep -qF "routers.sonarr.rule=Host(\`tv.\${CLOUDFLARE_DNS_ZONE:?err}\`) || Host(\`sonarr.\${CLOUDFLARE_DNS_ZONE:?err}\`)" <<<"$o" && grep -qF "routers.plex.rule=Host(\`watch.\${CLOUDFLARE_DNS_ZONE:?err}\`) && PathPrefix(\`/web/\`)" <<<"$o" && grep -qF "routers.homarr.rule=Host(\`home." <<<"$o" && grep -qF "routers.statusboard.rule=Host(\`board." <<<"$o" && ! grep -qF "Host(\`status." <<<"$o" && grep -q "qbittorrent: no Traefik router" <<<"$o" && [[ $(awk "/^  homarr:/{f=1;next} /^  [a-z]/{f=0} f && /^    labels:/" <<<"$o" | wc -l) == 1 ]] )'
+    st "hostnames menu: fresh menu session" '( st_prep internet both tailscale core; CFG[FOLDER_FOR_YAML]=$t/hz; FOLDER_FOR_YAML=""; printf "WEBUI_PORT_SONARR=8989\n" >$t/hz/.env; detect_network() { :; }; ask() { printf -v "$1" "%s" ""; }; o=$(cfg_urls 2>&1); [[ "$o" == *"Hostnames (."* && "$o" == *" sonarr "* && "$o" == *8989* && "$o" != *"Install first"* ]] )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
