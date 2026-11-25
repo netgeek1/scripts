@@ -605,6 +605,31 @@ Upstream still ships the legacy `ghcr.io/ajnart/homarr` (0.x) image. The install
 
 Homarr is off in the Core preset and on in Full.
 
+### Status board (Tailscale, Gluetun, CrowdSec)
+
+An add-on included in the Core preset: one page with three tabs, at **`https://status.<domain>`** (Authentik
+sign-in) or **`http://<host-ip>:13380`** (read-only). Its Python source is embedded in the installer and written to
+`<data>/statusboard/app` on every apply. It runs in a stock `python:3.13-alpine` container (read-only filesystem,
+no capabilities, **no Docker socket**) and uses each tool's own API:
+
+| Tab | Shows | Can do | Through |
+|---|---|---|---|
+| **Tailscale** | state, tailnet, this node, advertised routes/exit node, home relay; every peer with online state, IP, OS, direct/relay connection, traffic, last seen | ping a peer; a link to **Tailscale's own web interface** (`http://<tailscale-ip>:5252`, enabled by Apply) for exit node, routes and SSH changes | LocalAPI over the `tailscaled` socket (shared `<data>/tailscale/run`, read-only mount) |
+| **Gluetun VPN** | VPN state, provider/type, public IP and location, forwarded port, server-list updater | restart / stop / start the VPN, update the server list now; **change the server selection** (countries, cities, hostnames, regions) or recreate Gluetun | control server with a generated API key (`HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE`) |
+| **CrowdSec** | metrics (decisions, alerts, log lines read and parsed, bouncer requests), active decisions, recent alerts | ban an IP or range (duration, reason), unban | LAPI: the Traefik bouncer key for decisions, a `statusboard` machine login (registered by Apply) for alerts/ban/unban; metrics on :6060 |
+
+**Changes need the HTTPS address.** Actions are accepted only when the request comes through Traefik with an
+Authentik user (`X-authentik-username`). The LAN port is read-only, and every change is logged with the user name.
+
+**Server selection changes** recreate Gluetun, which only the host can do. The board writes a validated request
+file into `<data>/statusboard/requests`. The `mediastack-requests.path` systemd unit then runs
+`mediastack-installer --process-requests`, which:
+
+- accepts only whitelisted actions and validated values
+- sets the filters, runs Apply and writes the result back. The board's "Recent change requests" table shows it.
+
+These runs are logged as `request-*.log` in `/var/log/mediastack/`.
+
 ### Apps that check their hostname
 
 **SABnzbd** refuses requests for hostnames it doesn't know ("Access denied - Hostname verification failed"). With
@@ -880,7 +905,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 86 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 87 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
