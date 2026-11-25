@@ -3,6 +3,21 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v2.8.0 — 2026-11-24 — Authentik forward auth configured automatically
+
+### Added
+- **Authentik blueprint** (`<data>/authentik/blueprints/mediastack-forward-auth.yaml`, mounted as
+  `/blueprints/mediastack` in the server and worker). It creates upstream's manual setup:
+  - the domain-level forward-auth proxy provider for `https://auth.<domain>`, cookie domain `<domain>`
+  - the "Authentik" application
+  - the embedded outpost bound to it, with `authentik_host: https://auth.<domain>/`
+
+  This fixes app hostnames showing Authentik's "Not Found" and redirects to `http://0.0.0.0:9000/...`. Objects with
+  the upstream names are updated, not duplicated.
+- **`AUTHENTIK_BOOTSTRAP_PASSWORD`**: generated into the vault, and becomes `akadmin`'s password on a new Authentik
+  database (Secrets → 4 to reveal). The install summary says how to sign in.
+- Self-test: 83 checks.
+
 ## v2.7.0 — 2026-11-24 — CrowdSec bouncer works out of the box
 
 ### Fixed
