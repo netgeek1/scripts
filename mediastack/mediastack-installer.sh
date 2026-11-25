@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.9.2"
+readonly SCRIPT_VERSION="3.0.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -52,8 +52,8 @@ readonly AUTHENTIK_CONTAINER="authentik"
 
 # Folder layout. Mirrors upstream restart.sh at the pinned commit. The *_BRACE
 # strings are the exact upstream text and are used only for drift detection.
-readonly DATA_BRACE='{authentik/{certs,media,templates,blueprints},bazarr,chromium,crowdsec/data,ddns-updater,filebot,gluetun,grafana,headplane/data,headscale/data,heimdall,homarr/{configs,data,icons},homepage,huntarr,jellyfin,lidarr,logs/{unpackerr,traefik},mylar,plex,portainer,postgresql,prometheus,prowlarr,qbittorrent,radarr,readarr,sabnzbd,seerr,sonarr,tailscale,tdarr/{server,configs,logs},tdarr-node,traefik/letsencrypt,traefik-certs-dumper,unpackerr,valkey,whisparr}'
-DATA_SUBDIRS=( authentik/{certs,media,templates,blueprints} bazarr chromium crowdsec/data ddns-updater filebot
+readonly DATA_BRACE='{authentik/{certs,media,templates},bazarr,chromium,crowdsec/data,ddns-updater,filebot,gluetun,grafana,headplane/data,headscale/data,heimdall,homarr/{configs,data,icons},homepage,huntarr,jellyfin,lidarr,logs/{unpackerr,traefik},mylar,plex,portainer,postgresql,prometheus,prowlarr,qbittorrent,radarr,readarr,sabnzbd,seerr,sonarr,tailscale,tdarr/{server,configs,logs},tdarr-node,traefik/letsencrypt,traefik-certs-dumper,unpackerr,valkey,whisparr}'
+DATA_SUBDIRS=( authentik/{certs,media,templates} bazarr chromium crowdsec/data ddns-updater filebot
                gluetun grafana headplane/data headscale/data heimdall homarr/{configs,data,icons} homepage
                huntarr jellyfin lidarr logs/{unpackerr,traefik} mylar plex portainer postgresql prometheus
                prowlarr qbittorrent radarr readarr sabnzbd seerr sonarr tailscale tdarr/{server,configs,logs}
@@ -64,7 +64,7 @@ MEDIA_SUBDIRS=( media/{anime,audio,books,comics,movies,music,photos,tv,xxx}
                 watch filebot/{input,output} )
 
 # Folders for installer-patched upstream services (not in upstream restart.sh)
-EXTRA_DATA_SUBDIRS=( homarr/appdata )
+EXTRA_DATA_SUBDIRS=( homarr/appdata authentik/blueprints tailscale/run )
 
 # App config files upstream restart.sh copies from the YAML folder into app data
 # (source in FOLDER_FOR_YAML : destination relative to FOLDER_FOR_DATA).
@@ -82,10 +82,11 @@ UPSTREAM_SCRIPTS=( restart.sh create_guacamole_database.sh secure_authentik_data
 
 # Add-on services: not part of upstream MediaStack; defined by this installer in the managed
 # docker-compose.override.yaml and toggled like any other service (on/disabled/removed).
-ADDON_SERVICES=( audiobookshelf )
-declare -A ADDON_DATA_DIRS=( [audiobookshelf]="audiobookshelf/config audiobookshelf/metadata" )
+ADDON_SERVICES=( audiobookshelf statusboard )
+declare -A ADDON_DATA_DIRS=( [audiobookshelf]="audiobookshelf/config audiobookshelf/metadata"
+                             [statusboard]="statusboard/app statusboard/requests" )
 declare -A ADDON_MEDIA_DIRS=( [audiobookshelf]="media/audio media/podcasts media/books" )
-declare -A ADDON_ENV_DEFAULTS=( [audiobookshelf]="WEBUI_PORT_AUDIOBOOKSHELF=13378" )
+declare -A ADDON_ENV_DEFAULTS=( [audiobookshelf]="WEBUI_PORT_AUDIOBOOKSHELF=13378" [statusboard]="WEBUI_PORT_STATUSBOARD=13380" )
 
 # -----------------------------------------------------------------------------
 # CONFIG MODEL (non-secret settings -> $CONF_FILE)
@@ -119,14 +120,15 @@ SECRET_KEYS=( VPN_USERNAME VPN_PASSWORD PLEX_CLAIM CLOUDFLARE_DNS_API_TOKEN EMAI
               WIREGUARD_PRIVATE_KEY WIREGUARD_PRESHARED_KEY POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY
               HEADPLANE_COOKIE_SECRET SONARR_API_TOKEN RADARR_API_TOKEN LIDARR_API_TOKEN READARR_API_TOKEN
               WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD SECRET_ENCRYPTION_KEY
-              TLS_KEY_PASSPHRASE UPDATER_PROTONVPN_PASSWORD CROWDSEC_BOUNCER_KEY AUTHENTIK_BOOTSTRAP_PASSWORD )
+              TLS_KEY_PASSPHRASE UPDATER_PROTONVPN_PASSWORD CROWDSEC_BOUNCER_KEY AUTHENTIK_BOOTSTRAP_PASSWORD
+              STATUSBOARD_GLUETUN_KEY CROWDSEC_STATUSBOARD_PASSWORD )
 # Vault entries that are not .env variables
 SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE )
 SECRET_PROMPTED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY EMAIL_PASSWORD PLEX_CLAIM )
 SECRET_WIREGUARD=( WIREGUARD_PRIVATE_KEY )   # WIREGUARD_PRESHARED_KEY is optional: taken from wg0.conf only
 SECRET_REQUIRED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY )   # compose :?err
 SECRET_GENERATED=( POSTGRESQL_PASSWORD AUTHENTIK_SECRET_KEY HEADPLANE_COOKIE_SECRET SECRET_ENCRYPTION_KEY CROWDSEC_BOUNCER_KEY
-                   AUTHENTIK_BOOTSTRAP_PASSWORD )
+                   AUTHENTIK_BOOTSTRAP_PASSWORD STATUSBOARD_GLUETUN_KEY CROWDSEC_STATUSBOARD_PASSWORD )
 readonly SECRET_UNSET="not-set"
 declare -A SECRETS=()
 SECRETS_LOADED=0
@@ -1233,7 +1235,7 @@ svc_enabled() { svc_exists "$1" && [[ "$(eff_state "$1")" == on ]]; }
 # -----------------------------------------------------------------------------
 # SERVICE PRESETS (chosen in the wizard; 'custom' keeps the lists as they are)
 # -----------------------------------------------------------------------------
-readonly PRESET_CORE_COMMON="gluetun qbittorrent sabnzbd prowlarr flaresolverr unpackerr sonarr radarr lidarr bazarr seerr homepage tailscale audiobookshelf"
+readonly PRESET_CORE_COMMON="gluetun qbittorrent sabnzbd prowlarr flaresolverr unpackerr sonarr radarr lidarr bazarr seerr homepage tailscale audiobookshelf statusboard"
 readonly PRESET_CORE_INTERNET="traefik traefik-certs-dumper crowdsec authentik authentic-worker postgresql valkey"
 readonly PRESET_ALWAYS_REMOVED="readarr"       # retired upstream
 readonly PRESET_FULL_DISABLED="whisparr"
@@ -1321,6 +1323,56 @@ report_dependencies() {   # report_dependencies warn|die
 # -----------------------------------------------------------------------------
 render_addon() {   # render_addon NAME -> service body (4-space indented, no key line)
     case "$1" in
+        statusboard)
+            cat <<'EOF'
+    # Status board: Tailscale, Gluetun and CrowdSec in one page (app source written by the installer)
+    image: python:3.13-alpine
+    container_name: statusboard
+    restart: unless-stopped
+    networks:
+      - mediastack
+    command: ["python", "-u", "-B", "/app/app.py"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - ${WEBUI_PORT_STATUSBOARD:?err}:8080       # LAN: read-only; changes only via https://status.<domain>
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/statusboard/app:/app:ro
+      - ${FOLDER_FOR_DATA:?err}/statusboard/requests:/requests
+      - ${FOLDER_FOR_DATA:?err}/tailscale/run:/var/run/tailscale:ro
+    environment:
+      - TZ=${TIMEZONE:?err}
+      - TS_SOCKET=/var/run/tailscale/tailscaled.sock
+      - GLUETUN_URL=http://gluetun:${GLUETUN_CONTROL_PORT:?err}
+      - GLUETUN_API_KEY=${STATUSBOARD_GLUETUN_KEY:?err}
+      - CROWDSEC_LAPI=http://crowdsec:8080
+      - CROWDSEC_METRICS=http://crowdsec:6060/metrics
+      - CROWDSEC_BOUNCER_KEY=${CROWDSEC_BOUNCER_KEY:?err}
+      - CROWDSEC_MACHINE_ID=statusboard
+      - CROWDSEC_MACHINE_PASSWORD=${CROWDSEC_STATUSBOARD_PASSWORD:?err}
+      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER}
+      - VPN_TYPE=${VPN_TYPE}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES}
+      - SERVER_CITIES=${SERVER_CITIES}
+      - SERVER_HOSTNAMES=${SERVER_HOSTNAMES}
+      - SERVER_REGIONS=${SERVER_REGIONS}
+      - TRUSTED_PROXY_HOST=traefik
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.statusboard.service=statusboard
+      - traefik.http.routers.statusboard.rule=Host(`status.${CLOUDFLARE_DNS_ZONE:?err}`)
+      - traefik.http.routers.statusboard.entrypoints=secureweb
+      - traefik.http.routers.statusboard.middlewares=authentik-forwardauth@file,security-headers@file,traefik-bouncer@file
+      - traefik.http.services.statusboard.loadbalancer.server.scheme=http
+      - traefik.http.services.statusboard.loadbalancer.server.port=8080
+EOF
+            ;;
         audiobookshelf)
             cat <<'EOF'
     image: ghcr.io/advplyr/audiobookshelf:latest
@@ -1404,17 +1456,24 @@ EOF
             if vpn_custom_wg_endpoint; then
                 printf '      - WIREGUARD_ENDPOINT_IP=%s\n      - WIREGUARD_ENDPOINT_PORT=%s\n' "${CFG[VPN_ENDPOINT_IP]}" "${CFG[VPN_ENDPOINT_PORT]}"
             fi
-            if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -n "${CFG[VPN_UPDATER_PROTON_EMAIL]}" ]]; then
+            if [[ -n "$(vpn_update_period)" && "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -n "${CFG[VPN_UPDATER_PROTON_EMAIL]}" ]]; then
                 printf '      - UPDATER_PROTONVPN_EMAIL=%s\n' "${CFG[VPN_UPDATER_PROTON_EMAIL]}"
                 printf '      - UPDATER_PROTONVPN_PASSWORD=${UPDATER_PROTONVPN_PASSWORD:-}\n'
             fi
+            if svc_enabled statusboard; then   # control-server API key for the status board (all routes)
+                printf "      - 'HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}'\n"
+            fi
             ;;
         tailscale)
-            cat <<'EOF'
-    # TAILSCALE_CONTROL=tailscale: official control server (upstream logs in to self-hosted Headscale)
-    environment:
-      - TS_EXTRA_ARGS=--hostname=exit-node --advertise-exit-node --advertise-routes=${LOCAL_SUBNET:?err},${DOCKER_SUBNET:?err}
-EOF
+            printf '    # Tailscale: official control server (TAILSCALE_CONTROL=tailscale) / LocalAPI socket for the status board\n'
+            printf '    environment:\n'
+            if [[ "${CFG[TAILSCALE_CONTROL]}" == tailscale ]]; then
+                printf '      - TS_EXTRA_ARGS=--hostname=exit-node --advertise-exit-node --advertise-routes=${LOCAL_SUBNET:?err},${DOCKER_SUBNET:?err}\n'
+            fi
+            if svc_enabled statusboard; then
+                printf '      - TS_SOCKET=/var/run/tailscale/tailscaled.sock\n'
+                printf '    volumes:\n      - ${FOLDER_FOR_DATA:?err}/tailscale/run:/var/run/tailscale\n'
+            fi
             ;;
     esac
 }
@@ -1434,9 +1493,9 @@ active_patches() {   # upstream services this installer modifies
     done
     if grep -qE '^  crowdsec:[[:space:]]*$' "$compose" && ! is_removed crowdsec; then echo crowdsec; fi
     if grep -qE '^  gluetun:[[:space:]]*$' "$compose" && ! is_removed gluetun \
-        && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint; }; then echo gluetun; fi
+        && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint || svc_enabled statusboard; }; then echo gluetun; fi
     if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale \
-        && [[ "${CFG[TAILSCALE_CONTROL]}" == tailscale ]]; then echo tailscale; fi
+        && { [[ "${CFG[TAILSCALE_CONTROL]}" == tailscale ]] || svc_enabled statusboard; }; then echo tailscale; fi
     return 0
 }
 
@@ -3348,7 +3407,9 @@ stack_apply() {
     copy_app_configs
     ensure_tls
     write_homepage_config
+    write_statusboard_app
     cert_units
+    requests_units
     report_dependencies die
     log_step "Starting MediaStack ($mode)"
     if (( DRY_RUN )); then
@@ -3372,6 +3433,7 @@ stack_apply() {
     verify_services 180 || true
     traefik_ensure_middlewares
     ensure_app_hostnames
+    statusboard_wire
     log_info "URLs, ports and DNS names: menu L, or sudo $MS_INSTALL_BIN --urls"
     if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ ! "$(tls_ensure_live)" =~ ^(yes|n/a)$ ]]; then
         log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem yet; check: sudo $MS_INSTALL_BIN --cert-show"
@@ -4220,6 +4282,727 @@ full_install() {
 }
 
 # -----------------------------------------------------------------------------
+# STATUS BOARD (add-on): Tailscale / Gluetun / CrowdSec in one page
+#   The app is a single-file Python (standard library) web server; its source lives here and is written to
+#   <data>/statusboard/app on every apply. It talks to each tool's own API (no Docker socket):
+#     Tailscale LocalAPI over the shared tailscaled socket, Gluetun's control server (API key), CrowdSec LAPI
+#     (bouncer key + a 'statusboard' machine login) and metrics.
+#   Changes that need a container recreated arrive as request files in <data>/statusboard/requests; the
+#   mediastack-requests.path unit runs '--process-requests' (validated, whitelisted) on the host.
+# -----------------------------------------------------------------------------
+render_statusboard_app() {
+    cat <<'STATUSBOARD_APP_PY'
+"""MediaStack status board -- Tailscale, Gluetun and CrowdSec in one page.
+
+Python standard library only (no pip). Data comes from each tool's own API:
+  Tailscale : LocalAPI over the tailscaled unix socket (shared volume)
+  Gluetun   : control server, X-API-Key
+  CrowdSec  : LAPI (bouncer key for decisions, machine login for alerts/ban/unban) + Prometheus metrics
+Changes that need a container recreated (Gluetun server filters) are written as request files that the
+installer's systemd watcher validates and applies on the host.
+Generated by mediastack-installer; do not edit (rewritten on every apply).
+"""
+import http.client
+import ipaddress
+import json
+import os
+import re
+import secrets
+import socket
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+E = os.environ.get
+TS_SOCKET = E("TS_SOCKET", "/var/run/tailscale/tailscaled.sock")
+TS_WEB_PORT = E("TS_WEB_PORT", "5252")
+GLUETUN_URL = E("GLUETUN_URL", "http://gluetun:8320").rstrip("/")
+GLUETUN_KEY = E("GLUETUN_API_KEY", "")
+CS_LAPI = E("CROWDSEC_LAPI", "http://crowdsec:8080").rstrip("/")
+CS_BOUNCER_KEY = E("CROWDSEC_BOUNCER_KEY", "")
+CS_MACHINE = E("CROWDSEC_MACHINE_ID", "statusboard")
+CS_PASSWORD = E("CROWDSEC_MACHINE_PASSWORD", "")
+CS_METRICS = E("CROWDSEC_METRICS", "http://crowdsec:6060/metrics")
+REQ_DIR = E("REQUESTS_DIR", "/requests")
+TRUSTED_PROXY = E("TRUSTED_PROXY_HOST", "traefik")
+LAN_ACTIONS = E("ALLOW_LAN_ACTIONS", "no") == "yes"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+FILTER_KEYS = ("SERVER_COUNTRIES", "SERVER_CITIES", "SERVER_HOSTNAMES", "SERVER_REGIONS")
+CONFIG = {k: E(k, "") for k in ("VPN_SERVICE_PROVIDER", "VPN_TYPE", "DOMAIN") + FILTER_KEYS}
+TIMEOUT = 6
+
+
+class APIError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- Tailscale (LocalAPI over a unix socket)
+class _UnixConn(http.client.HTTPConnection):
+    def __init__(self, path, timeout=TIMEOUT):
+        super().__init__("local-tailscaled.sock", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(self._path)
+        self.sock = s
+
+
+def ts_call(method, path, timeout=TIMEOUT):
+    if not os.path.exists(TS_SOCKET):
+        raise APIError("tailscaled socket not found (%s): is the tailscale container running?" % TS_SOCKET)
+    c = _UnixConn(TS_SOCKET, timeout)
+    try:
+        c.request(method, "/localapi/v0/" + path, headers={"Host": "local-tailscaled.sock", "Sec-Tailscale": "localapi"})
+        r = c.getresponse()
+        body = r.read().decode("utf-8", "replace")
+        if r.status >= 300:
+            raise APIError("tailscale %s: HTTP %s %s" % (path, r.status, body.strip()[:200]))
+        return json.loads(body) if body.strip() else {}
+    except OSError as e:
+        raise APIError("tailscale: %s" % e)
+    finally:
+        c.close()
+
+
+def _ts_node(n):
+    return {
+        "host": n.get("HostName", ""), "dns": (n.get("DNSName") or "").rstrip("."),
+        "ips": n.get("TailscaleIPs") or [], "os": n.get("OS", ""), "online": bool(n.get("Online")),
+        "exit_node": bool(n.get("ExitNode")), "exit_option": bool(n.get("ExitNodeOption")),
+        "relay": n.get("Relay", ""), "addr": n.get("CurAddr", ""), "rx": n.get("RxBytes", 0), "tx": n.get("TxBytes", 0),
+        "last_seen": n.get("LastSeen", ""), "routes": n.get("PrimaryRoutes") or [],
+    }
+
+
+def tailscale_status():
+    st = ts_call("GET", "status")
+    prefs = {}
+    try:
+        prefs = ts_call("GET", "prefs")
+    except APIError:
+        pass
+    self_ = _ts_node(st.get("Self") or {})
+    peers = sorted((_ts_node(p) for p in (st.get("Peer") or {}).values()), key=lambda p: (not p["online"], p["host"].lower()))
+    ip4 = next((i for i in self_["ips"] if ":" not in i), "")
+    return {
+        "backend": st.get("BackendState", ""), "tailnet": (st.get("CurrentTailnet") or {}).get("Name", ""),
+        "version": st.get("Version", ""), "self": self_, "peers": peers,
+        "advertise_routes": prefs.get("AdvertiseRoutes") or [], "exit_node_id": prefs.get("ExitNodeID", ""),
+        "web_client": bool(prefs.get("RunWebClient")),
+        "web_url": "http://%s:%s/" % (ip4, TS_WEB_PORT) if ip4 else "",
+        "health": st.get("Health") or [],
+    }
+
+
+def tailscale_ping(ip):
+    ipaddress.ip_address(ip)          # validates
+    return ts_call("POST", "ping?ip=%s&type=disco" % ip, timeout=15)
+
+
+# ---------------------------------------------------------------- HTTP helpers (Gluetun, CrowdSec)
+def http_json(method, url, headers=None, body=None, timeout=TIMEOUT):
+    data = json.dumps(body).encode() if body is not None else None
+    h = {"Accept": "application/json"}
+    if data is not None:
+        h["Content-Type"] = "application/json"
+    h.update(headers or {})
+    req = urllib.request.Request(url, data=data, method=method, headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise APIError("%s %s: HTTP %s %s" % (method, url.split("?")[0], e.code, e.read().decode("utf-8", "replace").strip()[:200]))
+    except (urllib.error.URLError, OSError) as e:
+        raise APIError("%s %s: %s" % (method, url.split("?")[0], getattr(e, "reason", e)))
+    if not raw.strip():
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+# ---------------------------------------------------------------- Gluetun
+def gl(method, path, body=None, timeout=TIMEOUT):
+    return http_json(method, GLUETUN_URL + path, {"X-API-Key": GLUETUN_KEY}, body, timeout)
+
+
+def gluetun_status():
+    out = {"config": CONFIG}
+    for key, path in (("vpn", "/v1/vpn/status"), ("public_ip", "/v1/publicip/ip"), ("port_forward", "/v1/portforward"),
+                      ("updater", "/v1/updater/status"), ("dns", "/v1/dns/status")):
+        try:
+            out[key] = gl("GET", path)
+        except APIError as e:
+            out[key] = {"error": str(e)}
+    return out
+
+
+def gluetun_action(action):
+    if action in ("stop", "start"):
+        return gl("PUT", "/v1/vpn/status", {"status": "stopped" if action == "stop" else "running"}, 30)
+    if action == "restart":
+        gl("PUT", "/v1/vpn/status", {"status": "stopped"}, 30)
+        time.sleep(2)
+        return gl("PUT", "/v1/vpn/status", {"status": "running"}, 30)
+    if action == "update_servers":
+        return gl("PUT", "/v1/updater/status", {"status": "running"}, 30)
+    raise APIError("unknown action")
+
+
+# ---------------------------------------------------------------- CrowdSec
+_jwt = {"token": "", "until": 0.0}
+_jwt_lock = threading.Lock()
+
+
+def cs_token():
+    with _jwt_lock:
+        if _jwt["token"] and time.time() < _jwt["until"]:
+            return _jwt["token"]
+        if not CS_PASSWORD:
+            raise APIError("no CrowdSec machine password configured")
+        r = http_json("POST", CS_LAPI + "/v1/watchers/login",
+                      body={"machine_id": CS_MACHINE, "password": CS_PASSWORD, "scenarios": []})
+        tok = (r or {}).get("token", "")
+        if not tok:
+            raise APIError("CrowdSec login returned no token")
+        _jwt.update(token=tok, until=time.time() + 600)
+        return tok
+
+
+def cs_machine(method, path, body=None):
+    try:
+        return http_json(method, CS_LAPI + path, {"Authorization": "Bearer " + cs_token()}, body)
+    except APIError as e:
+        if "HTTP 401" in str(e):              # token expired early: log in again once
+            _jwt["token"] = ""
+            return http_json(method, CS_LAPI + path, {"Authorization": "Bearer " + cs_token()}, body)
+        raise
+
+
+METRIC_NAMES = {
+    "cs_active_decisions": "Active decisions",
+    "cs_alerts": "Alerts (since start)",
+    "cs_lapi_bouncer_requests_total": "Bouncer requests to LAPI",
+    "cs_filesource_hits_total": "Log lines read",
+    "cs_parser_hits_ok_total": "Lines parsed OK",
+    "cs_parser_hits_ko_total": "Lines not parsed",
+    "cs_bucket_overflowed_total": "Scenario overflows",
+    "cs_buckets": "Active buckets",
+}
+
+
+def cs_metrics():
+    try:
+        with urllib.request.urlopen(CS_METRICS, timeout=TIMEOUT) as r:
+            text = r.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as e:
+        return {"error": "metrics: %s" % getattr(e, "reason", e)}
+    sums = {}
+    for line in text.splitlines():
+        if not line or line[0] == "#":
+            continue
+        m = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([-0-9.eE+]+)", line)
+        if m and m.group(1) in METRIC_NAMES:
+            sums[m.group(1)] = sums.get(m.group(1), 0.0) + float(m.group(3))
+    return {METRIC_NAMES[k]: int(v) for k, v in sums.items()}
+
+
+def crowdsec_status():
+    out = {}
+    try:
+        d = http_json("GET", CS_LAPI + "/v1/decisions", {"X-Api-Key": CS_BOUNCER_KEY})
+        out["decisions"] = [{"id": x.get("id"), "type": x.get("type"), "scope": x.get("scope"), "value": x.get("value"),
+                             "duration": x.get("duration"), "origin": x.get("origin"), "scenario": x.get("scenario")}
+                            for x in (d or [])][:500]
+    except APIError as e:
+        out["decisions_error"] = str(e)
+    try:
+        a = cs_machine("GET", "/v1/alerts?limit=50") or []
+        out["alerts"] = [{"id": x.get("id"), "scenario": x.get("scenario"), "source": (x.get("source") or {}).get("value", ""),
+                          "country": (x.get("source") or {}).get("cn", ""), "events": x.get("events_count"),
+                          "decisions": len(x.get("decisions") or []), "created": x.get("created_at", "")}
+                         for x in a]
+    except APIError as e:
+        out["alerts_error"] = str(e)
+    out["metrics"] = cs_metrics()
+    return out
+
+
+def crowdsec_ban(ip, duration, reason):
+    net = ipaddress.ip_network(ip, strict=False)
+    scope, value = ("Ip", str(net.network_address)) if net.num_addresses == 1 else ("Range", str(net))
+    m = re.match(r"^([0-9]+)([smhd])$", duration)
+    if not m:
+        raise APIError("duration must look like 4h, 30m, 7d")
+    if m.group(2) == "d":                       # LAPI durations are Go durations: no days
+        duration = "%dh" % (int(m.group(1)) * 24)
+    reason = re.sub(r"[^\w .,:/()-]", "", reason or "manual ban from status board")[:120] or "manual ban"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    alert = [{
+        "scenario": reason, "scenario_hash": "", "scenario_version": "", "message": reason,
+        "events_count": 1, "start_at": now, "stop_at": now, "capacity": 0, "leakspeed": "0", "simulated": False,
+        "events": [], "remediation": True,
+        "source": {"scope": scope, "value": value, **({"ip": value} if scope == "Ip" else {"range": value})},
+        "decisions": [{"duration": duration, "type": "ban", "scope": scope, "value": value,
+                       "origin": "cscli", "scenario": reason}],
+    }]
+    return cs_machine("POST", "/v1/alerts", alert)
+
+
+def crowdsec_unban(ip):
+    net = ipaddress.ip_network(ip, strict=False)
+    q = "ip=%s" % net.network_address if net.num_addresses == 1 else "range=%s" % net
+    return cs_machine("DELETE", "/v1/decisions?" + q)
+
+
+# ---------------------------------------------------------------- requests to the installer (host side)
+REQ_ID = re.compile(r"^req-[0-9a-z-]{1,40}$")
+VALUE_OK = re.compile(r"^[^=\[\]#/\n\r\x00]{0,200}$")
+
+
+def write_request(action, fields):
+    if action not in ("vpn_filters", "gluetun_recreate"):
+        raise APIError("unknown request")
+    lines = ["ACTION=" + action]
+    for k, v in fields.items():
+        if k not in FILTER_KEYS or not VALUE_OK.match(v or ""):
+            raise APIError("invalid value for %s" % k)
+        lines.append("%s=%s" % (k, ",".join(x.strip() for x in (v or "").split(",") if x.strip())))
+    rid = "req-%s-%s" % (time.strftime("%Y%m%d%H%M%S"), secrets.token_hex(3))
+    tmp = os.path.join(REQ_DIR, rid + ".tmp")
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.rename(tmp, os.path.join(REQ_DIR, rid + ".req"))
+    return {"id": rid}
+
+
+def list_requests():
+    out = []
+    try:
+        names = sorted(os.listdir(REQ_DIR), reverse=True)
+    except OSError as e:
+        return {"error": str(e)}
+    for n in names:
+        rid, ext = os.path.splitext(n)
+        if not REQ_ID.match(rid) or ext not in (".req", ".run", ".res"):
+            continue
+        item = {"id": rid, "state": {".req": "queued", ".run": "running", ".res": "done"}[ext]}
+        if ext == ".res":
+            try:
+                with open(os.path.join(REQ_DIR, n)) as f:
+                    for line in f:
+                        k, _, v = line.rstrip("\n").partition("=")
+                        if k in ("STATUS", "MESSAGE", "ACTION", "FINISHED"):
+                            item[k.lower()] = v
+            except OSError:
+                pass
+        out.append(item)
+    return out[:20]
+
+
+# ---------------------------------------------------------------- web server
+def _proxy_ips():
+    try:
+        return {ai[4][0] for ai in socket.getaddrinfo(TRUSTED_PROXY, None)}
+    except OSError:
+        return set()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "mediastack-status"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):
+        if not self.path.startswith("/api/health"):
+            print("%s %s" % (self.address_string(), fmt % args), flush=True)
+
+    def _user(self):
+        return self.headers.get("X-authentik-username", "")
+
+    def _can_act(self):
+        """Changes only through Traefik + Authentik (the direct LAN port is read-only unless ALLOW_LAN_ACTIONS=yes)."""
+        if LAN_ACTIONS:
+            return True
+        return bool(self._user()) and self.client_address[0] in _proxy_ips()
+
+    def _send(self, code, obj, ctype="application/json"):
+        data = obj if isinstance(obj, bytes) else json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _guard(self, fn):
+        try:
+            self._send(200, {"ok": True, "data": fn()})
+        except (APIError, ValueError) as e:
+            self._send(200, {"ok": False, "error": str(e)})
+        except Exception as e:     # noqa: BLE001 -- never take the page down
+            self._send(500, {"ok": False, "error": "internal error: %s" % e})
+
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        if p in ("/", "/index.html"):
+            with open(os.path.join(APP_DIR, "index.html"), "rb") as f:
+                return self._send(200, f.read(), "text/html; charset=utf-8")
+        routes = {
+            "/api/health": lambda: "ok",
+            "/api/whoami": lambda: {"user": self._user(), "can_act": self._can_act()},
+            "/api/tailscale": tailscale_status,
+            "/api/gluetun": gluetun_status,
+            "/api/crowdsec": crowdsec_status,
+            "/api/requests": list_requests,
+        }
+        if p in routes:
+            return self._guard(routes[p])
+        self._send(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        p = self.path.split("?")[0]
+        if self.headers.get("X-Statusboard") != "1":        # blocks cross-site form posts
+            return self._send(403, {"ok": False, "error": "missing X-Statusboard header"})
+        if not self._can_act():
+            return self._send(403, {"ok": False, "error": "changes are only allowed through https://status.<domain> after Authentik sign-in"})
+        try:
+            n = min(int(self.headers.get("Content-Length") or 0), 8192)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("JSON object expected")
+        except ValueError as e:
+            return self._send(400, {"ok": False, "error": "bad JSON: %s" % e})
+        s = lambda k: str(body.get(k, "")).strip()   # noqa: E731
+        routes = {
+            "/api/tailscale/ping": lambda: tailscale_ping(s("ip")),
+            "/api/gluetun/action": lambda: gluetun_action(s("action")),
+            "/api/gluetun/request": lambda: write_request(s("action") or "vpn_filters",
+                                                          {k: s(k) for k in FILTER_KEYS if k in body}),
+            "/api/crowdsec/ban": lambda: crowdsec_ban(s("ip"), s("duration") or "4h", s("reason")),
+            "/api/crowdsec/unban": lambda: crowdsec_unban(s("ip")),
+        }
+        if p in routes:
+            print("ACTION %s by %s: %s" % (p, self._user() or "-", json.dumps(body)[:200]), flush=True)
+            return self._guard(routes[p])
+        self._send(404, {"ok": False, "error": "not found"})
+
+
+if __name__ == "__main__":
+    port = int(E("PORT", "8080"))
+    print("mediastack status board on :%d (LAN actions: %s)" % (port, "on" if LAN_ACTIONS else "off"), flush=True)
+    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+STATUSBOARD_APP_PY
+}
+
+render_statusboard_html() {
+    cat <<'STATUSBOARD_INDEX_HTML'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediaStack Status</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --mut:#667085; --line:#e3e6eb; --acc:#2f6fed; --ok:#16a34a; --bad:#dc2626; --warn:#d97706; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1218; --card:#171b23; --fg:#e6e9ef; --mut:#98a2b3; --line:#2a303b; --acc:#6b9bff; --ok:#22c55e; --bad:#f87171; --warn:#fbbf24; } }
+* { box-sizing:border-box } body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg) }
+header { display:flex; align-items:center; gap:16px; padding:14px 20px; border-bottom:1px solid var(--line); background:var(--card); position:sticky; top:0; z-index:2 }
+h1 { font-size:16px; margin:0 } nav { display:flex; gap:4px } nav button { border:0; background:none; color:var(--mut); padding:7px 12px; border-radius:6px; cursor:pointer; font:inherit }
+nav button.on { background:var(--bg); color:var(--fg); font-weight:600 } .sp { flex:1 } #who { color:var(--mut); font-size:12px }
+main { padding:18px 20px; max-width:1200px; margin:0 auto } section { display:none } section.on { display:block }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; margin-bottom:16px }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px }
+.k { color:var(--mut); font-size:12px; text-transform:uppercase; letter-spacing:.03em } .v { font-size:18px; font-weight:600; margin-top:4px; word-break:break-all }
+h2 { font-size:14px; margin:20px 0 8px } table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden }
+th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top } th { color:var(--mut); font-weight:500; font-size:12px } tr:last-child td { border-bottom:0 }
+.dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--mut) } .dot.ok { background:var(--ok) } .dot.bad { background:var(--bad) }
+.err { color:var(--bad) } .mut { color:var(--mut) } .tag { font-size:11px; padding:1px 6px; border:1px solid var(--line); border-radius:9px; margin-left:4px; color:var(--mut) }
+button.act { border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit }
+button.act:hover { border-color:var(--acc) } button.act.danger:hover { border-color:var(--bad); color:var(--bad) } button:disabled { opacity:.45; cursor:not-allowed }
+input { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:inherit; min-width:0 }
+.row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0 } a { color:var(--acc) } code { font-size:12px }
+#toast { position:fixed; right:16px; bottom:16px; max-width:420px; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px; display:none; box-shadow:0 6px 24px rgba(0,0,0,.18) }
+@media (max-width:640px) { header { flex-wrap:wrap } td,th { padding:6px } }
+</style>
+</head>
+<body>
+<header>
+  <h1>MediaStack Status</h1>
+  <nav><button data-t="ts" class="on">Tailscale</button><button data-t="gl">Gluetun VPN</button><button data-t="cs">CrowdSec</button></nav>
+  <span class="sp"></span><span id="who"></span>
+</header>
+<main>
+  <section id="ts" class="on"></section>
+  <section id="gl"></section>
+  <section id="cs"></section>
+</main>
+<div id="toast"></div>
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const bytes = n => { n = +n || 0; const u = ["B","KB","MB","GB","TB"]; let i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + " " + u[i]; };
+const ago = t => { if (!t || t.startsWith("0001")) return ""; const s = (Date.now() - Date.parse(t)) / 1000; if (isNaN(s)) return t;
+  return s < 90 ? "just now" : s < 5400 ? Math.round(s/60) + " min ago" : s < 129600 ? Math.round(s/3600) + " h ago" : Math.round(s/86400) + " d ago"; };
+const dot = ok => `<span class="dot ${ok === true ? "ok" : ok === false ? "bad" : ""}"></span>`;
+let CAN = false, TAB = "ts";
+function toast(msg, bad) { const t = $("#toast"); t.innerHTML = (bad ? '<span class="err">' : "<span>") + esc(msg) + "</span>"; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 6000); }
+async function get(p) { const r = await fetch(p, {cache: "no-store"}); return r.json(); }
+async function post(p, body, confirmText) {
+  if (confirmText && !confirm(confirmText)) return null;
+  const r = await fetch(p, {method: "POST", headers: {"Content-Type": "application/json", "X-Statusboard": "1"}, body: JSON.stringify(body || {})});
+  const j = await r.json().catch(() => ({ok: false, error: "HTTP " + r.status}));
+  toast(j.ok ? "Done" : j.error, !j.ok); return j;
+}
+const btn = (label, attrs, danger) => `<button class="act${danger ? " danger" : ""}" ${CAN ? "" : 'disabled title="Changes need https://status.&lt;domain&gt; with Authentik sign-in"'} ${attrs}>${esc(label)}</button>`;
+const card = (k, v, sub) => `<div class="card"><div class="k">${esc(k)}</div><div class="v">${v}</div>${sub ? `<div class="mut">${sub}</div>` : ""}</div>`;
+const fail = e => `<div class="card err">${esc(e)}</div>`;
+
+async function loadTS() {
+  const j = await get("/api/tailscale"); const el = $("#ts");
+  if (!j.ok) { el.innerHTML = fail(j.error); return; }
+  const d = j.data, s = d.self, ex = d.peers.find(p => p.exit_node);
+  el.innerHTML = `<div class="grid">
+    ${card("State", dot(d.backend === "Running") + esc(d.backend), esc(d.tailnet))}
+    ${card("This node", esc(s.host), esc(s.ips.join("  ")))}
+    ${card("Using exit node", ex ? esc(ex.host) : "none")}
+    ${card("Advertises", esc(d.advertise_routes.join(", ") || "nothing"), s.exit_option || d.advertise_routes.some(r => r === "0.0.0.0/0") ? "exit node offered" : "")}
+    ${card("Home relay (DERP)", esc(s.relay || "?"), esc(d.version))}
+  </div>
+  <div class="row"><span class="mut">Change exit node, routes or SSH in Tailscale's own web interface:</span>
+    ${d.web_url ? `<a href="${esc(d.web_url)}" target="_blank" rel="noopener">${esc(d.web_url)}</a> <span class="mut">(reachable from your tailnet)</span>` : '<span class="mut">not available</span>'}</div>
+  ${d.health.length ? `<h2>Health warnings</h2><div class="card">${d.health.map(esc).join("<br>")}</div>` : ""}
+  <h2>Peers (${d.peers.length}, ${d.peers.filter(p => p.online).length} online)</h2>
+  <table><tr><th>Device</th><th>Tailscale IP</th><th>OS</th><th>Connection</th><th>Traffic</th><th>Last seen</th><th></th></tr>
+  ${d.peers.map(p => `<tr><td>${dot(p.online)}${esc(p.host)}${p.exit_node ? '<span class="tag">exit node in use</span>' : p.exit_option ? '<span class="tag">exit node</span>' : ""}
+      ${p.routes.length ? `<div class="mut">routes: ${esc(p.routes.join(", "))}</div>` : ""}<div class="mut">${esc(p.dns)}</div></td>
+    <td><code>${esc(p.ips[0] || "")}</code></td><td>${esc(p.os)}</td>
+    <td>${p.addr ? "direct <code>" + esc(p.addr) + "</code>" : p.relay ? "relay " + esc(p.relay) : '<span class="mut">idle</span>'}</td>
+    <td class="mut">↓${bytes(p.rx)} ↑${bytes(p.tx)}</td><td class="mut">${p.online ? "online" : esc(ago(p.last_seen))}</td>
+    <td>${p.ips[0] ? btn("Ping", `data-ping="${esc(p.ips[0])}"`) : ""}</td></tr>`).join("")}</table>`;
+  el.querySelectorAll("[data-ping]").forEach(b => b.onclick = async () => {
+    b.disabled = true; b.textContent = "…";
+    const r = await post("/api/tailscale/ping", {ip: b.dataset.ping}); b.disabled = false; b.textContent = "Ping";
+    if (r && r.ok) { const x = r.data || {}; toast(x.Err ? x.Err : `${b.dataset.ping}: ${(x.LatencySeconds * 1000).toFixed(1)} ms ${x.Endpoint ? "direct " + x.Endpoint : "via DERP " + (x.DERPRegionCode || "")}`, !!x.Err); }
+  });
+}
+
+async function loadGL() {
+  const j = await get("/api/gluetun"); const el = $("#gl");
+  if (!j.ok) { el.innerHTML = fail(j.error); return; }
+  const d = j.data, c = d.config, ip = d.public_ip || {}, vpn = d.vpn || {}, pf = d.port_forward || {}, up = d.updater || {};
+  const running = vpn.status === "running";
+  el.innerHTML = `<div class="grid">
+    ${card("VPN", dot(vpn.error ? null : running) + esc(vpn.error ? "unreachable" : vpn.status), vpn.error ? '<span class="err">' + esc(vpn.error) + "</span>" : esc(c.VPN_SERVICE_PROVIDER + " / " + c.VPN_TYPE))}
+    ${card("Public IP", esc(ip.public_ip || "—"), esc([ip.city, ip.region, ip.country].filter(Boolean).join(", ")) + (ip.organization ? "<br>" + esc(ip.organization) : ""))}
+    ${card("Forwarded port", esc(pf.port || "none"), pf.error ? '<span class="mut">' + esc(pf.error) + "</span>" : "")}
+    ${card("Server list updater", esc(up.status || "—"))}
+  </div>
+  <div class="row">${btn("Restart VPN", 'data-a="restart"')} ${btn("Stop VPN", 'data-a="stop"', true)} ${btn("Start VPN", 'data-a="start"')} ${btn("Update server list now", 'data-a="update_servers"')}</div>
+  <h2>Server selection</h2>
+  <div class="card"><div class="mut">Changing these recreates Gluetun (the download apps restart with it). The installer validates and applies the change on the host.</div>
+    ${["SERVER_COUNTRIES","SERVER_CITIES","SERVER_HOSTNAMES","SERVER_REGIONS"].map(k => `<div class="row"><label style="width:150px">${esc(k.replace("SERVER_","").toLowerCase())}</label>
+      <input id="f_${k}" value="${esc(c[k])}" placeholder="any" style="flex:1" ${c.VPN_SERVICE_PROVIDER === "custom" ? "disabled" : ""}></div>`).join("")}
+    <div class="row">${c.VPN_SERVICE_PROVIDER === "custom" ? '<span class="mut">Provider custom connects to the server in your config: no filters.</span>' :
+      btn("Apply server selection", 'id="applyf"')} ${btn("Recreate Gluetun", 'id="recreate"', true)}</div></div>
+  <h2>Recent change requests</h2><div id="reqs" class="mut">…</div>`;
+  el.querySelectorAll("[data-a]").forEach(b => b.onclick = () => post("/api/gluetun/action", {action: b.dataset.a},
+      b.dataset.a === "stop" ? "Stop the VPN? The download apps lose their connection until it is started again." : null).then(() => setTimeout(loadGL, 2500)));
+  const af = $("#applyf"); if (af) af.onclick = () => { const body = {action: "vpn_filters"};
+    ["SERVER_COUNTRIES","SERVER_CITIES","SERVER_HOSTNAMES","SERVER_REGIONS"].forEach(k => body[k] = $("#f_" + k).value);
+    post("/api/gluetun/request", body, "Apply the new server selection? Gluetun and the apps behind it restart.").then(loadReqs); };
+  $("#recreate").onclick = () => post("/api/gluetun/request", {action: "gluetun_recreate"}, "Recreate Gluetun and the apps behind it?").then(loadReqs);
+  loadReqs();
+}
+async function loadReqs() {
+  const j = await get("/api/requests"), el = $("#reqs"); if (!el) return;
+  if (!j.ok || !Array.isArray(j.data)) { el.innerHTML = fail(j.error || "unavailable"); return; }
+  el.innerHTML = j.data.length ? `<table><tr><th>Request</th><th>State</th><th>Result</th></tr>${j.data.map(r => `<tr><td><code>${esc(r.id)}</code></td>
+    <td>${esc(r.state)}</td><td>${r.status ? dot(r.status === "ok") + esc(r.message || r.status) : ""}<div class="mut">${esc(r.finished || "")}</div></td></tr>`).join("")}</table>` : "none yet";
+}
+
+async function loadCS() {
+  const j = await get("/api/crowdsec"); const el = $("#cs");
+  if (!j.ok) { el.innerHTML = fail(j.error); return; }
+  const d = j.data, m = d.metrics || {};
+  el.innerHTML = `<div class="grid">${m.error ? fail(m.error) : Object.entries(m).map(([k, v]) => card(k, esc(v.toLocaleString()))).join("") || card("Metrics", "none yet")}</div>
+  <h2>Ban an IP or range</h2>
+  <div class="row"><input id="bip" placeholder="203.0.113.7 or 203.0.113.0/24" style="width:240px"><input id="bdur" value="4h" style="width:70px" title="e.g. 30m, 4h, 7d">
+    <input id="breason" placeholder="reason" style="flex:1;min-width:140px">${btn("Ban", 'id="ban"', true)}</div>
+  <h2>Active decisions (${(d.decisions || []).length})</h2>
+  ${d.decisions_error ? fail(d.decisions_error) : (d.decisions || []).length ? `<table><tr><th>Value</th><th>Type</th><th>Origin</th><th>Scenario</th><th>Expires in</th><th></th></tr>
+    ${d.decisions.map(x => `<tr><td><code>${esc(x.value)}</code> <span class="mut">${esc(x.scope)}</span></td><td>${esc(x.type)}</td><td>${esc(x.origin)}</td>
+    <td>${esc(x.scenario)}</td><td class="mut">${esc(x.duration)}</td><td>${btn("Unban", `data-unban="${esc(x.value)}"`)}</td></tr>`).join("")}</table>` : '<div class="card mut">No active decisions.</div>'}
+  <h2>Recent alerts</h2>
+  ${d.alerts_error ? fail(d.alerts_error) : (d.alerts || []).length ? `<table><tr><th>When</th><th>Scenario</th><th>Source</th><th>Events</th><th>Decisions</th></tr>
+    ${d.alerts.map(a => `<tr><td class="mut">${esc(ago(a.created) || a.created)}</td><td>${esc(a.scenario)}</td><td><code>${esc(a.source)}</code> ${esc(a.country)}</td>
+    <td>${esc(a.events)}</td><td>${esc(a.decisions)}</td></tr>`).join("")}</table>` : '<div class="card mut">No alerts.</div>'}`;
+  const b = $("#ban"); if (b) b.onclick = () => post("/api/crowdsec/ban", {ip: $("#bip").value, duration: $("#bdur").value, reason: $("#breason").value},
+      "Ban " + $("#bip").value + " for " + $("#bdur").value + "?").then(loadCS);
+  el.querySelectorAll("[data-unban]").forEach(x => x.onclick = () => post("/api/crowdsec/unban", {ip: x.dataset.unban}, "Unban " + x.dataset.unban + "?").then(loadCS));
+}
+
+const loaders = {ts: loadTS, gl: loadGL, cs: loadCS};
+function show(t) { TAB = t; document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.t === t));
+  document.querySelectorAll("section").forEach(s => s.classList.toggle("on", s.id === t)); try { localStorage.setItem("tab", t); } catch (e) {} refresh(); }
+async function refresh() { const el = $("#" + TAB); if (!el.innerHTML) el.innerHTML = '<div class="mut">Loading…</div>';
+  if (document.activeElement && document.activeElement.tagName === "INPUT") return;      // don't wipe a form being typed in
+  try { await loaders[TAB](); } catch (e) { el.innerHTML = fail(e); } }
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => show(b.dataset.t));
+get("/api/whoami").then(j => { CAN = !!(j.ok && j.data.can_act); const u = j.ok ? j.data.user : "";
+  $("#who").textContent = u ? u + (CAN ? "" : " (read-only)") : CAN ? "changes enabled on the LAN port" : "read-only: open https://status.<domain> to make changes";
+  let t = "ts"; try { t = localStorage.getItem("tab") || "ts"; } catch (e) {} show(loaders[t] ? t : "ts"); });
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>
+STATUSBOARD_INDEX_HTML
+}
+
+write_statusboard_app() {
+    svc_enabled statusboard || return 0
+    local d="$FOLDER_FOR_DATA/statusboard/app" tmp chg=0 f
+    [[ -d "$d" ]] || return 0
+    (( DRY_RUN )) && { log_info "[dry-run] would write the status board app to $d"; return 0; }
+    for f in app.py index.html; do
+        tmp=$(mktemp)
+        if [[ $f == app.py ]]; then render_statusboard_app >"$tmp"; else render_statusboard_html >"$tmp"; fi
+        if ! cmp -s "$tmp" "$d/$f"; then install -m 644 -o root -g root "$tmp" "$d/$f"; chg=1; fi
+        rm -f "$tmp"
+    done
+    run chmod 700 "$FOLDER_FOR_DATA/statusboard/requests" 2>/dev/null || true
+    if (( chg )); then
+        log_ok "Status board app written ($d)"
+        docker ps -q --filter 'name=^statusboard$' 2>/dev/null | grep -q . && docker restart statusboard >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+# statusboard_wire -- after start: CrowdSec machine login for the board, Tailscale's own web interface
+statusboard_wire() {
+    svc_enabled statusboard || return 0
+    (( DRY_RUN )) && return 0
+    if svc_enabled crowdsec && docker ps -q --filter 'name=^crowdsec$' | grep -q . && secret_is_set CROWDSEC_STATUSBOARD_PASSWORD; then
+        # password via the environment of docker exec, not this host's command line; credentials file thrown away
+        if SBPW=${SECRETS[CROWDSEC_STATUSBOARD_PASSWORD]} docker exec -e SBPW crowdsec sh -c \
+              'cscli machines add statusboard --password "$SBPW" --force -f /tmp/.sb-creds.yaml >/dev/null 2>&1; rc=$?; rm -f /tmp/.sb-creds.yaml; exit $rc'; then
+            log_ok "CrowdSec: status board machine login registered"
+        else
+            log_warn "CrowdSec: could not register the status board login (is CrowdSec healthy?); the CrowdSec tab shows no alerts until the next Apply."
+        fi
+    fi
+    if svc_enabled tailscale && docker ps -q --filter 'name=^tailscale$' | grep -q .; then
+        if docker exec tailscale tailscale set --webclient >/dev/null 2>&1; then
+            log_ok "Tailscale: device web interface enabled (port 5252 on the tailnet)"
+        else
+            log_info "Tailscale web interface not enabled yet (Tailscale not logged in?); Apply again later."
+        fi
+    fi
+    log_info "Status board: https://status.$(tls_zone) (changes) or http://$(eff_local_ip):$(env_get "$FOLDER_FOR_YAML/.env" WEBUI_PORT_STATUSBOARD 2>/dev/null || echo 13380) (read-only)"
+    return 0
+}
+
+# requests_units -- path unit that runs --process-requests when the board drops a request file
+requests_units() {
+    local ud=${MS_UNIT_DIR:-/etc/systemd/system} name="mediastack-requests" dir="$FOLDER_FOR_DATA/statusboard/requests" svc pathu chg=0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if ! svc_enabled statusboard; then
+        if [[ -f "$ud/$name.path" ]]; then
+            run systemctl disable --now "$name.path" 2>/dev/null || true
+            run rm -f "$ud/$name.path" "$ud/$name.service"; run systemctl daemon-reload 2>/dev/null || true
+            log_ok "Removed $name.path"
+        fi
+        return 0
+    fi
+    svc="[Unit]
+Description=mediastack-installer: apply change requests from the status board
+
+[Service]
+Type=oneshot
+ExecStart=$MS_INSTALL_BIN --process-requests --yes"
+    pathu="[Unit]
+Description=mediastack-installer: watch for status board change requests
+
+[Path]
+PathExistsGlob=$dir/*.req
+
+[Install]
+WantedBy=multi-user.target"
+    if [[ "$(cat "$ud/$name.service" 2>/dev/null)" != "$svc" ]]; then printf '%s\n' "$svc" | write_file "$ud/$name.service" 644 root:root; chg=1; fi
+    if [[ "$(cat "$ud/$name.path" 2>/dev/null)" != "$pathu" ]]; then printf '%s\n' "$pathu" | write_file "$ud/$name.path" 644 root:root; chg=1; fi
+    if (( chg )); then
+        run systemctl daemon-reload; run systemctl enable "$name.path"; run systemctl restart "$name.path"
+        log_ok "Change-request watcher: $name.path"
+    elif ! systemctl is-active --quiet "$name.path" 2>/dev/null; then
+        run systemctl enable --now "$name.path"
+    fi
+    return 0
+}
+
+# req_result FILE STATUS MESSAGE ACTION
+req_result() {
+    local msg=${3//$'\n'/ }; msg=${msg//[^[:print:]]/}
+    printf 'ACTION=%s\nSTATUS=%s\nMESSAGE=%s\nFINISHED=%s\n' "$4" "$2" "${msg:0:300}" "$(date '+%F %T')" >"$1"
+}
+
+# process_requests -- apply status board change requests (strictly validated; whitelisted actions only)
+process_requests() {
+    require_config; resolve_runtime; load_secrets
+    local dir="$FOLDER_FOR_DATA/statusboard/requests" f id base line k v action rc
+    [[ -d "$dir" ]] || return 0
+    local -A kv
+    for f in "$dir"/*.req; do      # every *.req: the path unit fires while any exists, so none may be left behind
+        [[ -f "$f" || -L "$f" ]] || continue
+        [[ -L "$f" ]] && { rm -f "$f"; continue; }
+        base=$(basename "$f" .req); id=$base
+        if [[ ! "$id" =~ ^req-[0-9a-z-]{1,40}$ ]] || (( $(stat -c %s "$f") > 4096 )); then rm -f "$f"; continue; fi
+        mv -f "$f" "$dir/$id.run"
+        kv=(); action=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^([A-Z_]{1,40})=(.{0,200})$ ]] || continue
+            kv[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+        done <"$dir/$id.run"
+        action=${kv[ACTION]:-}
+        _log_file INFO "request $id: action=$action"
+        rc=0
+        case "$action" in
+            vpn_filters)
+                if [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]]; then
+                    req_result "$dir/$id.res" error "Provider 'custom' has no server filters." "$action"; rm -f "$dir/$id.run"; continue
+                fi
+                for k in SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES SERVER_REGIONS; do
+                    [[ -n "${kv[$k]+x}" ]] || continue
+                    v=${kv[$k]}
+                    if ! validate_key "$k" "$v"; then
+                        req_result "$dir/$id.res" error "$k '$v' is not a list of names." "$action"; rm -f "$dir/$id.run"; continue 2
+                    fi
+                    CFG[$k]=$v
+                done
+                save_config
+                ( stack_apply nopull ) >>"$LOG_FILE" 2>&1 || rc=$?
+                if (( rc == 0 )); then req_result "$dir/$id.res" ok "Server selection applied (countries: ${CFG[SERVER_COUNTRIES]:-any}); Gluetun recreated." "$action"
+                else req_result "$dir/$id.res" error "Apply failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
+            gluetun_recreate)
+                { compose_run up -d --force-recreate gluetun && compose_run up -d --remove-orphans; } >>"$LOG_FILE" 2>&1 || rc=$?
+                if (( rc == 0 )); then req_result "$dir/$id.res" ok "Gluetun and the apps behind it were recreated." "$action"
+                else req_result "$dir/$id.res" error "Recreate failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
+            *)  req_result "$dir/$id.res" error "Unknown request." "$action" ;;
+        esac
+        rm -f "$dir/$id.run"
+    done
+    # keep the newest 20 results
+    ls -1t "$dir"/req-*.res 2>/dev/null | tail -n +21 | while IFS= read -r f; do rm -f -- "$f"; done
+    return 0
+}
+
+# -----------------------------------------------------------------------------
 # URLS / PORTS / DNS -- read from the effective compose configuration (enabled services only)
 # -----------------------------------------------------------------------------
 # compose_service_facts YAML -> one line per service:
@@ -4344,10 +5127,10 @@ readonly HOMEPAGE_MARKER="# managed-by: mediastack-installer (delete this line t
 HOMEPAGE_GROUPS=( "Media|jellyfin plex audiobookshelf seerr tdarr"
                   "Downloads|qbittorrent sabnzbd"
                   "Library|sonarr radarr lidarr readarr whisparr mylar bazarr prowlarr filebot"
-                  "Access & security|authentik traefik crowdsec headscale headplane tailscale gluetun"
+                  "Access & security|statusboard authentik traefik crowdsec headscale headplane tailscale gluetun"
                   "Tools|portainer grafana prometheus guacamole homarr heimdall chromium ddns-updater"
                   "Infrastructure|flaresolverr unpackerr postgresql valkey guacd authentic-worker tdarr-node" )
-declare -A HOMEPAGE_DESC=( [jellyfin]="Media server" [plex]="Media server" [audiobookshelf]="Audiobooks and podcasts"
+declare -A HOMEPAGE_DESC=( [statusboard]="Tailscale, VPN and CrowdSec status" [jellyfin]="Media server" [plex]="Media server" [audiobookshelf]="Audiobooks and podcasts"
     [seerr]="Requests" [tdarr]="Transcoding" [qbittorrent]="Torrent client (via VPN)" [sabnzbd]="Usenet client (via VPN)"
     [sonarr]="TV shows" [radarr]="Movies" [lidarr]="Music" [readarr]="Books" [whisparr]="Adult" [mylar]="Comics"
     [bazarr]="Subtitles" [prowlarr]="Indexers" [filebot]="File renaming" [authentik]="Single sign-on"
@@ -4357,7 +5140,7 @@ declare -A HOMEPAGE_DESC=( [jellyfin]="Media server" [plex]="Media server" [audi
     [homarr]="Dashboard" [heimdall]="Dashboard" [chromium]="Browser in a container" [ddns-updater]="Dynamic DNS"
     [flaresolverr]="Cloudflare solver for Prowlarr" [unpackerr]="Archive extraction" [postgresql]="Database"
     [valkey]="Cache" [guacd]="Guacamole daemon" [authentic-worker]="Authentik worker" [tdarr-node]="Transcode node" )
-declare -A HOMEPAGE_ICON=( [seerr]="jellyseerr.png" [headplane]="headscale.png" [postgresql]="postgres.png"
+declare -A HOMEPAGE_ICON=( [statusboard]="mdi-monitor-dashboard" [seerr]="jellyseerr.png" [headplane]="headscale.png" [postgresql]="postgres.png"
     [valkey]="redis.png" [authentic-worker]="authentik.png" [tdarr-node]="tdarr.png" [guacd]="guacamole.png"
     [ddns-updater]="ddns-updater.png" )
 # API widgets: service -> "widget type|internal port|vault token"
@@ -4365,7 +5148,7 @@ declare -A HOMEPAGE_WIDGET=( [sonarr]="sonarr|8989|SONARR_API_TOKEN" [radarr]="r
     [lidarr]="lidarr|8686|LIDARR_API_TOKEN" [readarr]="readarr|8787|READARR_API_TOKEN" )
 
 homepage_container() { case "$1" in authentic-worker) echo authentik-worker ;; *) echo "$1" ;; esac; }   # upstream container_name
-homepage_title() { local s=$1; case "$s" in qbittorrent) echo qBittorrent ;; sabnzbd) echo SABnzbd ;; ddns-updater) echo "DDNS Updater" ;;
+homepage_title() { local s=$1; case "$s" in statusboard) echo "Status board" ;; qbittorrent) echo qBittorrent ;; sabnzbd) echo SABnzbd ;; ddns-updater) echo "DDNS Updater" ;;
     authentic-worker) echo "Authentik worker" ;; tdarr-node) echo "Tdarr node" ;; postgresql) echo PostgreSQL ;;
     crowdsec) echo CrowdSec ;; *) echo "${s^}" ;; esac; }
 
@@ -4600,6 +5383,7 @@ uninstall_stack() {
         run rm -f "$MS_DROPIN_DIR/mediastack-mounts.conf"; run systemctl daemon-reload 2>/dev/null || true
     fi
     CFG[CERT_MODE]=letsencrypt; cert_units     # removes the certificate timer/watcher
+    set_svc_state statusboard removed 2>/dev/null || true; requests_units
     cert_push_remove
     if id "${CFG[SERVICE_USER]}" >/dev/null 2>&1 && confirm "Remove service account '${CFG[SERVICE_USER]}'?" n; then
         run userdel "${CFG[SERVICE_USER]}" || true
@@ -5187,7 +5971,7 @@ self_test() {
     st "override renders profile"          'CFG[DISABLED_SERVICES]="whisparr,bogus"; CFG[REMOVED_SERVICES]="radarr whisparr"; out=$(render_override "$t/compose.yaml"); [[ "$out" == *"  whisparr:"* && "$out" == *"  radarr:"* && $(grep -c "  whisparr:" <<<"$out") == 1 && "$out" == *"bogus: not found"* ]]'
     st "add-on rendered when on"            'CFG[DISABLED_SERVICES]=""; CFG[REMOVED_SERVICES]=""; out=$(render_override "$t/compose.yaml"); [[ "$out" == *"  audiobookshelf:"* && "$out" == *"user: \${PUID:?err}"* && "$out" != *disabled\"* ]]'
     st "add-on disabled -> profile"         'CFG[DISABLED_SERVICES]="audiobookshelf"; CFG[REMOVED_SERVICES]=""; out=$(render_override "$t/compose.yaml"); [[ "$out" == *"  audiobookshelf:"* && "$out" == *"profiles: [\"disabled\"]"* ]]'
-    st "add-on removed -> absent"           'CFG[DISABLED_SERVICES]=""; CFG[REMOVED_SERVICES]="audiobookshelf"; out=$(render_override "$t/compose.yaml"); [[ "$out" != *audiobookshelf* && "$out" == *"services: {}"* ]]'
+    st "add-on removed -> absent"           'CFG[DISABLED_SERVICES]=""; CFG[REMOVED_SERVICES]="audiobookshelf statusboard"; out=$(render_override "$t/compose.yaml"); [[ "$out" != *audiobookshelf* && "$out" == *"services: {}"* ]]'
     st "compose service list (skips networks)" '[[ "$(compose_services_list "$t/compose.yaml" | xargs)" == "whisparr radarr" ]]'
     st "service state cycle"               'CFG[DISABLED_SERVICES]="whisparr"; CFG[REMOVED_SERVICES]="readarr"; set_svc_state whisparr removed; set_svc_state readarr on; set_svc_state sonarr disabled; [[ "${CFG[DISABLED_SERVICES]}" == sonarr && "${CFG[REMOVED_SERVICES]}" == whisparr && $(svc_state readarr) == on ]]'
     st "smb remote normalisation"          '[[ "$(normalize_remote smb "\\\\winsrv\\Media Share\\")" == "//winsrv/Media Share" ]] && valid_remote smb "//nas/media" && ! valid_remote smb "nas" && ! valid_remote smb "//nas/"'
@@ -5398,6 +6182,7 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "Homepage services from compose"   '( st_prep internet jellyfin tailscale core; FOLDER_FOR_YAML="$t/hp"; mkdir -p "$t/hp"; printf "WEBUI_PORT_SONARR=8989\nWEBUI_PORT_JELLYFIN=8096\n" >"$t/hp/.env"; CFG[LOCAL_DOCKER_IP]=10.0.0.5; SECRETS[SONARR_API_TOKEN]=abc; f=$(printf "%s\n" "sonarr|service:gluetun|sonarr.x.org|1|" "jellyfin|service:gluetun|jellyfin.x.org|1|" "postgresql|||0|5432/tcp" "zeta|||0|"); y=$(render_homepage_services "$f"); [[ "$y" == *"- Media:"*"- Jellyfin:"*"href: https://jellyfin.x.org"* && "$y" == *"- Sonarr:"*"url: http://gluetun:8989"*"{{HOMEPAGE_VAR_SONARR_API_TOKEN}}"* && "$y" == *"- Infrastructure:"*"- PostgreSQL:"*"icon: postgres.png"* && "$y" == *"- Other:"*"- Zeta:"* && "$y" != *"PostgreSQL:"*"href:"*"- Other"* ]] && svc_enabled traefik )'
     st "SABnzbd host_whitelist edit"       '( f="$t/sab.ini"; printf "[misc]\nhost_whitelist = 9f2c1a, \nport = 8080\n[servers]\nhost_whitelist = x\n" >"$f"; ini_whitelist_add "$f" sabnzbd.example.org && grep -qx "host_whitelist = 9f2c1a, sabnzbd.example.org" "$f" && grep -qx "host_whitelist = x" "$f" && ! ini_whitelist_add "$f" SABnzbd.example.org && printf "[misc]\nhost_whitelist = \n" >"$f" && ini_whitelist_add "$f" a.b && grep -qx "host_whitelist = a.b" "$f" )'
     st "web UI paths (Plex, Traefik)"      '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
+    st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
@@ -5540,6 +6325,7 @@ Actions (default: interactive menu)
   --cert-push-setup [F|-] Set up the push receiver (user, forced-command key, sudoers); public key
                          from file F, stdin (-) or a prompt (CERT_MODE=push)
   --cert-receive         Push receiver: read chain + key on stdin (run by the forced SSH command)
+  --process-requests     Apply status board change requests (run by the mediastack-requests.path unit)
   --helper NAME          authentik-db | guacamole | akadmin | apikeys | vpn-servers | vpn-check | traefik-check
   --settings             Settings menu (paths, network, storage, services, ...)
   --test-storage T       Trial-mount MEDIA or DATA share; check write + hardlinks
@@ -5599,6 +6385,7 @@ main() {
             --cert-push-setup) action=certpush
                             if [[ -n "${2:-}" && ( "${2:-}" == - || "${2:-}" != -* ) ]]; then arg1=$2; shift; fi ;;
             --cert-receive) action=certreceive ;;
+            --process-requests) action=processrequests ;;
             --status)       action=status ;;
             --urls)         action=urls ;;
             --helper)       action=helper; helper=${2:-}; shift ;;
@@ -5626,8 +6413,10 @@ main() {
     fi
 
     check_root "${orig[@]}"
-    case "$action" in certrefresh|certreceive) init_logging cert ;; *) init_logging ;; esac
-    if [[ "$action" == certreceive ]]; then   # a push waits for a menu/apply run instead of failing
+    case "$action" in certrefresh|certreceive) init_logging cert ;; processrequests) init_logging request ;; *) init_logging ;; esac
+    if [[ "$action" == processrequests ]]; then   # a board request waits for a running menu/apply
+        exec 9>"$MS_LOCK_FILE"; flock -w 900 9 || die "Busy: another run held the lock for 15 minutes."
+    elif [[ "$action" == certreceive ]]; then   # a push waits for a menu/apply run instead of failing
         exec 9>"$MS_LOCK_FILE"
         flock -w 300 9 || { printf '%s FAIL busy: another run held the lock for 5 minutes\n' "$CERT_RECEIVE_TAG"; exit 1; }
     else
@@ -5657,6 +6446,7 @@ main() {
         certkey)   ensure_config; cert_fetch_key ;;
         certpush)  cert_push_setup "$arg1" ;;
         certreceive) cert_receive ;;
+        processrequests) process_requests ;;
         status)    show_status ;;
         urls)      show_urls ;;
         secrets)   menu_secrets ;;
