@@ -35,6 +35,7 @@ After installation it handles day-2 operations:
 - [Menu and CLI](#menu-and-cli)
 - [Settings reference](#settings-reference)
 - [Access mode and certificates](#access-mode-and-certificates)
+- [URLs, ports and DNS](#urls-ports-and-dns)
 - [VPN (Gluetun)](#vpn-gluetun)
 - [Service presets](#service-presets)
 - [Storage: local, SMB, NFS, external](#storage-local-smb-nfs-external)
@@ -123,6 +124,7 @@ You can re-run detection any time with **Settings → D**.
               6) Stop stack                    R) Restart containers
               7) Status                        8) Post-install helpers   9) Logs
               K) Certificate (refresh, show, fetch key, push receiver)
+              L) URLs, ports and DNS names
  Maintenance  B) Backup / restore   C) Show settings   U) Uninstall...
               T) Toggle dry-run     S) Self-test       0) Quit
 ```
@@ -150,6 +152,7 @@ You can re-run detection any time with **Settings → D**.
 | `--apply` / `--start` | Converge and start, with / without pulling images |
 | `--stop` | `docker compose down` (data kept) |
 | `--restart` | Restart the containers (no converge) |
+| `--urls` | LAN URLs, HTTPS hostnames, other published ports and the DNS records to create (see [URLs, ports and DNS](#urls-ports-and-dns)) |
 | `--status` | Configuration, access/certificate and expiry, storage mounts, dependency problems, containers, PostgreSQL readiness |
 | `--logs [N] [SERVICE]` | Last N container log lines (default 100), all services or one |
 | `--show-config` | Print every setting with its meaning |
@@ -177,6 +180,33 @@ The compose folder also gets wrappers, so the upstream workflow keeps working:
 `./get-apikeys.sh`.
 
 ---
+
+## URLs, ports and DNS
+
+Menu **L** or `--urls` lists what the running configuration actually publishes, for enabled services only. It is
+read from `docker compose config`, not from a fixed list, and also prints at the end of a full install:
+
+```
+  SERVICE          LAN                            HTTPS (via Traefik)
+  jellyfin         http://192.168.1.20:8096       https://jellyfin.example.org   (via VPN, Authentik login)
+  plex             http://192.168.1.20:32400/web  https://plex.example.org   (via VPN, Authentik login)
+  ...
+  Other published ports (host 192.168.1.20)
+  gluetun          8888/tcp HTTP proxy, 8388/tcp Shadowsocks, 6881/tcp qbit-port, ...
+  ...
+  DNS
+  14 HTTPS hostname(s) under example.org. One wildcard record covers them all:
+    LAN DNS (Pi-hole, router, OPNsense Unbound host override):  *.example.org  A  192.168.1.20
+    Public DNS (e.g. Cloudflare):  *.example.org  A  <your public IP>, and forward TCP 443 (HTTPS) to 192.168.1.20
+```
+
+- **LAN:** the app's own port (`WEBUI_PORT_*` in `.env`). It works without DNS and without Traefik.
+- **HTTPS:** the hostnames from Traefik's router rules. "via VPN" means the app runs inside Gluetun's network, so
+  its port is published on the `gluetun` container. "Authentik login" means Traefik asks for an Authentik sign-in
+  first.
+- **Other published ports:** everything else on the host, each named from the `.env` variable that sets it.
+  Ports Gluetun publishes for apps you have turned off still appear here, because upstream publishes them on
+  Gluetun itself.
 
 ## Settings reference
 
@@ -783,7 +813,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 79 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 80 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
