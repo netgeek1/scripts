@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.5.10"
+readonly SCRIPT_VERSION="2.6.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -3139,6 +3139,7 @@ stack_apply() {
         die "Some containers could not start (causes above). Fix them, then run Apply again."
     fi
     verify_services 180 || true
+    log_info "URLs, ports and DNS names: menu L, or sudo $MS_INSTALL_BIN --urls"
     if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ ! "$(tls_ensure_live)" =~ ^(yes|n/a)$ ]]; then
         log_warn "Traefik is not serving $(traefik_cert_dir)/cert.pem yet; check: sudo $MS_INSTALL_BIN --cert-show"
     fi
@@ -3985,18 +3986,124 @@ full_install() {
     print_summary
 }
 
-print_summary() {
-    local envf="$FOLDER_FOR_YAML/.env" ip; ip=$(eff_local_ip)
-    log_step "Done"
-    [[ -f "$envf" ]] || return 0
-    local app port z; z=$(tls_zone)
-    for app in HOMEPAGE HOMARR PORTAINER AUTHENTIK GUACAMOLE PLEX JELLYFIN AUDIOBOOKSHELF SEERR QBITTORRENT SABNZBD PROWLARR SONARR RADARR LIDARR; do
-        svc_enabled "${app,,}" || continue
-        port=$(env_get "$envf" "WEBUI_PORT_$app" || true)
-        [[ -n "$port" ]] || continue
-        if svc_enabled traefik; then printf '  %-15s http://%s:%-6s https://%s.%s\n' "${app,,}" "$ip" "$port" "${app,,}" "$z"
-        else printf '  %-15s http://%s:%s\n' "${app,,}" "$ip" "$port"; fi
+# -----------------------------------------------------------------------------
+# URLS / PORTS / DNS -- read from the effective compose configuration (enabled services only)
+# -----------------------------------------------------------------------------
+# compose_service_facts YAML -> one line per service:
+#   NAME|NETWORK_MODE|HOSTS(space-separated)|SSO(0/1)|PORTS(space-separated published/protocol)
+compose_service_facts() {
+    awk '
+        function flushport() { if (pub != "") ports = ports (ports ? " " : "") pub "/" (proto ? proto : "tcp"); pub = ""; proto = "" }
+        function flush() {
+            flushport()
+            if (svc != "") print svc "|" nm "|" hosts "|" sso "|" ports
+            svc = ""; nm = ""; hosts = ""; sso = 0; ports = ""; sec = ""
+        }
+        /^services:[[:space:]]*$/ { insv = 1; next }
+        insv && /^[^ ]/           { flush(); insv = 0; next }
+        !insv                     { next }
+        /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { flush(); svc = $1; sub(/:$/, "", svc); next }
+        /^    [a-z_]+:/ {
+            flushport(); sec = $1; sub(/:$/, "", sec)
+            if (sec == "network_mode") { nm = $2; gsub(/"/, "", nm) }
+            next
+        }
+        sec == "labels" && /^      traefik\.http\.routers\.[^.]+\.rule:/ {
+            line = $0
+            while (match(line, /Host\(`[^`]+`\)/)) {
+                h = substr(line, RSTART + 6, RLENGTH - 8)
+                if (index(" " hosts " ", " " h " ") == 0) hosts = hosts (hosts ? " " : "") h
+                line = substr(line, RSTART + RLENGTH)
+            }
+            next
+        }
+        sec == "labels" && /^      traefik\.http\.routers\.[^.]+\.middlewares:/ && /authentik/ { sso = 1; next }
+        sec == "ports" && /^      - /                 { flushport() }
+        sec == "ports" && /^ +(- )?published:/        { v = $NF; gsub(/"/, "", v); pub = v; next }
+        sec == "ports" && /^ +(- )?protocol:/         { proto = $NF; next }
+        END { flush() }' <<<"$1"
+}
+
+# web_path SERVICE -> path to append to the LAN URL
+web_path() { case "$1" in plex) printf '/web' ;; esac; }
+
+show_urls() {
+    require_config; resolve_runtime; load_secrets
+    local envf="$FOLDER_FOR_YAML/.env" ip yaml line name nm hosts sso ports var port url note z
+    local -a rows=() other=() allhosts=()
+    local -A claimed=()
+    ip=$(eff_local_ip); z=$(tls_zone)
+    [[ -f "$envf" ]] || die "No $envf yet: run Apply first."
+    yaml=$(compose_run config 2>/dev/null) || die "docker compose config failed; run Apply to see why."
+    log_step "URLs and ports (enabled services; host $ip)"
+    while IFS='|' read -r name nm hosts sso ports; do
+        [[ -n "$name" ]] || continue
+        var="WEBUI_PORT_$(tr 'a-z-' 'A-Z_' <<<"$name")"
+        port=$(env_get "$envf" "$var" 2>/dev/null || true)
+        note=""
+        [[ "$nm" == service:gluetun ]] && note="via VPN"
+        (( sso )) && note+="${note:+, }Authentik login"
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            claimed[$port]=1
+            url="http://$ip:$port$(web_path "$name")"
+            rows+=("$name|$url|${hosts:+https://${hosts// / https://}}|$note")
+        elif [[ -n "$hosts" ]]; then
+            rows+=("$name|-|https://${hosts// / https://}|$note")
+        fi
+        if [[ -n "$hosts" ]]; then local -a hl; read -ra hl <<<"$hosts"; allhosts+=("${hl[@]}"); fi
+        [[ -n "$ports" ]] && other+=("$name|$ports")
+    done < <(compose_service_facts "$yaml")
+    if (( ${#rows[@]} )); then
+        printf '\n  %s%-16s %-30s %s%s\n' "$B" "SERVICE" "LAN" "HTTPS (via Traefik)" "$NC"
+        printf '%s\n' "${rows[@]}" | sort | while IFS='|' read -r name url hosts note; do
+            printf '  %-16s %-30s %s%s\n' "$name" "$url" "${hosts:--}" "${note:+   ($note)}"
+        done
+    fi
+    # published ports that are not a web UI above (VPN proxy, torrent port, Plex discovery, databases, ...)
+    local p rest k v
+    local -a extra=()
+    local -A plabel=( [8888]="HTTP proxy" [8388]="Shadowsocks" [32410]="Plex discovery" [32412]="Plex discovery"
+                      [32413]="Plex discovery" [32414]="Plex discovery" [32469]="Plex DLNA" [8324]="Plex companion"
+                      [80]="HTTP->HTTPS" [443]="HTTPS" )
+    while IFS='=' read -r k v; do      # name every port the .env defines (e.g. QBIT_PORT, WEBUI_PORT_HUNTARR)
+        [[ "$v" =~ ^[0-9]+$ ]] || continue
+        k=${k#WEBUI_PORT_}; k=${k,,}; k=${k//_/-}
+        plabel[$v]=$k
+    done < <(grep -E '^[A-Z0-9_]*PORT[A-Z0-9_]*=' "$envf" 2>/dev/null || true)
+    for line in "${other[@]}"; do
+        name=${line%%|*}; rest=""
+        for p in ${line#*|}; do
+            [[ -n "${claimed[${p%/*}]:-}" ]] && continue
+            rest+="${rest:+, }$p${plabel[${p%/*}]:+ ${plabel[${p%/*}]}}"
+        done
+        [[ -n "$rest" ]] && extra+=("$name|$rest")
     done
+    if (( ${#extra[@]} )); then
+        printf '\n  %sOther published ports%s (host %s)\n' "$B" "$NC" "$ip"
+        printf '%s\n' "${extra[@]}" | sort | while IFS='|' read -r name rest; do
+            printf '  %-16s %s\n' "$name" "$rest" | fold -s -w 96 | sed '2,$s/^/                   /'
+        done
+    fi
+    printf '\n  %sDNS%s\n' "$B" "$NC"
+    if svc_enabled traefik && (( ${#allhosts[@]} )); then
+        printf '  %d HTTPS hostname(s) under %s. One wildcard record covers them all:\n' "$(printf '%s\n' "${allhosts[@]}" | sort -u | grep -c .)" "$z"
+        printf '    LAN DNS (Pi-hole, router, OPNsense Unbound host override):  *.%s  A  %s\n' "$z" "$ip"
+        if [[ "${CFG[ACCESS_MODE]}" == internet ]]; then
+            printf '    Public DNS (e.g. Cloudflare):  *.%s  A  <your public IP>, and forward TCP %s (HTTPS) to %s\n' \
+                "$z" "$(env_get "$envf" REVERSE_PROXY_PORT_HTTPS 2>/dev/null || echo 443)" "$ip"
+        fi
+        printf '  Hostnames: %s\n' "$(printf '%s\n' "${allhosts[@]}" | sort -u | sed "s/\.$z\$//" | xargs)" | fold -s -w 110 | sed '2,$s/^/             /'
+    else
+        printf '  Traefik is not enabled: use the LAN URLs above (no DNS records needed).\n'
+    fi
+    return 0
+}
+
+print_summary() {
+    local ip z; ip=$(eff_local_ip); z=$(tls_zone)
+    log_step "Done"
+    [[ -f "$FOLDER_FOR_YAML/.env" ]] || return 0
+    ( show_urls ) || true
     if svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == selfsigned ]]; then
         printf '\n  Self-signed: import %s/ca.crt on your devices (and point *.%s at %s in your DNS).\n' "$(tls_dir)" "$z" "$ip"
     fi
@@ -4909,6 +5016,31 @@ FIX
     st "subnet overlap check"             '( cidr_overlap 172.28.10.0/24 172.28.10.0/24 && cidr_overlap 172.28.0.0/16 172.28.10.0/24 && ! cidr_overlap 172.28.11.0/24 172.28.10.0/24 && ! cidr_overlap 172.17.0.0/16 172.28.10.0/24 && cidr_overlap 0.0.0.0/0 10.1.2.0/24 && ! cidr_overlap fd00::/64 172.28.10.0/24 )'
     st "orphaned bridge on stack subnet"  '( FOLDER_FOR_YAML="$t/fy"; mkdir -p "$t/fy"; echo DOCKER_SUBNET=172.28.10.0/24 >"$t/fy/.env"; docker() { case "$1 $2" in "network ls") echo 91b65f27405bfffffff;; "network inspect") echo "";; esac; }; ip() { echo "1: lo    inet 127.0.0.1/8 scope host lo"; echo "5: br-cef1f9fa439b    inet 172.28.10.1/24 brd 172.28.10.255 scope global br-cef1f9fa439b"; echo "6: br-91b65f27405b    inet 172.28.10.1/24 scope global br-91b65f27405b"; echo "2: eno1    inet 192.168.11.75/24 scope global eno1"; }; [[ "$(subnet_foreign_ifaces)" == "br-cef1f9fa439b 172.28.10.1/24" ]] )'
     st "TLS probe name is under the zone"  '( CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; [[ "$(tls_probe_name)" == mediastack-probe.certifiedgeeks.net ]] )'
+    st "URL view: compose facts"           '( y="name: mediastack
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    ports:
+      - mode: ingress
+        target: 8888
+        published: \"8888\"
+        protocol: tcp
+      - mode: ingress
+        target: 8388
+        published: \"8388\"
+        protocol: udp
+  sonarr:
+    labels:
+      traefik.http.routers.sonarr.middlewares: authentik-forwardauth@file,security-headers@file
+      traefik.http.routers.sonarr.rule: Host(\`sonarr.example.org\`) || Host(\`tv.example.org\`)
+    network_mode: service:gluetun
+    volumes:
+      - type: bind
+        target: /config
+networks:
+  mediastack:
+    name: mediastack"; f=$(compose_service_facts "$y"); [[ "$f" == "gluetun|||0|8888/tcp 8388/udp
+sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ -z "${CFG[VPN_ENDPOINT_IP]}${CFG[VPN_ENDPOINT_PORT]}${CFG[WIREGUARD_PUBLIC_KEY]}" ]] && CFG[VPN_SERVICE_PROVIDER]=custom CFG[VPN_ENDPOINT_IP]=1.2.3.4 && vpn_normalize && [[ ${CFG[VPN_ENDPOINT_IP]} == 1.2.3.4 ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
@@ -4988,6 +5120,7 @@ main_menu() {
         printf '   6) Stop stack             (containers down, data kept)\n'
         printf '   R) Restart containers     (no converge)\n'
         printf '   7) Status\n   8) Post-install helpers\n   9) Logs\n   K) Certificate          (refresh, show, fetch key, push receiver)\n'
+        printf '   L) URLs, ports and DNS names\n'
         printf '  %sMaintenance%s\n' "$B" "$NC"
         printf '   B) Backup / restore\n   C) Show settings (all keys)\n   U) Uninstall...\n   T) Toggle dry-run\n   S) Self-test\n   0) Quit\n\n'
         local ch; read -rp "  Choice: " ch || exit 0
@@ -5002,6 +5135,7 @@ main_menu() {
             8) menu_helpers ;;
             9) menu_logs ;;
             k) menu_cert ;;
+            l) menu_action show_urls ;;
             r) menu_action stack_restart ;;
             b) menu_backup ;;
             c) menu_action show_config ;;
@@ -5032,6 +5166,7 @@ Actions (default: interactive menu)
   --stop                 Stop stack (docker compose down; data kept)
   --restart              Restart the containers (no converge)
   --status               Show configuration, storage, certificate and container status
+  --urls                 LAN URLs, HTTPS hostnames, published ports and the DNS records to create
   --logs [N] [SERVICE]   Last N container log lines (default 100), all services or one
   --show-config          Print every setting with its meaning
   --set KEY VALUE        Change one setting (validated; presets re-applied), then --apply
@@ -5106,6 +5241,7 @@ main() {
                             if [[ -n "${2:-}" && ( "${2:-}" == - || "${2:-}" != -* ) ]]; then arg1=$2; shift; fi ;;
             --cert-receive) action=certreceive ;;
             --status)       action=status ;;
+            --urls)         action=urls ;;
             --helper)       action=helper; helper=${2:-}; shift ;;
             --secrets)      action=secrets ;;
             --settings)     action=settings ;;
@@ -5163,6 +5299,7 @@ main() {
         certpush)  cert_push_setup "$arg1" ;;
         certreceive) cert_receive ;;
         status)    show_status ;;
+        urls)      show_urls ;;
         secrets)   menu_secrets ;;
         settings)  is_tty || die "Settings menu needs a terminal."; menu_settings ;;
         teststorage) storage_test "${helper^^}" ;;
