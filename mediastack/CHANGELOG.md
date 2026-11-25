@@ -3,6 +3,19 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.1.7 — 2026-11-25 — Guacamole database on Apply
+
+### Fixed
+- **Guacamole "An error has occurred".** Guacamole needs its own PostgreSQL database with its schema, which was
+  only created by a helper that had to be run by hand (and which stopped as soon as the database existed, even
+  without tables). Apply now checks it whenever Guacamole is on: it creates the database if missing, loads the
+  schema from the running Guacamole image if its tables are missing, grants access and restarts Guacamole.
+  Helper 2 does the same on demand.
+
+### Changed
+- Apply waits up to 240 s (was 180 s) for containers to settle; the Tailscale container can take over 3 minutes.
+- Self-test: 93 checks.
+
 ## v3.1.6 — 2026-11-25 — Tailscale container joins Headscale
 
 ### Added
