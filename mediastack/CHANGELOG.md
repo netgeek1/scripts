@@ -3,6 +3,20 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.1.5 — 2026-11-25 — Headscale API key, no-link tile
+
+### Added
+- **Headscale API key for Headplane sign-in.** Apply creates one when Headscale first runs (valid 365 days), stores
+  it in the vault (`HEADSCALE_API_KEY`) and shows it once on the terminal (never in a log). New helper
+  **9) Headscale: show / create the API key** (`--helper headscale-key`) shows it again, lists the keys Headscale
+  knows and can create a new one.
+
+### Fixed
+- **Headscale tile opened a blank page.** Headscale has no web page (its `/` is blank by design; it is an API for
+  clients and Headplane). Homepage now lists it without a link and points to Headplane; Homarr and Heimdall skip it;
+  the URL view notes "no web page".
+- Self-test: 91 checks.
+
 ## v3.1.4 — 2026-11-25 — Headscale 0.29 config
 
 ### Fixed
