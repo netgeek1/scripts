@@ -3,6 +3,35 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.0.0 — 2026-11-24 — Status board
+
+### Added
+- **Status board add-on (`statusboard`, Core preset):** one page with Tailscale, Gluetun VPN and CrowdSec tabs at
+  `https://status.<domain>` (Authentik) and `http://<host-ip>:13380` (read-only). The single-file Python app
+  (standard library only) is embedded in the installer and written to `<data>/statusboard/app`. It runs in
+  `python:3.13-alpine`, read-only, `cap_drop: ALL`, `no-new-privileges`, without the Docker socket.
+  - **Tailscale:** LocalAPI over the shared `tailscaled` socket (`TS_SOCKET`, `<data>/tailscale/run`). Shows status
+    and peers (online, IP, OS, direct/relay, traffic, last seen) and can ping a peer. Apply enables Tailscale's own
+    web interface (`tailscale set --webclient`, port 5252 on the tailnet), which the tab links to for exit node,
+    routes and SSH changes.
+  - **Gluetun:** control server with a generated key (`STATUSBOARD_GLUETUN_KEY` →
+    `HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE`). Shows VPN state, public IP/location, forwarded port and updater; can
+    stop/start/restart the VPN and update the server list. Server selection changes go through the installer.
+  - **CrowdSec:** decisions via the bouncer key; alerts, ban and unban via a `statusboard` machine login that Apply
+    registers (`CROWDSEC_STATUSBOARD_PASSWORD`); summary metrics from :6060.
+  - Changes are accepted only through Traefik with an Authentik user. They need an `X-Statusboard` header, which
+    blocks cross-site form posts, and are logged with the user name.
+- **Change requests:** the board writes validated `*.req` files. The `mediastack-requests.path` unit runs
+  `--process-requests` (lock-aware, whitelisted actions `vpn_filters` and `gluetun_recreate`, values checked by
+  `validate_key`), which applies them and writes a result the board shows. Logged as `request-*.log`.
+- Homepage lists the status board under Access & security.
+- Self-test: 87 checks.
+
+### Fixed
+- v2.8.0 had changed the upstream folder-layout string used for drift detection (`DATA_BRACE`). It matches
+  upstream again; `authentik/blueprints` is now an installer-owned folder.
+- Proton server-list credentials are only passed to Gluetun while periodic updates are on.
+
 ## v2.9.2 — 2026-11-24
 
 ### Fixed
