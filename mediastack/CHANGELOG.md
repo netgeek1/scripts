@@ -3,6 +3,13 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.7.1 — 2026-11-26 — Quiet wait for Traefik's API
+
+### Fixed
+- Apply printed `[FAIL] rc=1 ... docker exec traefik wget ...` when Traefik had just been recreated (3.7.0 gives it a
+  fixed address, which recreates it once): its API was not answering yet. The check already waits and retries on
+  an empty answer; the API call no longer reports its own failure, and the wait is up to 60 s (was 30 s).
+
 ## v3.7.0 — 2026-11-26 — Link checks on Homepage
 
 ### Added
