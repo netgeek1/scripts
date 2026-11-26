@@ -3,6 +3,16 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.4.0 — 2026-11-25 — Chromium through the VPN
+
+### Changed
+- **Chromium now browses through the VPN** (`CHROMIUM_VIA_VPN`, default `yes`, Settings → 8). Upstream gives it its
+  own network, so sites saw the home IP. The managed override puts it in Gluetun's network
+  (`network_mode: service:gluetun`, its `networks`/`ports` reset) and publishes its port on Gluetun, as upstream
+  does for the download apps; LAN port, hostname and Traefik route are unchanged. `no` restores upstream's setup.
+- README: which apps use the VPN and why the others don't.
+- Self-test: 100 checks.
+
 ## v3.3.3 — 2026-11-25 — Provider switch keeps the wg0.conf server
 
 ### Fixed
