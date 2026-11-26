@@ -800,6 +800,17 @@ enabled:
 - **Access by IP:** `HOMEPAGE_ALLOWED_HOSTS` also accepts `<host-ip>:<port>` and `localhost:<port>`, so
   `http://<host-ip>:<port>` works as well as `https://homepage.<domain>`.
 
+
+**Link checks (`HOMEPAGE_LINK_CHECKS=yes`, default).** Every tile with a link gets Homepage's `siteMonitor`: a
+status dot with the response time, on top of the container state Homepage already shows from Docker. Homepage
+calls the tile's own link, so a missing Traefik route or wrong path (a 404 or other error above 403) shows as down,
+while Authentik's sign-in redirect counts as up. To make the check take the same route as a browser, whatever
+your server's DNS knows and whatever host port Traefik uses, the installer:
+- gives Traefik a fixed address on the stack network, the last one in `DOCKER_SUBNET` (`172.28.10.254` by default)
+- maps every app hostname to it in Homepage's container (`extra_hosts`)
+
+Homarr already checks each app (its status dot pings the app's LAN address); Heimdall has no link checks.
+
 ### Authentik sign-in (forward auth)
 
 With Traefik and Authentik enabled, every app hostname goes through Authentik's sign-in. The installer sets this up
@@ -1071,7 +1082,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 103 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 104 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
