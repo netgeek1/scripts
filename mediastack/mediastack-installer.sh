@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.4.3"
+readonly SCRIPT_VERSION="3.5.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -4544,23 +4544,25 @@ cfg_services() {
 
 services_toggle_ui() {
     log_info "on = runs | disabled = never started, folders kept | removed = never started, no app-data folder"
-    local -a svcs; mapfile -t svcs < <(all_services)
-    local in n i s line
+    local -a svcs; mapfile -t svcs < <(all_services | sort -u)
+    local in n i s line lab cst
+    docker_up 2>/dev/null && ct_refresh
     while :; do
-        echo
+        printf '\n   %3s  %-22s %-10s %s\n' "#" "Service" "Setting" "Container now"
         for i in "${!svcs[@]}"; do
             s=${svcs[$i]}
             case "$(eff_state "$s")" in
-                on)       line="${G}on${NC}      " ;;
-                disabled) line="${Y}disabled${NC}"; [[ "$(svc_state "$s")" == on ]] && line="${Y}auto-off${NC}" ;;
-                *)        line="${R}removed${NC} " ;;
+                on)       line="${G}on${NC}        " ;;
+                disabled) line="${Y}disabled${NC}  "; [[ "$(svc_state "$s")" == on ]] && line="${Y}auto-off${NC}  " ;;
+                *)        line="${R}removed${NC}   " ;;
             esac
+            cst=${CT_STATE[$s]:-}
+            if [[ -n "$cst" ]]; then lab=$(ct_label "$s"); cst=${lab%%|*}; [[ "$cst" == disabled || "$cst" == removed ]] && cst=${CT_STATE[$s]}
+            else cst="not created"; fi
             if is_addon "$s"; then s+="+"; fi
-            printf '  %2d) %-20s %s' "$((i + 1))" "$s" "$line"
-            (( (i + 1) % 3 == 0 )) && echo
+            printf '   %3d  %-22s %s %s%s%s\n' "$((i + 1))" "$s" "$line" "$(ct_colour "$cst")" "$cst" "$NC"
         done
-        echo
-        printf '  (+ = add-on provided by this installer; auto-off = parked by another setting)\n'
+        printf '   (+ = add-on provided by this installer; auto-off = parked by another setting)\n'
         read -rp "  Numbers to cycle on -> disabled -> removed (e.g. '12 31'), Enter when done: " in || true
         [[ -z "$in" ]] && break
         for n in $in; do
@@ -5255,7 +5257,7 @@ main { padding:18px 20px; max-width:1200px; margin:0 auto } section { display:no
 .k { color:var(--mut); font-size:12px; text-transform:uppercase; letter-spacing:.03em } .v { font-size:18px; font-weight:600; margin-top:4px; word-break:break-all }
 h2 { font-size:14px; margin:20px 0 8px } table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden }
 th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top } th { color:var(--mut); font-weight:500; font-size:12px } tr:last-child td { border-bottom:0 }
-.dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--mut) } .dot.ok { background:var(--ok) } .dot.bad { background:var(--bad) }
+.dot { display:inline-block; width:16px; height:16px; border-radius:50%; margin-right:8px; vertical-align:-3px; background:var(--mut) } .dot.ok { background:var(--ok) } .dot.bad { background:var(--bad) }
 .err { color:var(--bad) } .mut { color:var(--mut) } .tag { font-size:11px; padding:1px 6px; border:1px solid var(--line); border-radius:9px; margin-left:4px; color:var(--mut) }
 button.act { border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit }
 button.act:hover { border-color:var(--acc) } button.act.danger:hover { border-color:var(--bad); color:var(--bad) } button:disabled { opacity:.45; cursor:not-allowed }
@@ -6205,10 +6207,12 @@ cfg_urls() {
     log_info "Hostnames are subdomains of $z (the first one is used in links); ports are the LAN port on $(eff_local_ip)."
     while :; do
         local -a rows=(); mapfile -t rows < <(url_services)
-        printf '\n   %3s  %-20s %-44s %s\n' "#" "Service" "Hostnames (.$z)" "LAN port"
+        ct_refresh
+        printf '\n   %3s  %-20s %-12s %-40s %s\n' "#" "Service" "State" "Hostnames (.$z)" "LAN port"
         for i in "${!rows[@]}"; do
             IFS='|' read -r s r p <<<"${rows[$i]}"
-            printf '   %3d  %-20s %-44s %s\n' $((i + 1)) "$s" \
+            local cl; cl=$(ct_label "$s"); cl=${cl%%|*}
+            printf '   %3d  %-20s %s%-12s%s %-40s %s\n' $((i + 1)) "$s" "$(ct_colour "$cl")" "$cl" "$NC" \
                 "$( (( r )) && svc_labels "$s" | paste -sd, - || echo -)$(map_get "${CFG[SERVICE_HOSTNAMES]:-}" "$s" >/dev/null && echo ' *')" \
                 "$( (( p )) && env_get "$envf" "$(svc_port_key "$s")" 2>/dev/null || echo -)$(map_get "${CFG[SERVICE_PORTS]:-}" "$s" >/dev/null && echo ' *')"
         done
@@ -6688,6 +6692,160 @@ menu_uninstall() {
 }
 
 # -----------------------------------------------------------------------------
+# CONTAINERS: one at a time (restart / stop / start / recreate / logs) and the shared service picker
+# -----------------------------------------------------------------------------
+declare -A CT_STATE=() CT_STATUS=()
+# ct_refresh -- container state (running/exited/...) and Docker's status text ("Up 2 hours (healthy)") by name
+ct_refresh() {
+    CT_STATE=(); CT_STATUS=()
+    local n st tx
+    while IFS=$'\t' read -r n st tx; do [[ -n "$n" ]] && { CT_STATE[$n]=$st; CT_STATUS[$n]=$tx; }; done \
+        < <(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}' 2>/dev/null || true)
+}
+# ct_label SVC -> "state|uptime" (state: healthy, running, unhealthy, starting, restarting, stopped, created,
+#   not created, disabled, removed)
+ct_label() {
+    local s=$1 st tx up=""
+    case "$(eff_state "$s" 2>/dev/null)" in disabled) echo "disabled|"; return ;; removed) echo "removed|"; return ;; esac
+    st=${CT_STATE[$s]:-}; tx=${CT_STATUS[$s]:-}
+    [[ -n "$st" ]] || { echo "not created|"; return; }
+    case "$st" in
+        running)
+            case "$tx" in *"(healthy)"*) st=healthy ;; *"(unhealthy)"*) st=unhealthy ;; *"(health: starting)"*) st=starting ;; esac
+            up=$(sed -E 's/^Up //; s/ \(.*\)$//' <<<"$tx") ;;
+        exited|dead) st=stopped; up=$(sed -nE 's/^Exited \([0-9]+\) (.*)$/\1/p' <<<"$tx") ;;
+    esac
+    echo "$st|$up"
+}
+ct_colour() {
+    case "$1" in healthy|running) printf '%s' "$G" ;; unhealthy|stopped|restarting) printf '%s' "$R" ;;
+        starting|created|"not created") printf '%s' "$Y" ;; *) printf '%s' "$D" ;; esac
+}
+# ct_dependents SVC -> enabled services that run inside SVC's network (network_mode: service:SVC, upstream or override)
+ct_dependents() {
+    local f s
+    for f in "$FOLDER_FOR_YAML/docker-compose.yaml" "$FOLDER_FOR_YAML/docker-compose.override.yaml"; do
+        [[ -f "$f" ]] || continue
+        awk -v t="$1" '
+            /^services:/ {in_s = 1; next}
+            in_s && /^[^ #]/ {in_s = 0}
+            in_s && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ {s = $1; sub(/:$/, "", s)}
+            in_s && /^    network_mode:/ {v = $0; gsub(/["'\'' ]/, "", v); if (v == "network_mode:service:" t) print s}' "$f"
+    done | sort -u | while read -r s; do if [[ -n "$s" ]] && svc_enabled "$s"; then echo "$s"; fi; done
+    return 0
+}
+
+# pick_service VAR PROMPT [all|enabled] -- alphabetical numbered list with live state; number or name; blank = none
+#   all = enabled + disabled services (removed ones have no container); enabled = running set only
+pick_service() {
+    local __ps_var=$1 __ps_prompt=$2 __ps_which=${3:-enabled} __ps_s __ps_i __ps_lab __ps_st __ps_up __ps_note __ps_pick
+    local -a __ps_svcs=()
+    local -A __ps_vpn=()
+    ct_refresh
+    while IFS= read -r __ps_s; do
+        [[ -n "$__ps_s" ]] || continue
+        case "$(eff_state "$__ps_s" 2>/dev/null)" in on) ;; disabled) [[ "$__ps_which" == all ]] || continue ;; *) continue ;; esac
+        __ps_svcs+=("$__ps_s")
+    done < <(all_services | sort -u)
+    while IFS= read -r __ps_s; do [[ -n "$__ps_s" ]] && __ps_vpn[$__ps_s]=1; done < <(ct_dependents gluetun 2>/dev/null)
+    printf '\n   %3s  %-22s %-12s %-16s %s\n' "#" "Service" "State" "Up / stopped" ""
+    for __ps_i in "${!__ps_svcs[@]}"; do
+        __ps_s=${__ps_svcs[$__ps_i]}; __ps_lab=$(ct_label "$__ps_s"); __ps_st=${__ps_lab%%|*}; __ps_up=${__ps_lab#*|}
+        __ps_note=""; [[ -n "${__ps_vpn[$__ps_s]:-}" ]] && __ps_note="via VPN"
+        [[ "$__ps_s" == gluetun ]] && __ps_note="VPN for ${#__ps_vpn[@]} app(s)"
+        printf '   %3d  %-22s %s%-12s%s %-16s %s\n' $((__ps_i + 1)) "$__ps_s" "$(ct_colour "$__ps_st")" "$__ps_st" "$NC" "${__ps_up:0:16}" "$__ps_note"
+    done
+    while :; do
+        read -rp "  $__ps_prompt (number or name, Enter = back): " __ps_pick || __ps_pick=""
+        __ps_pick=${__ps_pick// /}
+        [[ -z "$__ps_pick" ]] && { printf -v "$__ps_var" '%s' ""; return 1; }
+        if [[ "$__ps_pick" =~ ^[0-9]+$ ]] && (( __ps_pick >= 1 && __ps_pick <= ${#__ps_svcs[@]} )); then
+            printf -v "$__ps_var" '%s' "${__ps_svcs[$((__ps_pick - 1))]}"; return 0
+        fi
+        for __ps_s in "${__ps_svcs[@]}"; do [[ "$__ps_s" == "$__ps_pick" ]] && { printf -v "$__ps_var" '%s' "$__ps_s"; return 0; }; done
+        log_warn "No '$__ps_pick' in the list."
+    done
+}
+
+# ct_action ACTION SVC -- restart | stop | start | recreate | logs [N] | follow
+ct_action() {
+    local a=$1 s=$2 n=${3:-100} deps st i
+    require_config; resolve_runtime; load_secrets
+    docker_up || die "Docker is not running."
+    svc_exists "$s" || die "Unknown service '$s'."
+    case "$a" in
+        logs)   docker logs --tail "$n" --timestamps "$s" 2>&1 | sed 's/^/  /'; return 0 ;;
+        follow) log_info "Following $s's log; Ctrl-C returns to the menu."
+                trap ':' INT; docker logs -f --tail 50 "$s" 2>&1 || true; trap - INT; return 0 ;;
+    esac
+    [[ "$(eff_state "$s")" == on ]] || die "$s is $(eff_state "$s") (Settings -> 7 to turn it on, then Apply)."
+    deps=$(ct_dependents "$s" | xargs)
+    if [[ -n "$deps" && "$a" != start ]]; then
+        log_warn "$(wc -w <<<"$deps") app(s) run inside $s's network and lose it during this: $deps"
+        is_tty && ! (( ASSUME_YES )) && { confirm "$(tr '[:lower:]' '[:upper:]' <<<"${a:0:1}")${a:1} $s and those apps?" y || { log_info "Cancelled"; return 0; }; }
+    fi
+    case "$a" in
+        restart)
+            log_step "Restarting $s${deps:+ and the apps in its network}"
+            run_logged compose_run restart "$s"
+            # apps sharing its network keep a dead network namespace: restart them once it is back
+            if [[ -n "$deps" ]]; then ct_wait_up "$s" 120; run_logged compose_run restart $deps; fi ;;
+        stop)
+            log_step "Stopping $s${deps:+ and the apps in its network}"
+            [[ -n "$deps" ]] && run_logged compose_run stop $deps
+            run_logged compose_run stop "$s" ;;
+        start)
+            log_step "Starting $s"
+            run_logged compose_run up -d --no-deps "$s"
+            if [[ -n "$deps" ]]; then ct_wait_up "$s" 120; log_info "Starting the apps in its network: $deps"; run_logged compose_run up -d --no-deps $deps; fi ;;
+        recreate)
+            log_step "Recreating $s${deps:+ and the apps in its network}"
+            run_logged compose_run up -d --no-deps --force-recreate "$s"
+            if [[ -n "$deps" ]]; then ct_wait_up "$s" 120; run_logged compose_run up -d --no-deps --force-recreate $deps; fi ;;
+        *) die "Unknown action '$a' (restart|stop|start|recreate|logs|follow)" ;;
+    esac
+    ct_refresh
+    for i in $s $deps; do st=$(ct_label "$i"); log_info "$(printf '%-20s %s' "$i" "${st%%|*}")"; done
+}
+
+# ct_wait_up SVC SECONDS -- until running (and healthy when it has a health check)
+ct_wait_up() {
+    local i st
+    for (( i = 0; i < $2; i += 3 )); do
+        st=$(docker inspect -f '{{.State.Status}}{{if .State.Health}}/{{.State.Health.Status}}{{end}}' "$1" 2>/dev/null || true)
+        [[ "$st" == running || "$st" == running/healthy ]] && return 0
+        sleep 3
+    done
+    log_warn "$1 is not up after $2 s ($st); continuing."
+}
+
+# menu_prep -- the menus run in the main shell, where the stack's folders are only set once an action ran
+menu_prep() {
+    [[ -f "$CONF_FILE" ]] || { log_warn "Not installed yet (no $CONF_FILE): run the full install first."; return 1; }
+    load_config; resolve_runtime
+    docker_up || { log_warn "Docker is not running."; return 1; }
+}
+
+menu_containers() {
+    local s ch n
+    menu_prep || return 0
+    while :; do
+        printf '\n  %sContainers%s (one at a time; R in the main menu restarts all)\n' "$B" "$NC"
+        pick_service s "Container" all || return 0
+        printf '\n  %s%s%s: 1) Restart  2) Stop  3) Start  4) Recreate  5) Logs  6) Follow logs  0) Back\n' "$B" "$s" "$NC"
+        read -rp "  Choice: " ch || return 0
+        case "$ch" in
+            1) menu_action ct_action restart "$s" ;;
+            2) menu_action ct_action stop "$s" ;;
+            3) menu_action ct_action start "$s" ;;
+            4) menu_action ct_action recreate "$s" ;;
+            5) read -rp "  Lines [100]: " n || n=""; [[ "$n" =~ ^[0-9]+$ ]] || n=100; menu_action ct_action logs "$s" "$n" ;;
+            6) menu_action ct_action follow "$s" ;;
+        esac
+    done
+}
+
+# -----------------------------------------------------------------------------
 # LOGS MENU
 # -----------------------------------------------------------------------------
 menu_logs() {
@@ -6696,7 +6854,9 @@ menu_logs() {
     case "$ch" in
         1) ls -1t "$MS_LOG_DIR"/installer-*.log 2>/dev/null | head -n "$LOG_KEEP" | sed 's/^/  /' ;;
         2) local f; f=$(ls -1t "$MS_LOG_DIR"/installer-*.log 2>/dev/null | sed -n 2p); [[ -n "$f" ]] && ${PAGER:-less} "$f" ;;
-        3) ask s "Service (blank = all)" ""; ask n "Lines" "100"; [[ "$n" =~ ^[0-9]+$ ]] || n=100
+        3) menu_prep || return 0
+           pick_service s "Container whose log to show" all || return 0
+           ask n "Lines" "100"; [[ "$n" =~ ^[0-9]+$ ]] || n=100
            menu_action show_logs "$n" "$s" ;;
     esac
 }
@@ -7504,6 +7664,24 @@ services:
 FIX
     st "Chromium through the VPN"           '( st_prep internet jellyfin tailscale full; CFG[FOLDER_FOR_YAML]=$t/cv; FOLDER_FOR_YAML=$t/cv; o=$(render_override "$t/cv/docker-compose.yaml"); c=$(awk "/^  chromium:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o"); g=$(awk "/^  gluetun:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o"); [[ "$c" == *"network_mode: \"service:gluetun\""* && "$c" == *"networks: !reset []"* && "$c" == *"ports: !reset []"* ]] && [[ "$(tail -n 1 <<<"$g")" == "      - \${WEBUI_PORT_CHROMIUM:?err}:\${WEBUI_PORT_CHROMIUM:?err}" && "$(tail -n 2 <<<"$g" | head -n 1)" == "    ports:" ]] && CFG[CHROMIUM_VIA_VPN]=no && o=$(render_override "$t/cv/docker-compose.yaml") && [[ "$o" != *"  chromium:"* && "$o" != *WEBUI_PORT_CHROMIUM* ]] )'
     st "qBittorrent start-up script"        '( mkdir -p $t/qi/config/qBittorrent; render_qbt_init | sed "s|/config/|$t/qi/config/|" >$t/qi/s.sh; f=$t/qi/config/qBittorrent/qBittorrent.conf; ok=1; for c in "[Preferences]\nWebUI\\\\LocalHostAuth=true\nWebUI\\\\Port=8200\n" "[BitTorrent]\nx=1\n[Preferences]\nGeneral\\\\Locale=en\n" "[BitTorrent]\nx=1\n" "[WebUI]\nLocalHostAuth=true\nPort=8200\n[Preferences]\nGeneral\\\\Locale=en\n"; do printf "$c" >$f; sh $t/qi/s.sh >/dev/null; sh $t/qi/s.sh >/dev/null; awk "/^\\[/{s=\$0} s==\"[WebUI]\" && \$0==\"LocalHostAuth=false\"{a++} s==\"[Preferences]\" && index(\$0,\"WebUI\")==1 && substr(\$0,7)==\"LocalHostAuth=false\"{b++} /LocalHostAuth=true/{bad=1} END{exit !(a==1&&b==1&&!bad)}" $f || { ok=0; cat $f >&2; }; grep -q "Port=8200\|Locale=en\|x=1" $f || ok=0; done; (( ok )) && st_prep internet jellyfin tailscale core && CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=protonvpn && CFG[VPN_PORT_FORWARDING]=on && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"/qbittorrent-init:/custom-cont-init.d:ro"* ]] && CFG[VPN_PF_QBITTORRENT]=no && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *custom-cont-init* ]] )'
+    mkdir -p "$t/ct"; cat >"$t/ct/docker-compose.yaml" <<'FIX'
+services:
+  gluetun:
+    image: g
+  sonarr:
+    image: s
+    network_mode: "service:gluetun"
+  qbittorrent:
+    image: q
+    network_mode: service:gluetun
+  chromium:
+    image: c
+  homepage:
+    image: h
+FIX
+    printf 'services:\n  chromium:\n    network_mode: "service:gluetun"\n' >"$t/ct/docker-compose.override.yaml"
+    st "containers: dependents + states"   '( st_prep internet jellyfin tailscale full; CFG[FOLDER_FOR_YAML]=$t/ct; FOLDER_FOR_YAML=$t/ct; d=$(ct_dependents gluetun | xargs); [[ "$d" == "chromium qbittorrent sonarr" && -z "$(ct_dependents sonarr)" ]] && CT_STATE=([gluetun]=running [sonarr]=running [homepage]=exited [qbittorrent]=running) && CT_STATUS=([gluetun]="Up 2 hours (healthy)" [sonarr]="Up 5 minutes" [homepage]="Exited (0) 3 hours ago" [qbittorrent]="Up 10 seconds (health: starting)") && [[ "$(ct_label gluetun)" == "healthy|2 hours" && "$(ct_label sonarr)" == "running|5 minutes" && "$(ct_label homepage)" == "stopped|3 hours ago" && "$(ct_label qbittorrent)" == "starting|10 seconds" && "$(ct_label chromium)" == "not created|" ]] )'
+    st "containers: gluetun order + picker" '( st_prep internet jellyfin tailscale full; CFG[FOLDER_FOR_YAML]=$t/ct; FOLDER_FOR_YAML=$t/ct; require_config() { :; }; resolve_runtime() { :; }; load_secrets() { :; }; docker_up() { return 0; }; svc_exists() { return 0; }; is_tty() { return 1; }; ct_wait_up() { echo "wait $1" >>$t/ct/calls; }; ct_refresh() { :; }; run_logged() { shift; echo "compose $*" >>$t/ct/calls; }; : >$t/ct/calls; ct_action stop gluetun >/dev/null 2>&1; [[ "$(cat $t/ct/calls)" == "compose stop chromium qbittorrent sonarr"$'"'"'\n'"'"'"compose stop gluetun" ]] && : >$t/ct/calls && ct_action start gluetun >/dev/null 2>&1 && [[ "$(head -n 1 $t/ct/calls)" == "compose up -d --no-deps gluetun" && "$(sed -n 2p $t/ct/calls)" == "wait gluetun" && "$(sed -n 3p $t/ct/calls)" == "compose up -d --no-deps chromium qbittorrent sonarr" ]] && : >$t/ct/calls && ct_action restart sonarr >/dev/null 2>&1 && [[ "$(cat $t/ct/calls)" == "compose restart sonarr" ]] && docker() { :; } && x=$(pick_service p "Pick" all <<<"2" >/dev/null; echo "$p") && pick_service p "Pick" all <<<"sonarr" >/dev/null && [[ "$p" == sonarr ]] && s="" && pick_service s "Pick" all <<<"sonarr" >/dev/null && [[ "$s" == sonarr ]] && pick_service p "Pick" all <<<"2" >/dev/null && [[ -n "$p" ]] && ! pick_service p "Pick" all <<<"" >/dev/null )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
@@ -7590,7 +7768,8 @@ main_menu() {
         printf '   4) Apply + pull updates   (converge, pull images, up)\n'
         printf '   5) Apply without pulling  (converge, up)\n'
         printf '   6) Stop stack             (containers down, data kept)\n'
-        printf '   R) Restart containers     (no converge)\n'
+        printf '   R) Restart containers     (all; no converge)\n'
+        printf '   M) Containers             (one at a time: restart, stop, start, recreate, logs)\n'
         printf '   7) Status\n   8) Post-install helpers\n   9) Logs\n   K) Certificate          (refresh, show, fetch key, push receiver)\n'
         printf '   L) URLs, ports and DNS names\n'
         printf '  %sMaintenance%s\n' "$B" "$NC"
@@ -7609,6 +7788,7 @@ main_menu() {
             k) menu_cert ;;
             l) menu_action show_urls ;;
             r) menu_action stack_restart ;;
+            m) menu_containers ;;
             b) menu_backup ;;
             c) menu_action show_config ;;
             u) menu_uninstall ;;
@@ -7654,6 +7834,9 @@ Actions (default: interactive menu)
                          from file F, stdin (-) or a prompt (CERT_MODE=push)
   --cert-receive         Push receiver: read chain + key on stdin (run by the forced SSH command)
   --process-requests     Apply status board change requests (run by the mediastack-requests.path unit)
+  --container ACTION [SERVICE]
+                         restart | stop | start | recreate | logs | follow one container (and, for Gluetun,
+                         the apps in its network); without SERVICE a numbered list to pick from
   --helper NAME          authentik-db | guacamole | akadmin | apikeys | vpn-servers | vpn-check | traefik-check
                          | homarr-key | headscale-key
   --settings             Settings menu (paths, network, storage, services, ...)
@@ -7718,6 +7901,7 @@ main() {
             --status)       action=status ;;
             --urls)         action=urls ;;
             --helper)       action=helper; helper=${2:-}; shift ;;
+            --container)    action=container; helper=${2:-}; arg1=${3:-}; shift 2 || true ;;
             --secrets)      action=secrets ;;
             --settings)     action=settings ;;
             --test-storage) action=teststorage; helper=${2:-MEDIA}; shift ;;
@@ -7781,6 +7965,10 @@ main() {
         secrets)   menu_secrets ;;
         settings)  is_tty || die "Settings menu needs a terminal."; menu_settings ;;
         teststorage) storage_test "${helper^^}" ;;
+        container) [[ -n "$helper" ]] || die "Usage: --container restart|stop|start|recreate|logs|follow SERVICE"
+                   if [[ -z "$arg1" ]]; then is_tty || die "Name the service: --container $helper SERVICE"
+                       menu_prep || exit 1; pick_service arg1 "Container to $helper" all || exit 0; fi
+                   ct_action "$helper" "$arg1" ;;
         uninstall) uninstall_stack ;;
         purge)     purge_docker_engine ;;
         compose)   require_config; resolve_runtime; load_secrets; compose_run "${compose_args[@]}" ;;
