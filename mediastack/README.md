@@ -506,6 +506,21 @@ keep `custom`, Settings → VPN offers to switch to `protonvpn`: the key and add
 picks the server from your filters. Staying on `custom` still works; the status board lets you change the server
 endpoint (IP, port, public key) from another config of the same provider.
 
+### Which apps use the VPN
+
+The download apps, the *ARR apps, Jellyfin, Plex, Seerr, FlareSolverr, FileBot and Tdarr run inside Gluetun's
+network (upstream's design): their internet traffic leaves through the VPN, and their ports are published on the
+`gluetun` container ("via VPN" in the URL view).
+
+**Chromium** is a browser, but upstream runs it on its own network, so websites see your home IP. With
+`CHROMIUM_VIA_VPN=yes` (default; Settings → 8) Apply moves it behind Gluetun the same way: Gluetun's network, its
+port published on Gluetun, same LAN port and hostname. It then stops whenever the VPN is down. `no` restores
+upstream's setup.
+
+The rest stay outside the VPN on purpose: they either must use your real connection (DDNS-Updater reports your
+public IP; Traefik, Authentik, CrowdSec, Tailscale and Headscale are reached from outside or by your devices), only
+talk to other containers (PostgreSQL, Valkey, Unpackerr, guacd), or are dashboards and admin tools on your LAN.
+
 ### Port forwarding
 
 | Key | Default | Notes |
@@ -1033,7 +1048,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 99 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 100 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
