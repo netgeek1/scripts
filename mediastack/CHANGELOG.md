@@ -3,6 +3,18 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.7.0 — 2026-11-26 — Link checks on Homepage
+
+### Added
+- **Link health on Homepage** (`HOMEPAGE_LINK_CHECKS`, default `yes`): every tile with a link gets Homepage's
+  `siteMonitor` (status dot + response time). It calls the tile's own link, so missing Traefik routes or wrong
+  paths show as down and Authentik's sign-in redirect as up. Homepage already had this, so it is used instead of
+  building link checks into the status board.
+  - Traefik gets a fixed address on the stack network (the last one in `DOCKER_SUBNET`, e.g. `172.28.10.254`), and
+    Homepage's container maps every app hostname to it (`extra_hosts`): the check takes the browser's route
+    whatever the host's DNS knows and whatever host port Traefik is published on.
+- Self-test: 104 checks.
+
 ## v3.6.0 — 2026-11-26 — Headscale tab on the status board
 
 ### Added
