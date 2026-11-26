@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.6.0"
+readonly SCRIPT_VERSION="3.7.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -105,7 +105,7 @@ CONF_KEYS=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA FOLDER_FOR_YAML DOMAIN CLOUDFLARE_D
             SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES VPN_SERVERS_UPDATE_PERIOD VPN_UPDATER_PROTON_EMAIL
             DDNS_PROVIDER DDNS_RECORDS DDNS_CF_ZONE_ID DDNS_TTL DDNS_PROXIED DDNS_IP_VERSION DDNS_CONFIG_FILE
             SERVICE_HOSTNAMES SERVICE_PORTS VPN_PORT_FORWARDING VPN_PORT_FORWARDING_PROVIDER VPN_PF_QBITTORRENT
-            CHROMIUM_VIA_VPN )
+            CHROMIUM_VIA_VPN HOMEPAGE_LINK_CHECKS )
 # Settings that did not exist before v2.0.0: an existing config without them keeps its old behaviour
 declare -A CONF_LEGACY=( [ACCESS_MODE]=internet [CERT_MODE]=letsencrypt [SERVICE_PRESET]=custom
                          [TAILSCALE_CONTROL]=headscale [PLAYER]=both )
@@ -428,6 +428,7 @@ set_default_config() {
         [VPN_PORT_FORWARDING_PROVIDER]=""
         [VPN_PF_QBITTORRENT]="yes"
         [CHROMIUM_VIA_VPN]="yes"
+        [HOMEPAGE_LINK_CHECKS]="yes"
     )
 }
 
@@ -1504,6 +1505,15 @@ EOF
       - HOMEPAGE_VAR_LIDARR_API_TOKEN=${LIDARR_API_TOKEN:-}
       - HOMEPAGE_VAR_READARR_API_TOKEN=${READARR_API_TOKEN:-}
 EOF
+            local tip l; tip=$(traefik_fixed_ip || true)
+            if [[ -n "$tip" ]]; then
+                printf '    # link checks: app hostnames go to Traefik on the stack network (same route as a browser)\n    extra_hosts:\n'
+                for l in $(link_check_hostnames); do printf '      - "%s.${CLOUDFLARE_DNS_ZONE:?err}:%s"\n' "$l" "$tip"; done
+            fi
+            ;;
+        traefik)
+            printf '    # fixed address on the stack network: Homepage'"'"'s link checks reach Traefik here\n'
+            printf '    networks:\n      mediastack:\n        ipv4_address: %s\n' "$(traefik_fixed_ip)"
             ;;
         ddns-updater)
             printf '    # DDNS-Updater: records from the installer settings (DDNS_*); the API token comes from the vault\n'
@@ -1601,6 +1611,7 @@ active_patches() {   # upstream services this installer modifies
         && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint || vpn_pf_on || chromium_via_vpn || svc_enabled statusboard; }; then echo gluetun; fi
     if grep -qE '^  chromium:[[:space:]]*$' "$compose" && grep -qE '^  gluetun:[[:space:]]*$' "$compose" && chromium_via_vpn; then echo chromium; fi
     if grep -qE '^  qbittorrent:[[:space:]]*$' "$compose" && vpn_pf_qbt; then echo qbittorrent; fi
+    if grep -qE '^  traefik:[[:space:]]*$' "$compose" && [[ -n "$(traefik_fixed_ip || true)" ]]; then echo traefik; fi
     if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale; then echo tailscale; fi
     return 0
 }
@@ -6502,6 +6513,26 @@ homepage_title() { local s=$1; case "$s" in statusboard) echo "Status board" ;; 
     authentic-worker) echo "Authentik worker" ;; tdarr-node) echo "Tdarr node" ;; postgresql) echo PostgreSQL ;;
     crowdsec) echo CrowdSec ;; *) echo "${s^}" ;; esac; }
 
+# LINK CHECKS (Homepage siteMonitor): each tile checks its own link. HTTPS links go to Traefik's fixed address on the
+# stack network (the last one in DOCKER_SUBNET) through extra_hosts, so the check takes the browser's route (Traefik
+# router, path, certificate, Authentik redirect) whatever the host's DNS knows, and whatever host port Traefik has.
+link_checks_on() { svc_enabled homepage && [[ "${CFG[HOMEPAGE_LINK_CHECKS]:-yes}" == yes ]]; }
+# cidr_last_host CIDR -> the highest usable IPv4 address (172.28.10.0/24 -> 172.28.10.254)
+cidr_last_host() {
+    local ip=${1%/*} bits=${1#*/} a b c d n
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] && (( bits <= 30 )) || return 1
+    IFS=. read -r a b c d <<<"$ip"
+    n=$(( (a << 24 | b << 16 | c << 8 | d) | ((1 << (32 - bits)) - 1) ))
+    n=$(( n - 1 ))
+    printf '%d.%d.%d.%d' $(( n >> 24 & 255 )) $(( n >> 16 & 255 )) $(( n >> 8 & 255 )) $(( n & 255 ))
+}
+traefik_fixed_ip() { link_checks_on && svc_enabled traefik && cidr_last_host "$(env_get "$FOLDER_FOR_YAML/.env" DOCKER_SUBNET 2>/dev/null)"; }
+# link_check_hostnames -> every HTTPS hostname label of the enabled services (and Authentik's, for its redirect)
+link_check_hostnames() {
+    local s r
+    while IFS='|' read -r s r _; do (( r )) && svc_labels "$s"; done < <(url_services) | sort -u
+}
+
 # render_homepage_services FACTS -> services.yaml content
 render_homepage_services() {
     local facts=$1 envf="$FOLDER_FOR_YAML/.env" ip g grp members s line nm hosts href port w wt wp wk host
@@ -6533,6 +6564,8 @@ render_homepage_services() {
             printf '    - %s:\n' "$(homepage_title "$s")"
             printf '        icon: %s\n' "${HOMEPAGE_ICON[$s]:-$s.png}"
             [[ -n "$href" ]] && printf '        href: %s\n' "$href"
+            # link check: the tile's own link (HTTPS through Traefik, or the LAN address)
+            [[ -n "$href" ]] && link_checks_on && printf '        siteMonitor: %s\n' "$href"
             printf '        description: %s\n' "${HOMEPAGE_DESC[$s]:-$s}"
             printf '        server: local\n        container: %s\n' "$(homepage_container "$s")"
             w=${HOMEPAGE_WIDGET[$s]:-}
@@ -7021,6 +7054,7 @@ declare -A CONF_HELP=(
     [VPN_PORT_FORWARDING_PROVIDER]="custom provider only: whose port forwarding the server uses (protonvpn, ...)"
     [VPN_PF_QBITTORRENT]="yes | no -- set qBittorrent's listening port to the forwarded port"
     [CHROMIUM_VIA_VPN]="yes | no -- run the Chromium browser behind Gluetun (its traffic leaves through the VPN)"
+    [HOMEPAGE_LINK_CHECKS]="yes | no -- Homepage checks every tile's link (status dot + response time)"
     [CERT_FETCH_SOURCE]="fetch mode: user@host:/folder holding the certificate files"
     [CERT_FETCH_CERT]="fetch mode: full-chain certificate file name in that folder"
     [CERT_FETCH_KEY]="fetch mode: private key file name in that folder"
@@ -7098,7 +7132,7 @@ validate_key() {   # validate_key KEY VALUE
         VPN_PORT_FORWARDING) v_onoff "$v" ;;
         VPN_PORT_FORWARDING_PROVIDER) v_pfprov "$v" ;;
         VPN_PF_QBITTORRENT) v_yesno "$v" ;;
-        CHROMIUM_VIA_VPN) v_yesno "$v" ;;
+        CHROMIUM_VIA_VPN|HOMEPAGE_LINK_CHECKS) v_yesno "$v" ;;
         DDNS_CONFIG_FILE) [[ -z "$v" ]] || v_path "$v" ;;
         VPN_UPDATER_PROTON_EMAIL) [[ -z "$v" || "$v" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ;;
         CLOUDFLARE_EMAIL|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
@@ -7777,6 +7811,7 @@ FIX
     printf 'services:\n  chromium:\n    network_mode: "service:gluetun"\n' >"$t/ct/docker-compose.override.yaml"
     st "containers: dependents + states"   '( st_prep internet jellyfin tailscale full; CFG[FOLDER_FOR_YAML]=$t/ct; FOLDER_FOR_YAML=$t/ct; d=$(ct_dependents gluetun | xargs); [[ "$d" == "chromium qbittorrent sonarr" && -z "$(ct_dependents sonarr)" ]] && CT_STATE=([gluetun]=running [sonarr]=running [homepage]=exited [qbittorrent]=running) && CT_STATUS=([gluetun]="Up 2 hours (healthy)" [sonarr]="Up 5 minutes" [homepage]="Exited (0) 3 hours ago" [qbittorrent]="Up 10 seconds (health: starting)") && [[ "$(ct_label gluetun)" == "healthy|2 hours" && "$(ct_label sonarr)" == "running|5 minutes" && "$(ct_label homepage)" == "stopped|3 hours ago" && "$(ct_label qbittorrent)" == "starting|10 seconds" && "$(ct_label chromium)" == "not created|" ]] )'
     st "containers: gluetun order + picker" '( st_prep internet jellyfin tailscale full; CFG[FOLDER_FOR_YAML]=$t/ct; FOLDER_FOR_YAML=$t/ct; require_config() { :; }; resolve_runtime() { :; }; load_secrets() { :; }; docker_up() { return 0; }; svc_exists() { return 0; }; is_tty() { return 1; }; ct_wait_up() { echo "wait $1" >>$t/ct/calls; }; ct_refresh() { :; }; run_logged() { shift; echo "compose $*" >>$t/ct/calls; }; : >$t/ct/calls; ct_action stop gluetun >/dev/null 2>&1; [[ "$(cat $t/ct/calls)" == "compose stop chromium qbittorrent sonarr"$'"'"'\n'"'"'"compose stop gluetun" ]] && : >$t/ct/calls && ct_action start gluetun >/dev/null 2>&1 && [[ "$(head -n 1 $t/ct/calls)" == "compose up -d --no-deps gluetun" && "$(sed -n 2p $t/ct/calls)" == "wait gluetun" && "$(sed -n 3p $t/ct/calls)" == "compose up -d --no-deps chromium qbittorrent sonarr" ]] && : >$t/ct/calls && ct_action restart sonarr >/dev/null 2>&1 && [[ "$(cat $t/ct/calls)" == "compose restart sonarr" ]] && docker() { :; } && x=$(pick_service p "Pick" all <<<"2" >/dev/null; echo "$p") && pick_service p "Pick" all <<<"sonarr" >/dev/null && [[ "$p" == sonarr ]] && s="" && pick_service s "Pick" all <<<"sonarr" >/dev/null && [[ "$s" == sonarr ]] && pick_service p "Pick" all <<<"2" >/dev/null && [[ -n "$p" ]] && ! pick_service p "Pick" all <<<"" >/dev/null )'
+    st "Homepage link checks"               '( [[ "$(cidr_last_host 172.28.10.0/24)" == 172.28.10.254 && "$(cidr_last_host 10.0.0.0/16)" == 10.0.255.254 ]] && ! cidr_last_host bad && st_prep internet jellyfin tailscale core && CFG[FOLDER_FOR_YAML]=$t/hz && FOLDER_FOR_YAML=$t/hz && printf "DOCKER_SUBNET=172.28.10.0/24\nWEBUI_PORT_SONARR=8989\n" >$t/hz/.env && printf "  traefik:\n    image: t\n  homepage:\n    image: h\n" >>$t/hz/docker-compose.yaml && traefik_fixed_ip >/dev/null && o=$(render_override "$t/hz/docker-compose.yaml") && tr=$(awk "/^  traefik:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o") && hp=$(awk "/^  homepage:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o") && [[ "$tr" == *"ipv4_address: 172.28.10.254"* && "$hp" == *"extra_hosts:"* && "$hp" == *"- \"sonarr.\${CLOUDFLARE_DNS_ZONE:?err}:172.28.10.254\""* ]] && f=$(printf "sonarr|service:gluetun|sonarr.x.org||\n") && svc_enabled() { [[ "$1" != plex ]]; } && y=$(render_homepage_services "$f") && [[ "$y" == *"siteMonitor: https://sonarr.x.org"* ]] && CFG[HOMEPAGE_LINK_CHECKS]=no && y=$(render_homepage_services "$f") && [[ "$y" != *siteMonitor* ]] )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
