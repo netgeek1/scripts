@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.4.1"
+readonly SCRIPT_VERSION="3.4.2"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -1548,6 +1548,10 @@ EOF
                 [[ -n "$cp" ]] && printf '    ports:\n%s\n' "$cp"
             fi
             ;;
+        qbittorrent)
+            printf '    # qBittorrent: start-up script keeping localhost login bypass on (Gluetun port hook)\n'
+            printf '    volumes:\n      - ${FOLDER_FOR_DATA:?err}/%s:/custom-cont-init.d:ro\n' "$QBT_INIT_DIR_NAME"
+            ;;
         chromium)
             printf '    # Chromium behind Gluetun (CHROMIUM_VIA_VPN): it browses through the VPN; its port is published on gluetun\n'
             printf '    network_mode: "service:gluetun"\n    networks: !reset []\n    ports: !reset []\n'
@@ -1586,6 +1590,7 @@ active_patches() {   # upstream services this installer modifies
     if grep -qE '^  gluetun:[[:space:]]*$' "$compose" && ! is_removed gluetun \
         && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint || vpn_pf_on || chromium_via_vpn || svc_enabled statusboard; }; then echo gluetun; fi
     if grep -qE '^  chromium:[[:space:]]*$' "$compose" && grep -qE '^  gluetun:[[:space:]]*$' "$compose" && chromium_via_vpn; then echo chromium; fi
+    if grep -qE '^  qbittorrent:[[:space:]]*$' "$compose" && vpn_pf_qbt; then echo qbittorrent; fi
     if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale; then echo tailscale; fi
     return 0
 }
@@ -2383,6 +2388,54 @@ ensure_qbt_localhost() {
     rm -f "$tmp"
     docker start qbittorrent >/dev/null 2>&1 || true
     log_ok "qBittorrent: localhost login bypass on (Gluetun sets its listening port to the forwarded port)"
+}
+
+# qBittorrent start-up script (LinuxServer images run /custom-cont-init.d/* as root before the app starts): keeps
+# "no login from localhost" on, whatever reset it, so Gluetun's port hook can always reach the Web API.
+readonly QBT_INIT_DIR_NAME=qbittorrent-init
+render_qbt_init() {
+    cat <<'SH'
+#!/bin/sh
+# Managed by mediastack-installer -- runs before qBittorrent starts (LinuxServer custom-cont-init.d).
+# Gluetun's port-forwarding hook sets qBittorrent's listening port through the Web API on 127.0.0.1; that needs
+# "Bypass authentication for clients on localhost" (WebUI\LocalHostAuth=false). Logins from anywhere else are unchanged.
+f=/config/qBittorrent/qBittorrent.conf
+[ -f "$f" ] || exit 0
+if grep -q '^WebUI\\LocalHostAuth=' "$f"; then
+    sed -i 's/^WebUI\\LocalHostAuth=.*/WebUI\\LocalHostAuth=false/' "$f"
+elif grep -q '^\[Preferences\]' "$f"; then
+    sed -i '/^\[Preferences\]/a WebUI\\LocalHostAuth=false' "$f"
+else
+    printf '\n[Preferences]\nWebUI\\LocalHostAuth=false\n' >>"$f"
+fi
+echo "[mediastack] qBittorrent: localhost login bypass on (for Gluetun's port hook)"
+SH
+}
+
+write_qbt_init() {
+    local d="$FOLDER_FOR_DATA/$QBT_INIT_DIR_NAME" f tmp
+    (( DRY_RUN )) && return 0
+    if ! vpn_pf_qbt; then [[ -d "$d" ]] && rm -rf "$d"; return 0; fi
+    install -d -m 755 -o root -g root "$d"
+    f="$d/10-mediastack-localhost-auth"
+    tmp=$(mktemp); render_qbt_init >"$tmp"
+    cmp -s "$tmp" "$f" || install -m 755 -o root -g root "$tmp" "$f"
+    rm -f "$tmp"
+    # LinuxServer images skip start-up scripts that are not root-owned; the data folder's recursive chown runs before
+    chown -R root:root "$d"; chmod 755 "$d" "$f"
+}
+
+# pf_qbt_resync -- hand Gluetun's current forwarded port to qBittorrent now (the hook only runs when the port changes)
+pf_qbt_resync() {
+    vpn_pf_qbt && ! (( DRY_RUN )) || return 1
+    local port ifc qp
+    port=$(docker exec gluetun cat /tmp/gluetun/forwarded_port 2>/dev/null | head -n1 | tr -dc '0-9')
+    [[ -n "$port" ]] || { log_info "qBittorrent port: Gluetun has no forwarded port yet; its hook sets it when one arrives."; return 1; }
+    ifc=$(docker exec gluetun sh -c 'for i in tun0 wg0; do [ -e /sys/class/net/$i ] && echo $i && break; done' 2>/dev/null)
+    qp=$(env_get "$FOLDER_FOR_YAML/.env" WEBUI_PORT_QBITTORRENT 2>/dev/null || true)
+    [[ "$qp" =~ ^[0-9]+$ ]] || return 1
+    docker exec gluetun /bin/sh "/gluetun/$PF_SCRIPT" up "$port" "${ifc:-wg0}" "$qp" >/dev/null 2>&1 || return 1
+    log_ok "qBittorrent: listening port $port being set (result on the status board / status screen)"
 }
 
 cfg_vpn_pf() {
@@ -3716,6 +3769,7 @@ stack_apply() {
     write_statusboard_app
     write_ddns_custom_config
     write_pf_script
+    write_qbt_init
     cert_units
     requests_units
     report_dependencies die
@@ -3742,6 +3796,7 @@ stack_apply() {
     traefik_ensure_middlewares
     ensure_app_hostnames
     ensure_qbt_localhost
+    pf_qbt_resync || true
     guacamole_ensure_db
     statusboard_wire
     sync_heimdall
@@ -4696,7 +4751,7 @@ GLUETUN_DIR = E("GLUETUN_DIR", "/gluetun")
 DDNS_DIR = E("DDNS_DIR", "/ddns")
 DDNS = {k: E(k, "") for k in ("DDNS_PROVIDER", "DDNS_RECORDS", "DDNS_URL", "DOMAIN")}
 REQUEST_KEYS = {"vpn_filters": FILTER_KEYS, "gluetun_recreate": (), "ddns_records": ("DDNS_RECORDS",),
-                "vpn_endpoint": ENDPOINT_KEYS, "vpn_portforward": ("VPN_PORT_FORWARDING",)}
+                "vpn_endpoint": ENDPOINT_KEYS, "vpn_portforward": ("VPN_PORT_FORWARDING",), "pf_resync": ()}
 # values that need more than VALUE_OK allows (a WireGuard key has / + =); the installer validates every value again
 KEY_RE = {"VPN_ENDPOINT_IP": re.compile(r"^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$"),
           "VPN_ENDPOINT_PORT": re.compile(r"^([1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$"),
@@ -5320,7 +5375,8 @@ async function loadGL() {
     ${card("Forwarded port", esc(pf.port || (pf.ports && pf.ports[0]) || "none"), (pf.error ? '<span class="mut">' + esc(pf.error) + "</span>" : "") +
         (d.qbt && d.qbt.result ? (pf.error ? "<br>" : "") + dot(d.qbt.result === "ok" ? true : d.qbt.result === "pending" ? null : false) +
           esc("qBittorrent " + (d.qbt.result === "ok" ? "uses port " + d.qbt.port : d.qbt.result === "pending" ? "being set to " + d.qbt.port : "not set: " + (d.qbt.detail || ""))) +
-          '<div class="mut">' + esc(d.qbt.time ? new Date(d.qbt.time).toLocaleString() : "") + "</div>" : ""))}
+          '<div class="mut">' + esc(d.qbt.time ? new Date(d.qbt.time).toLocaleString() : "") + "</div>" +
+          (d.qbt.result !== "ok" && d.qbt.result !== "pending" ? '<div style="margin-top:6px">' + btn("Set qBittorrent's port now", 'id="pfresync"') + "</div>" : "") : ""))}
     ${card("Server list", c.VPN_SERVICE_PROVIDER === "custom" ? "—" : (d.servers && d.servers.timestamp ? esc(new Date(d.servers.timestamp * 1000).toLocaleString()) : "—"),
         c.VPN_SERVICE_PROVIDER === "custom" ? '<span class="mut">provider custom has no server list</span>' :
         (d.servers && d.servers.timestamp ? esc(d.servers.count + " servers") : '<span class="mut">' + esc((d.servers && d.servers.error) || "unknown") + "</span>") +
@@ -5353,6 +5409,7 @@ async function loadGL() {
     post("/api/gluetun/request", body, "Connect to this server? Gluetun and the apps behind it restart.").then(loadReqs); };
   const pt = $("#pftoggle"); if (pt) pt.onclick = () => post("/api/gluetun/request", {action: "vpn_portforward", VPN_PORT_FORWARDING: c.VPN_PORT_FORWARDING === "on" ? "off" : "on"},
     "Turn port forwarding " + (c.VPN_PORT_FORWARDING === "on" ? "off" : "on") + "? Gluetun and the apps behind it restart.").then(loadReqs);
+  const pr = $("#pfresync"); if (pr) pr.onclick = () => post("/api/gluetun/request", {action: "pf_resync"}).then(loadReqs);
   $("#recreate").onclick = () => post("/api/gluetun/request", {action: "gluetun_recreate"}, "Recreate Gluetun and the apps behind it?").then(loadReqs);
   loadReqs();
 }
@@ -5607,6 +5664,9 @@ process_requests() {
                 ( stack_apply nopull ) >>"$LOG_FILE" 2>&1 || rc=$?
                 if (( rc == 0 )); then req_result "$dir/$id.res" ok "Port forwarding $v; Gluetun recreated." "$action"
                 else req_result "$dir/$id.res" error "Apply failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
+            pf_resync)
+                if pf_qbt_resync >>"$LOG_FILE" 2>&1; then req_result "$dir/$id.res" ok "qBittorrent is being set to Gluetun's forwarded port; the card shows the result." "$action"
+                else req_result "$dir/$id.res" error "Nothing to send: port forwarding or the qBittorrent hook is off, or Gluetun has no port yet." "$action"; fi ;;
             gluetun_recreate)
                 { compose_run up -d --force-recreate gluetun && compose_run up -d --remove-orphans; } >>"$LOG_FILE" 2>&1 || rc=$?
                 if (( rc == 0 )); then req_result "$dir/$id.res" ok "Gluetun and the apps behind it were recreated." "$action"
@@ -7435,6 +7495,7 @@ services:
       - mediastack
 FIX
     st "Chromium through the VPN"           '( st_prep internet jellyfin tailscale full; CFG[FOLDER_FOR_YAML]=$t/cv; FOLDER_FOR_YAML=$t/cv; o=$(render_override "$t/cv/docker-compose.yaml"); c=$(awk "/^  chromium:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o"); g=$(awk "/^  gluetun:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o"); [[ "$c" == *"network_mode: \"service:gluetun\""* && "$c" == *"networks: !reset []"* && "$c" == *"ports: !reset []"* ]] && [[ "$(tail -n 1 <<<"$g")" == "      - \${WEBUI_PORT_CHROMIUM:?err}:\${WEBUI_PORT_CHROMIUM:?err}" && "$(tail -n 2 <<<"$g" | head -n 1)" == "    ports:" ]] && CFG[CHROMIUM_VIA_VPN]=no && o=$(render_override "$t/cv/docker-compose.yaml") && [[ "$o" != *"  chromium:"* && "$o" != *WEBUI_PORT_CHROMIUM* ]] )'
+    st "qBittorrent start-up script"        '( mkdir -p $t/qi/config/qBittorrent; render_qbt_init | sed "s|/config/|$t/qi/config/|" >$t/qi/s.sh; f=$t/qi/config/qBittorrent/qBittorrent.conf; ok=1; for c in "[Preferences]\nWebUI\\\\LocalHostAuth=true\nWebUI\\\\Port=8200\n" "[BitTorrent]\nx=1\n[Preferences]\nWebUI\\\\Port=8200\n" "[BitTorrent]\nx=1\n"; do printf "$c" >$f; sh $t/qi/s.sh >/dev/null; sh $t/qi/s.sh >/dev/null; [[ $(grep -c "^WebUI\\\\LocalHostAuth=false$" $f) == 1 && $(grep -c "LocalHostAuth" $f) == 1 ]] || ok=0; awk "/^\\[Preferences\\]/{p=1;next} /^\\[/{p=0} p&&/LocalHostAuth=false/{found=1} END{exit !found}" $f || ok=0; done; (( ok )) && st_prep internet jellyfin tailscale core && CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=protonvpn && CFG[VPN_PORT_FORWARDING]=on && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"/qbittorrent-init:/custom-cont-init.d:ro"* ]] && CFG[VPN_PF_QBITTORRENT]=no && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *custom-cont-init* ]] )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
