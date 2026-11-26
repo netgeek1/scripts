@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.5.0"
+readonly SCRIPT_VERSION="3.6.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -124,7 +124,8 @@ SECRET_KEYS=( VPN_USERNAME VPN_PASSWORD PLEX_CLAIM CLOUDFLARE_DNS_API_TOKEN EMAI
               HEADPLANE_COOKIE_SECRET SONARR_API_TOKEN RADARR_API_TOKEN LIDARR_API_TOKEN READARR_API_TOKEN
               WHISPARR_API_TOKEN MYLAR_API_TOKEN MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD SECRET_ENCRYPTION_KEY
               TLS_KEY_PASSPHRASE UPDATER_PROTONVPN_PASSWORD CROWDSEC_BOUNCER_KEY AUTHENTIK_BOOTSTRAP_PASSWORD
-              STATUSBOARD_GLUETUN_KEY CROWDSEC_STATUSBOARD_PASSWORD HOMARR_API_KEY HEADSCALE_API_KEY )
+              STATUSBOARD_GLUETUN_KEY CROWDSEC_STATUSBOARD_PASSWORD HOMARR_API_KEY HEADSCALE_API_KEY
+              STATUSBOARD_HEADSCALE_KEY )
 # Vault entries that are not .env variables
 SECRET_NON_ENV=( HEADPLANE_COOKIE_SECRET MEDIA_SMB_USERNAME MEDIA_SMB_PASSWORD TLS_KEY_PASSPHRASE HOMARR_API_KEY HEADSCALE_API_KEY )
 SECRET_PROMPTED=( VPN_USERNAME VPN_PASSWORD CLOUDFLARE_DNS_API_TOKEN TAILSCALE_AUTHKEY EMAIL_PASSWORD PLEX_CLAIM )
@@ -1152,6 +1153,10 @@ render_env() {
     env_set "$envf" MS_DDNS_PROVIDER "${CFG[DDNS_PROVIDER]:-none}"
     env_set "$envf" MS_DDNS_RECORDS "${CFG[DDNS_RECORDS]}"
     env_set "$envf" MS_DDNS_URL "$(ddns_ui_url)"
+    # status board: which tabs (Tailscale node / Headscale server) and Headplane's address
+    env_set "$envf" MS_TS_ENABLED "$(svc_enabled tailscale && echo yes || echo no)"
+    env_set "$envf" MS_HS_ENABLED "$(svc_enabled headscale && echo yes || echo no)"
+    env_set "$envf" MS_HEADPLANE_URL "$(svc_enabled headplane && headplane_url || true)"
     # status board: VPN endpoint (custom) and port forwarding
     env_set "$envf" MS_VPN_ENDPOINT_IP "${CFG[VPN_ENDPOINT_IP]:-}"
     env_set "$envf" MS_VPN_ENDPOINT_PORT "${CFG[VPN_ENDPOINT_PORT]:-}"
@@ -1419,6 +1424,11 @@ render_addon() {   # render_addon NAME -> service body (4-space indented, no key
       - VPN_PORT_FORWARDING_PROVIDER=${MS_VPN_PORT_FORWARDING_PROVIDER:-}
       - VPN_PF_CAPABLE=${MS_VPN_PF_CAPABLE:-no}
       - VPN_UPDATER=${MS_VPN_UPDATER:-off}
+      - TS_ENABLED=${MS_TS_ENABLED:-yes}
+      - HS_ENABLED=${MS_HS_ENABLED:-no}
+      - HEADSCALE_URL=http://headscale:8080
+      - HEADSCALE_API_KEY=${STATUSBOARD_HEADSCALE_KEY:-}
+      - HEADPLANE_URL=${MS_HEADPLANE_URL:-}
       - TRUSTED_PROXY_HOST=traefik
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)"]
@@ -3810,6 +3820,7 @@ stack_apply() {
     sync_heimdall
     sync_homarr
     headscale_ensure_api_key
+    statusboard_headscale_key
     headscale_join_tailscale
     log_info "URLs, ports and DNS names: menu L, or sudo $MS_INSTALL_BIN --urls"
     if [[ "${CFG[CERT_MODE]}" != letsencrypt ]] && svc_enabled traefik && [[ ! "$(tls_ensure_live)" =~ ^(yes|n/a)$ ]]; then
@@ -4758,6 +4769,10 @@ ENDPOINT_KEYS = ("VPN_ENDPOINT_IP", "VPN_ENDPOINT_PORT", "WIREGUARD_PUBLIC_KEY")
 CONFIG = {k: E(k, "") for k in ("VPN_SERVICE_PROVIDER", "VPN_TYPE", "DOMAIN", "VPN_PORT_FORWARDING",
                                 "VPN_PORT_FORWARDING_PROVIDER", "VPN_PF_CAPABLE", "VPN_UPDATER") + FILTER_KEYS + ENDPOINT_KEYS}
 GLUETUN_DIR = E("GLUETUN_DIR", "/gluetun")
+HEADSCALE_URL = E("HEADSCALE_URL", "http://headscale:8080").rstrip("/")
+HEADSCALE_KEY = E("HEADSCALE_API_KEY", "")
+FEATURES = {"tailscale": E("TS_ENABLED", "yes") == "yes", "headscale": E("HS_ENABLED", "no") == "yes",
+            "headplane_url": E("HEADPLANE_URL", "")}
 DDNS_DIR = E("DDNS_DIR", "/ddns")
 DDNS = {k: E(k, "") for k in ("DDNS_PROVIDER", "DDNS_RECORDS", "DDNS_URL", "DOMAIN")}
 REQUEST_KEYS = {"vpn_filters": FILTER_KEYS, "gluetun_recreate": (), "ddns_records": ("DDNS_RECORDS",),
@@ -4919,6 +4934,39 @@ def gluetun_status():
             out[key] = gl("GET", path)
         except APIError as e:
             out[key] = {"error": str(e)}
+    return out
+
+
+# ---------------------------------------------------------------- Headscale (read-only; changes are made in Headplane)
+def hs(path):
+    if not HEADSCALE_KEY:
+        raise APIError("no Headscale API key for the status board yet (Apply creates one once Headscale runs)")
+    return http_json("GET", HEADSCALE_URL + path, {"Authorization": "Bearer " + HEADSCALE_KEY})
+
+
+def headscale_status():
+    out = {"headplane_url": FEATURES["headplane_url"]}
+    try:
+        out["health"] = hs("/api/v1/health") or {}
+    except APIError as e:
+        out["health"] = {"error": str(e)}
+    try:
+        users = {str(u.get("id")): u for u in (hs("/api/v1/user") or {}).get("users", [])}
+        out["users"] = [{"id": u.get("id"), "name": u.get("name"), "display": u.get("displayName", ""),
+                         "email": u.get("email", ""), "created": u.get("createdAt", "")} for u in users.values()]
+    except APIError as e:
+        out["users_error"] = str(e)
+    try:
+        nodes = (hs("/api/v1/node") or {}).get("nodes", [])
+        out["nodes"] = [{
+            "id": n.get("id"), "name": n.get("givenName") or n.get("name"), "host": n.get("name"),
+            "user": (n.get("user") or {}).get("name", ""), "ips": n.get("ipAddresses") or [],
+            "online": bool(n.get("online")), "last_seen": n.get("lastSeen", ""), "expiry": n.get("expiry", ""),
+            "created": n.get("createdAt", ""), "approved": n.get("approvedRoutes") or [],
+            "available": n.get("availableRoutes") or [], "tags": n.get("tags") or [],
+            "method": (n.get("registerMethod") or "").replace("REGISTER_METHOD_", "").lower()} for n in nodes]
+    except APIError as e:
+        out["nodes_error"] = str(e)
     return out
 
 
@@ -5186,7 +5234,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, f.read(), "text/html; charset=utf-8")
         routes = {
             "/api/health": lambda: "ok",
-            "/api/whoami": lambda: {"user": self._user(), "can_act": self._can_act()},
+            "/api/whoami": lambda: {"user": self._user(), "can_act": self._can_act(), "features": FEATURES},
+            "/api/headscale": headscale_status,
             "/api/tailscale": tailscale_status,
             "/api/gluetun": gluetun_status,
             "/api/crowdsec": crowdsec_status,
@@ -5275,11 +5324,12 @@ details { margin:10px 0 } details > summary { cursor:pointer; font-weight:600; p
 <body>
 <header>
   <h1>MediaStack Status</h1>
-  <nav><button data-t="ts" class="on">Tailscale</button><button data-t="gl">Gluetun VPN</button><button data-t="cs">CrowdSec</button><button data-t="dd">DDNS</button></nav>
+  <nav><button data-t="ts" class="on">Tailscale</button><button data-t="hs" hidden>Headscale</button><button data-t="gl">Gluetun VPN</button><button data-t="cs">CrowdSec</button><button data-t="dd">DDNS</button></nav>
   <span class="sp"></span><span id="who"></span>
 </header>
 <main>
   <section id="ts" class="on"></section>
+  <section id="hs"></section>
   <section id="gl"></section>
   <section id="cs"></section>
   <section id="dd"></section>
@@ -5372,6 +5422,33 @@ async function loadTS() {
     const r = await post("/api/tailscale/ping", {ip: b.dataset.ping}); b.disabled = false; b.textContent = "Ping";
     if (r && r.ok) { const x = r.data || {}; toast(x.Err ? x.Err : `${b.dataset.ping}: ${(x.LatencySeconds * 1000).toFixed(1)} ms ${x.Endpoint ? "direct " + x.Endpoint : "via DERP " + (x.DERPRegionCode || "")}`, !!x.Err); }
   });
+}
+
+// Headscale: read-only overview; users, nodes, routes and keys are managed in Headplane
+const until = t => { if (!t || t.startsWith("0001-")) return "never"; const ms = Date.parse(t) - Date.now(); return ms < 0 ? "expired " + ago(t) : "in " + ago(new Date(Date.now() - ms).toISOString()).replace(/ ago$/, ""); };
+async function loadHS() {
+  const j = await get("/api/headscale"); const el = $("#hs");
+  if (!j.ok) { el.innerHTML = fail(j.error); return; }
+  const d = j.data, h = d.health || {}, nodes = d.nodes || [], users = d.users || [];
+  const pending = n => n.available.filter(r => !n.approved.includes(r));
+  const waiting = nodes.filter(n => pending(n).length);
+  el.innerHTML = `<div class="grid">
+    ${card("Headscale", dot(h.error ? false : h.databaseConnectivity !== false) + (h.error ? "unreachable" : "running"), h.error ? '<span class="err">' + esc(h.error) + "</span>" : "database " + (h.databaseConnectivity === false ? "not connected" : "connected"))}
+    ${card("Nodes", esc(nodes.filter(n => n.online).length + " / " + nodes.length), "online / registered")}
+    ${card("Users", esc(users.length), esc(users.map(u => u.name).join(", ")))}
+    ${card("Routes waiting for approval", esc(waiting.reduce((a, n) => a + pending(n).length, 0)), waiting.length ? esc(waiting.map(n => n.name).join(", ")) : "none")}
+  </div>
+  <div class="row"><span class="mut">Add users, approve routes, expire or remove nodes and create keys in Headplane:</span>
+    ${d.headplane_url ? `<a href="${esc(d.headplane_url)}" target="_blank" rel="noopener">${esc(d.headplane_url)}</a>` : '<span class="mut">Headplane is not enabled</span>'}</div>
+  <h2>Nodes (${nodes.length}, ${nodes.filter(n => n.online).length} online)</h2>
+  ${d.nodes_error ? fail(d.nodes_error) : nodes.length ? `<table><tr><th>Node</th><th>User</th><th>IP</th><th>Routes</th><th>Last seen</th><th>Key expires</th></tr>
+  ${nodes.map(n => `<tr><td>${dot(n.online)}${esc(n.name)}${n.name !== n.host ? ` <span class="mut">(${esc(n.host)})</span>` : ""}${n.tags.map(t => ' <span class="tag">' + esc(t) + "</span>").join("")}</td>
+    <td>${esc(n.user)}</td><td><code>${esc(n.ips[0] || "")}</code>${n.ips[1] ? '<div class="mut">' + esc(n.ips[1]) + "</div>" : ""}</td>
+    <td>${n.approved.length ? esc(n.approved.join(", ")) : '<span class="mut">none</span>'}${pending(n).length ? '<div class="err">waiting: ' + esc(pending(n).join(", ")) + "</div>" : ""}</td>
+    <td class="mut">${n.online ? "online" : esc(ago(n.last_seen) || "never")}</td><td class="mut">${esc(until(n.expiry))}</td></tr>`).join("")}</table>` : '<div class="card mut">No nodes yet.</div>'}
+  <h2>Users (${users.length})</h2>
+  ${d.users_error ? fail(d.users_error) : users.length ? `<table><tr><th>Name</th><th>Display name</th><th>Email</th><th>Nodes</th><th>Created</th></tr>
+  ${users.map(u => `<tr><td>${esc(u.name)}</td><td>${esc(u.display)}</td><td>${esc(u.email)}</td><td>${esc(nodes.filter(n => n.user === u.name).length)}</td><td class="mut">${esc(ago(u.created))}</td></tr>`).join("")}</table>` : '<div class="card mut">No users.</div>'}`;
 }
 
 async function loadGL() {
@@ -5498,7 +5575,7 @@ async function loadDD() {
   loadReqs();
 }
 
-const loaders = {ts: loadTS, gl: loadGL, cs: loadCS, dd: loadDD};
+const loaders = {ts: loadTS, hs: loadHS, gl: loadGL, cs: loadCS, dd: loadDD};
 function show(t) { TAB = t; document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.t === t));
   document.querySelectorAll("section").forEach(s => s.classList.toggle("on", s.id === t)); try { localStorage.setItem("tab", t); } catch (e) {} refresh(); }
 async function refresh() { const el = $("#" + TAB); if (!el.innerHTML) el.innerHTML = '<div class="mut">Loading…</div>';
@@ -5507,7 +5584,12 @@ async function refresh() { const el = $("#" + TAB); if (!el.innerHTML) el.innerH
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => show(b.dataset.t));
 get("/api/whoami").then(j => { CAN = !!(j.ok && j.data.can_act); const u = j.ok ? j.data.user : "";
   $("#who").textContent = u ? u + (CAN ? "" : " (read-only)") : CAN ? "changes enabled on the LAN port" : "read-only: open https://status.<domain> to make changes";
-  let t = "ts"; try { t = localStorage.getItem("tab") || "ts"; } catch (e) {} show(loaders[t] ? t : "ts"); });
+  // tabs for what is installed: Tailscale (the node container), Headscale (the control server), or both
+  const f = (j.ok && j.data.features) || {tailscale: true};
+  const tabOn = {ts: f.tailscale !== false, hs: !!f.headscale};
+  document.querySelectorAll("nav button").forEach(b => { if (b.dataset.t in tabOn) b.hidden = !tabOn[b.dataset.t]; });
+  const avail = [...document.querySelectorAll("nav button")].filter(b => !b.hidden).map(b => b.dataset.t);
+  let t = avail[0]; try { const saved = localStorage.getItem("tab"); if (avail.includes(saved)) t = saved; } catch (e) {} show(t); });
 setInterval(refresh, 10000);
 </script>
 </body>
@@ -5952,14 +6034,27 @@ headscale_wait() {
     return 1
 }
 
-# headscale_new_api_key -- creates a key and stores it in the vault (prints nothing); rc 1 if Headscale can't
+# headscale_new_api_key [VAULT_KEY] -- creates a Headscale API key and stores it in the vault under VAULT_KEY
+#   (default HEADSCALE_API_KEY, the Headplane sign-in key); prints nothing; rc 1 if Headscale can't
 headscale_new_api_key() {
-    local out k
+    local vk=${1:-HEADSCALE_API_KEY} out k
     out=$(docker exec headscale headscale apikeys create --expiration "$HEADSCALE_KEY_EXPIRY" 2>/dev/null) || return 1
     k=$(printf '%s\n' "$out" | awk 'NF {l = $NF} END {print l}')
     [[ "$k" =~ ^[A-Za-z0-9._-]{20,}$ ]] || return 1
-    SECRETS[HEADSCALE_API_KEY]=$k; save_secrets
-    _log_file INFO "Headscale API key created (expires in $HEADSCALE_KEY_EXPIRY); stored in the vault"
+    SECRETS[$vk]=$k; save_secrets
+    _log_file INFO "Headscale API key created for $vk (expires in $HEADSCALE_KEY_EXPIRY); stored in the vault"
+}
+
+# statusboard_headscale_key -- the board's own read key (separate from the Headplane sign-in key, so either can be
+# revoked alone); the board is recreated once so it gets the key
+statusboard_headscale_key() {
+    svc_enabled headscale && svc_enabled statusboard || return 0
+    (( DRY_RUN )) && return 0
+    secret_is_set STATUSBOARD_HEADSCALE_KEY && return 0
+    headscale_wait 60 || { log_info "Status board: Headscale tab gets its key on the next Apply (Headscale not answering yet)."; return 0; }
+    headscale_new_api_key STATUSBOARD_HEADSCALE_KEY || { log_warn "Status board: Headscale did not create a key for the Headscale tab."; return 0; }
+    compose_run up -d --no-deps statusboard >>"$LOG_FILE" 2>&1 || true
+    log_ok "Status board: Headscale tab connected (own API key, valid $HEADSCALE_KEY_EXPIRY)"
 }
 
 headplane_url() {
