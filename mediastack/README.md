@@ -747,9 +747,10 @@ without. Both are changed from a throwaway `python:3.13-alpine` container, so th
   `[MediaStack]`, which marks them as managed. Placing them on a board is up to you (Homarr boards are free-form
   layouts). Apps you created yourself are never changed.
 
-### Status board (Tailscale, Gluetun, CrowdSec, DDNS)
+### Status board (Tailscale, Headscale, Gluetun, CrowdSec, DDNS)
 
-An add-on included in the Core preset: one page with four tabs, at **`https://status.<domain>`** (Authentik
+An add-on included in the Core preset: one page with up to five tabs (Tailscale and Headscale each appear when
+that service is on), at **`https://status.<domain>`** (Authentik
 sign-in) or **`http://<host-ip>:13380`** (read-only). Its Python source is embedded in the installer and written to
 `<data>/statusboard/app` on every apply. It runs in a stock `python:3.13-alpine` container (read-only filesystem,
 no capabilities, **no Docker socket**) and uses each tool's own API:
@@ -757,6 +758,7 @@ no capabilities, **no Docker socket**) and uses each tool's own API:
 | Tab | Shows | Can do | Through |
 |---|---|---|---|
 | **Tailscale** | state, tailnet, this node, advertised routes/exit node, home relay; every peer with online state, IP, OS, direct/relay connection, traffic, last seen | ping a peer; a link to **Tailscale's own web interface** (`http://<tailscale-ip>:5252`, enabled by Apply) for exit node, routes and SSH changes | LocalAPI over the `tailscaled` socket (shared `<data>/tailscale/run`, read-only mount) |
+| **Headscale** | health, nodes (online, user, IPs, approved routes and routes **waiting for approval**, last seen, key expiry, tags), users | read-only; a link to **Headplane** for users, routes, nodes and keys | Headscale's REST API with the board's own API key (`STATUSBOARD_HEADSCALE_KEY`, created by Apply, separate from the Headplane sign-in key so either can be revoked alone) |
 | **Gluetun VPN** | VPN state, provider/type, public IP and location, forwarded port, when the server list was last updated (and how many servers) | restart / stop / start the VPN, update the server list now; **change the server selection** (countries, cities, hostnames, regions), or for provider `custom` WireGuard the **server endpoint** (IP, port, public key); **port forwarding on/off**; recreate Gluetun | control server with a generated API key (`HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE`) |
 | **DDNS** | provider, records, last update and current IP per record (from DDNS-Updater's `updates.json`), a link to its page | **change the records** (Cloudflare provider) | DDNS-Updater's data folder, read-only |
 | **CrowdSec** | metrics (alerts, log lines read and parsed, bouncer requests); active decisions counted by origin: your detections (`crowdsec`), manual bans (`cscli`), the community blocklist (`CAPI`) and subscribed lists, your own listed in full, the community ones folded away; an "Is an IP blocked?" lookup; recent alerts | ban an IP or range (duration, reason), unban | LAPI: the Traefik bouncer key for decisions, a `statusboard` machine login (registered by Apply) for alerts/ban/unban; metrics on :6060 |
