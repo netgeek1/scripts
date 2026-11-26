@@ -3,6 +3,17 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.6.0 — 2026-11-26 — Headscale tab on the status board
+
+### Added
+- **Status board, Headscale tab** (when Headscale is on): health and database state; nodes with online state, user,
+  IPs, approved routes and routes waiting for approval (highlighted), last seen, key expiry and tags; users with
+  their node count; a link to Headplane for changes. Read-only, through Headscale's REST API (0.29) with the board's
+  own API key `STATUSBOARD_HEADSCALE_KEY`, which Apply creates once Headscale runs (separate from the Headplane
+  sign-in key, so either can be revoked alone).
+- Tabs follow what is installed: the Tailscale tab only when the Tailscale container is on, the Headscale tab only
+  when Headscale is on, both when both are; the board opens on the first available tab.
+
 ## v3.5.0 — 2026-11-26 — Containers one at a time, numbered service lists
 
 ### Added
