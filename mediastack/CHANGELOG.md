@@ -3,6 +3,19 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.8.0 — 2026-11-26 — Automatic updates
+
+### Added
+- **Automatic updates** (main menu **A**, `--auto-update`): `AUTO_UPDATE` off / daily / weekly at
+  `AUTO_UPDATE_TIME` (`AUTO_UPDATE_DAY` for weekly). The `mediastack-update.timer` runs Apply with pull, so only
+  containers with a new image are recreated and the managed override, patches and Gluetun's app order stay intact.
+  - `AUTO_UPDATE_EXCLUDE`: services that keep their current image (picked from the numbered service list).
+  - `AUTO_UPDATE_PRUNE` (default `yes`): unused old images removed after each update.
+  - Waits for a menu session or Apply; skipped and recorded after 30 minutes.
+  - Last result (time, ok / failed / skipped, updated images, duration, space freed) in the menu and on the status
+    screen; each run logs to `update-*.log`.
+- Self-test: 106 checks.
+
 ## v3.7.1 — 2026-11-26 — Quiet wait for Traefik's API
 
 ### Fixed
