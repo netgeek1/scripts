@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.4.0"
+readonly SCRIPT_VERSION="3.4.1"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -4900,7 +4900,7 @@ def cs_machine(method, path, body=None):
 
 
 METRIC_NAMES = {
-    "cs_active_decisions": "Active decisions",
+    # cs_active_decisions is left out: it counts per scenario/origin label and disagrees with the decision list below
     "cs_alerts": "Alerts (since start)",
     "cs_lapi_bouncer_requests_total": "Bouncer requests to LAPI",
     "cs_filesource_hits_total": "Log lines read",
@@ -4927,13 +4927,34 @@ def cs_metrics():
     return {METRIC_NAMES[k]: int(v) for k, v in sums.items()}
 
 
+BULK_ORIGINS = ("CAPI", "lists")      # community blocklist / subscribed lists: thousands of IPs that never visited
+
+
+def _decision(x):
+    return {"id": x.get("id"), "type": x.get("type"), "scope": x.get("scope"), "value": x.get("value"),
+            "duration": x.get("duration"), "origin": x.get("origin"), "scenario": x.get("scenario")}
+
+
+def crowdsec_decisions_search(ip):
+    """Every active decision that covers IP (single address or one inside a banned range)."""
+    ipaddress.ip_address(ip)                                   # ValueError -> 400
+    d = http_json("GET", CS_LAPI + "/v1/decisions?ip=" + ip, {"X-Api-Key": CS_BOUNCER_KEY})
+    return [_decision(x) for x in (d or [])]
+
+
 def crowdsec_status():
     out = {}
     try:
-        d = http_json("GET", CS_LAPI + "/v1/decisions", {"X-Api-Key": CS_BOUNCER_KEY})
-        out["decisions"] = [{"id": x.get("id"), "type": x.get("type"), "scope": x.get("scope"), "value": x.get("value"),
-                             "duration": x.get("duration"), "origin": x.get("origin"), "scenario": x.get("scenario")}
-                            for x in (d or [])][:500]
+        d = http_json("GET", CS_LAPI + "/v1/decisions", {"X-Api-Key": CS_BOUNCER_KEY}, timeout=20) or []
+        counts, own, bulk = {}, [], []
+        for x in d:
+            o = x.get("origin") or "?"
+            counts[o] = counts.get(o, 0) + 1
+            (bulk if o in BULK_ORIGINS else own).append(x)
+        out["decision_counts"] = counts
+        out["decision_total"] = len(d)
+        out["decisions"] = [_decision(x) for x in own[:1000]]          # your detections + manual bans: all
+        out["decisions_bulk_sample"] = [_decision(x) for x in bulk[:100]]
     except APIError as e:
         out["decisions_error"] = str(e)
     try:
@@ -5104,6 +5125,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/tailscale": tailscale_status,
             "/api/gluetun": gluetun_status,
             "/api/crowdsec": crowdsec_status,
+            "/api/crowdsec/search": lambda: crowdsec_decisions_search(
+                (self.path.split("?", 1) + [""])[1].partition("ip=")[2].split("&")[0][:64]),
             "/api/ddns": ddns_status,
             "/api/requests": list_requests,
         }
@@ -5175,6 +5198,7 @@ button.act { border:1px solid var(--line); background:var(--card); color:var(--f
 button.act:hover { border-color:var(--acc) } button.act.danger:hover { border-color:var(--bad); color:var(--bad) } button:disabled { opacity:.45; cursor:not-allowed }
 input { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:inherit; min-width:0 }
 .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0 } a { color:var(--acc) } code { font-size:12px }
+details { margin:10px 0 } details > summary { cursor:pointer; font-weight:600; padding:6px 0 } details > .mut { margin:4px 0 8px }
 #toast { position:fixed; right:16px; bottom:16px; max-width:440px; background:var(--card); border:1px solid var(--line); border-left:4px solid var(--acc); border-radius:10px; padding:10px 14px; display:none; box-shadow:0 6px 24px rgba(0,0,0,.18); z-index:10 }
 #toast.ok { border-left-color:var(--ok) } #toast.bad { border-left-color:var(--bad) } #toast .t { font-weight:600; margin-bottom:2px }
 .spin { display:inline-block; width:.9em; height:.9em; border:2px solid var(--line); border-top-color:var(--acc); border-radius:50%; animation:spin .8s linear infinite; vertical-align:-2px; margin-right:6px }
@@ -5340,6 +5364,18 @@ async function loadReqs() {
     <td>${esc(r.state)}</td><td>${r.status ? dot(r.status === "ok") + esc(r.message || r.status) : ""}<div class="mut">${esc(r.finished || "")}</div></td></tr>`).join("")}</table>` : "none yet";
 }
 
+const ORIGIN = {crowdsec: ["Your detections", "caught on this server by a CrowdSec scenario"], cscli: ["Manual bans", "banned by hand (board or cscli)"],
+  CAPI: ["Community blocklist", "reported by other CrowdSec users"], lists: ["Subscribed lists", "blocklists from the CrowdSec console"],
+  console: ["Console", "added in the CrowdSec console"], appsec: ["AppSec", "blocked by the web application firewall"]};
+// Go duration (e.g. 167h59m3.5s) -> "6d 23h"
+function dur(g) {
+  const m = /^(-)?(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?/.exec(g || ""); if (!m || m[1]) return g || "";
+  const t = (+m[2] || 0) * 3600 + (+m[3] || 0) * 60 + Math.floor(+m[4] || 0), d = Math.floor(t / 86400), h = Math.floor(t % 86400 / 3600), mi = Math.floor(t % 3600 / 60);
+  return d ? d + "d " + h + "h" : h ? h + "h " + mi + "m" : mi ? mi + "m" : t + "s";
+}
+const decTable = rows => `<table><tr><th>IP / range</th><th>Type</th><th>Origin</th><th>Why (scenario)</th><th>Expires in</th><th></th></tr>
+  ${rows.map(x => `<tr><td><code>${esc(x.value)}</code> <span class="mut">${esc(x.scope)}</span></td><td>${esc(x.type)}</td><td>${esc(ORIGIN[x.origin] ? ORIGIN[x.origin][0] : x.origin)}</td>
+  <td>${esc(x.scenario)}</td><td class="mut" title="${esc(x.duration)}">${esc(dur(x.duration))}</td><td>${btn("Unban", `data-unban="${esc(x.value)}"`)}</td></tr>`).join("")}</table>`;
 async function loadCS() {
   const j = await get("/api/crowdsec"); const el = $("#cs");
   if (!j.ok) { el.innerHTML = fail(j.error); return; }
@@ -5348,14 +5384,26 @@ async function loadCS() {
   <h2>Ban an IP or range</h2>
   <div class="row"><input id="bip" placeholder="203.0.113.7 or 203.0.113.0/24" style="width:240px"><input id="bdur" value="4h" style="width:70px" title="e.g. 30m, 4h, 7d">
     <input id="breason" placeholder="reason" style="flex:1;min-width:140px">${btn("Ban", 'id="ban"', true)}</div>
-  <h2>Active decisions (${(d.decisions || []).length})</h2>
-  ${d.decisions_error ? fail(d.decisions_error) : (d.decisions || []).length ? `<table><tr><th>Value</th><th>Type</th><th>Origin</th><th>Scenario</th><th>Expires in</th><th></th></tr>
-    ${d.decisions.map(x => `<tr><td><code>${esc(x.value)}</code> <span class="mut">${esc(x.scope)}</span></td><td>${esc(x.type)}</td><td>${esc(x.origin)}</td>
-    <td>${esc(x.scenario)}</td><td class="mut">${esc(x.duration)}</td><td>${btn("Unban", `data-unban="${esc(x.value)}"`)}</td></tr>`).join("")}</table>` : '<div class="card mut">No active decisions.</div>'}
+  <h2>Active decisions (${esc((d.decision_total || 0).toLocaleString())})</h2>
+  ${d.decisions_error ? fail(d.decisions_error) : `
+  <div class="mut">IPs and ranges the Traefik bouncer currently refuses (HTTP 403 on every site). Each row is one block.</div>
+  <div class="grid">${Object.entries(d.decision_counts || {}).sort((a, b) => b[1] - a[1]).map(([o, n]) => card(ORIGIN[o] ? ORIGIN[o][0] : o, esc(n.toLocaleString()), ORIGIN[o] ? esc(ORIGIN[o][1]) : "origin " + esc(o))).join("") || card("Blocks", "0", "nothing blocked right now")}</div>
+  <div class="row"><input id="csq" placeholder="Is an IP blocked? e.g. 198.51.100.4" style="width:280px">${'<button class="act" id="csfind">Look up</button>'}<span id="csres" class="mut"></span></div>
+  <h2>Your detections and manual bans (${esc((d.decisions || []).length)})</h2>
+  ${(d.decisions || []).length ? decTable(d.decisions) : '<div class="card mut">None: no address has triggered a scenario on your server, and nothing was banned by hand.</div>'}
+  ${(d.decisions_bulk_sample || []).length ? `<details><summary>Community and list blocks: ${esc(((d.decision_counts || {}).CAPI || 0) + ((d.decision_counts || {}).lists || 0))} (first ${d.decisions_bulk_sample.length} shown)</summary>
+    <div class="mut">Addresses other CrowdSec users reported, downloaded automatically. Most never contacted your server; unbanning one only lasts until the next download.</div>
+    ${decTable(d.decisions_bulk_sample)}</details>` : ""}`}
   <h2>Recent alerts</h2>
   ${d.alerts_error ? fail(d.alerts_error) : (d.alerts || []).length ? `<table><tr><th>When</th><th>Scenario</th><th>Source</th><th>Events</th><th>Decisions</th></tr>
     ${d.alerts.map(a => `<tr><td class="mut">${esc(ago(a.created) || a.created)}</td><td>${esc(a.scenario)}</td><td><code>${esc(a.source)}</code> ${esc(a.country)}</td>
     <td>${esc(a.events)}</td><td>${esc(a.decisions)}</td></tr>`).join("")}</table>` : '<div class="card mut">No alerts.</div>'}`;
+  const fq = $("#csfind"); if (fq) fq.onclick = async () => {
+    const ip = $("#csq").value.trim(), r = $("#csres"); if (!ip) return; r.textContent = " looking up…";
+    const j = await get("/api/crowdsec/search?ip=" + encodeURIComponent(ip));
+    r.innerHTML = !j.ok ? ' <span class="err">' + esc(j.error) + "</span>" : !j.data.length ? " " + dot(true) + esc(ip + " is not blocked")
+      : " " + dot(false) + esc(ip + " is blocked: ") + j.data.map(x => esc((ORIGIN[x.origin] ? ORIGIN[x.origin][0] : x.origin) + " · " + x.scenario + " · " + dur(x.duration) + " left" + (x.value !== ip ? " (range " + x.value + ")" : ""))).join("; ");
+  };
   const b = $("#ban"); if (b) b.onclick = () => post("/api/crowdsec/ban", {ip: $("#bip").value, duration: $("#bdur").value, reason: $("#breason").value},
       "Ban " + $("#bip").value + " for " + $("#bdur").value + "?").then(loadCS);
   el.querySelectorAll("[data-unban]").forEach(x => x.onclick = () => post("/api/crowdsec/unban", {ip: x.dataset.unban}, "Unban " + x.dataset.unban + "?").then(loadCS));
