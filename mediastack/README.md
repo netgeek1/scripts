@@ -535,7 +535,7 @@ talk to other containers (PostgreSQL, Valkey, Unpackerr, guacd), or are dashboar
 - **qBittorrent:** Gluetun runs `<data>/gluetun/mediastack-pf-qbittorrent.sh` (written by Apply) whenever the
   forwarded port changes, which sets qBittorrent's listening port through its Web API on `127.0.0.1`. qBittorrent
   shares Gluetun's network, so Apply turns on qBittorrent's "Bypass authentication for clients on localhost"
-  (`WebUI\LocalHostAuth=false`), and a start-up script (`<data>/qbittorrent-init/`, run by the LinuxServer image
+  (`LocalHostAuth=false` in `[WebUI]`; older versions: `WebUI\LocalHostAuth=false` in `[Preferences]`), and a start-up script (`<data>/qbittorrent-init/`, run by the LinuxServer image
   before qBittorrent starts) keeps it on. Other apps that share Gluetun's network can then reach qBittorrent's Web
   UI without a login; from the LAN or through Traefik it still asks for the password. Apply also re-sends the
   current port, and the board has "Set qBittorrent's port now".
