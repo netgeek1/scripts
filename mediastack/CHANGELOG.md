@@ -3,6 +3,22 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.4.1 — 2026-11-25 — CrowdSec decisions explained on the board
+
+### Fixed
+- **Active decisions showed at most 500 rows and counted those**, so the heading was wrong with the community
+  blocklist (thousands of entries) and your own detections could be buried in it. The board now counts every
+  decision by origin and shows the true total.
+
+### Added
+- CrowdSec tab: a card per origin with a plain description (your detections, manual bans, community blocklist,
+  subscribed lists); your detections and manual bans listed in full; community and list blocks folded away (first
+  100 shown, with a note that unbanning one lasts only until the next download); "Is an IP blocked?" lookup that
+  also finds addresses inside banned ranges; expiry times as "6d 23h" instead of Go's "167h59m3.5s".
+
+### Changed
+- The "Active decisions" metric card is gone: it disagreed with the decision list.
+
 ## v3.4.0 — 2026-11-25 — Chromium through the VPN
 
 ### Changed
