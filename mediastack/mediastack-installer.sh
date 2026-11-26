@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.3.3"
+readonly SCRIPT_VERSION="3.4.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -104,7 +104,8 @@ CONF_KEYS=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA FOLDER_FOR_YAML DOMAIN CLOUDFLARE_D
             CERT_FETCH_SOURCE CERT_FETCH_CERT CERT_FETCH_KEY CERT_PUSH_USER CERT_PUSH_FROM
             SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES VPN_SERVERS_UPDATE_PERIOD VPN_UPDATER_PROTON_EMAIL
             DDNS_PROVIDER DDNS_RECORDS DDNS_CF_ZONE_ID DDNS_TTL DDNS_PROXIED DDNS_IP_VERSION DDNS_CONFIG_FILE
-            SERVICE_HOSTNAMES SERVICE_PORTS VPN_PORT_FORWARDING VPN_PORT_FORWARDING_PROVIDER VPN_PF_QBITTORRENT )
+            SERVICE_HOSTNAMES SERVICE_PORTS VPN_PORT_FORWARDING VPN_PORT_FORWARDING_PROVIDER VPN_PF_QBITTORRENT
+            CHROMIUM_VIA_VPN )
 # Settings that did not exist before v2.0.0: an existing config without them keeps its old behaviour
 declare -A CONF_LEGACY=( [ACCESS_MODE]=internet [CERT_MODE]=letsencrypt [SERVICE_PRESET]=custom
                          [TAILSCALE_CONTROL]=headscale [PLAYER]=both )
@@ -425,6 +426,7 @@ set_default_config() {
         [VPN_PORT_FORWARDING]="off"
         [VPN_PORT_FORWARDING_PROVIDER]=""
         [VPN_PF_QBITTORRENT]="yes"
+        [CHROMIUM_VIA_VPN]="yes"
     )
 }
 
@@ -1541,6 +1543,15 @@ EOF
             if svc_enabled statusboard; then   # control-server API key for the status board (all routes)
                 printf "      - 'HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}'\n"
             fi
+            if chromium_via_vpn; then   # after the environment list: Chromium's port, now published on gluetun
+                local cp; cp=$(service_ports "${compose:-$FOLDER_FOR_YAML/docker-compose.yaml}" chromium)
+                [[ -n "$cp" ]] && printf '    ports:\n%s\n' "$cp"
+            fi
+            ;;
+        chromium)
+            printf '    # Chromium behind Gluetun (CHROMIUM_VIA_VPN): it browses through the VPN; its port is published on gluetun\n'
+            printf '    network_mode: "service:gluetun"\n    networks: !reset []\n    ports: !reset []\n'
+            printf '    depends_on:\n      gluetun:\n        condition: service_healthy\n        restart: true\n'
             ;;
         tailscale)
             printf '    # Tailscale: control server (TAILSCALE_CONTROL; Headscale over the stack network) / LocalAPI socket for the status board\n'
@@ -1573,7 +1584,8 @@ active_patches() {   # upstream services this installer modifies
     done
     if grep -qE '^  crowdsec:[[:space:]]*$' "$compose" && ! is_removed crowdsec; then echo crowdsec; fi
     if grep -qE '^  gluetun:[[:space:]]*$' "$compose" && ! is_removed gluetun \
-        && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint || vpn_pf_on || svc_enabled statusboard; }; then echo gluetun; fi
+        && { [[ -n "$(vpn_update_period)" ]] || vpn_custom_wg_endpoint || vpn_pf_on || chromium_via_vpn || svc_enabled statusboard; }; then echo gluetun; fi
+    if grep -qE '^  chromium:[[:space:]]*$' "$compose" && grep -qE '^  gluetun:[[:space:]]*$' "$compose" && chromium_via_vpn; then echo chromium; fi
     if grep -qE '^  tailscale:[[:space:]]*$' "$compose" && ! is_removed tailscale; then echo tailscale; fi
     return 0
 }
@@ -2290,6 +2302,20 @@ vpn_pf_on() {
 }
 vpn_pf_qbt() { vpn_pf_on && svc_enabled qbittorrent && [[ "${CFG[VPN_PF_QBITTORRENT]:-yes}" == yes ]]; }
 
+# chromium_via_vpn -- upstream gives the browser its own network (it browses from your home IP); this moves it
+# behind Gluetun like the download apps: Gluetun's network, its port published on Gluetun
+chromium_via_vpn() {
+    [[ "${CFG[CHROMIUM_VIA_VPN]:-yes}" == yes ]] && svc_enabled chromium && svc_enabled gluetun
+}
+# service_ports COMPOSE SVC -> the service's "ports:" list entries in upstream's file (as written)
+service_ports() {
+    awk -v s="$2" '
+        $0 ~ "^  " s ":[[:space:]]*$" {f = 1; next}
+        f && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ {exit}
+        f && /^    [a-z_]+:/ {p = ($1 == "ports:"); next}
+        f && p && /^      - / {sub(/[[:space:]]+#.*$/, ""); print}' "$1"
+}
+
 # looks_like_proton -- a wg0.conf from ProtonVPN: Address 10.2.0.2/32 (their fixed client address)
 looks_like_proton() { [[ "${CFG[VPN_TYPE]:-}" == wireguard && "${CFG[WIREGUARD_ADDRESSES]:-}" == 10.2.0.2/32* ]]; }
 
@@ -2943,6 +2969,10 @@ cfg_vpn() {
         fi
     fi
     cfg_vpn_pf
+    if svc_enabled chromium; then
+        log_info "Chromium (browser in a container): upstream runs it outside the VPN, so sites see your home IP."
+        ask_valid "CFG[CHROMIUM_VIA_VPN]" "Run Chromium through the VPN (yes/no)" "${CFG[CHROMIUM_VIA_VPN]:-yes}" v_yesno "yes or no"
+    fi
     local probs l; probs=$(vpn_problems)
     if [[ -n "$probs" ]]; then while IFS= read -r l; do log_warn "VPN: $l"; done <<<"$probs"; else log_ok "VPN settings complete"; fi
 }
@@ -6619,6 +6649,7 @@ declare -A CONF_HELP=(
     [VPN_PORT_FORWARDING]="on | off -- VPN server port forwarding (protonvpn, private internet access, perfect privacy, privatevpn; custom WireGuard)"
     [VPN_PORT_FORWARDING_PROVIDER]="custom provider only: whose port forwarding the server uses (protonvpn, ...)"
     [VPN_PF_QBITTORRENT]="yes | no -- set qBittorrent's listening port to the forwarded port"
+    [CHROMIUM_VIA_VPN]="yes | no -- run the Chromium browser behind Gluetun (its traffic leaves through the VPN)"
     [CERT_FETCH_SOURCE]="fetch mode: user@host:/folder holding the certificate files"
     [CERT_FETCH_CERT]="fetch mode: full-chain certificate file name in that folder"
     [CERT_FETCH_KEY]="fetch mode: private key file name in that folder"
@@ -6696,6 +6727,7 @@ validate_key() {   # validate_key KEY VALUE
         VPN_PORT_FORWARDING) v_onoff "$v" ;;
         VPN_PORT_FORWARDING_PROVIDER) v_pfprov "$v" ;;
         VPN_PF_QBITTORRENT) v_yesno "$v" ;;
+        CHROMIUM_VIA_VPN) v_yesno "$v" ;;
         DDNS_CONFIG_FILE) [[ -z "$v" ]] || v_path "$v" ;;
         VPN_UPDATER_PROTON_EMAIL) [[ -z "$v" || "$v" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ;;
         CLOUDFLARE_EMAIL|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
@@ -7343,6 +7375,18 @@ FIX
     st "port forwarding: gluetun patch"     '( st_prep internet jellyfin tailscale core; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=protonvpn; CFG[VPN_PORT_FORWARDING]=on; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"VPN_PORT_FORWARDING=on"* && "$o" == *"PORT_FORWARD_ONLY=on"* && "$o" == *"VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh /gluetun/mediastack-pf-qbittorrent.sh up {{PORT}} {{VPN_INTERFACE}} \${WEBUI_PORT_QBITTORRENT:?err}"* && "$o" != *"VPN_PORT_FORWARDING_PROVIDER=protonvpn"* ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[VPN_ENDPOINT_IP]=203.0.113.9 && CFG[VPN_PORT_FORWARDING_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"VPN_PORT_FORWARDING_PROVIDER=protonvpn"* && "$o" != *PORT_FORWARD_ONLY* ]] && CFG[VPN_PF_QBITTORRENT]=no && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UP_COMMAND* ]] && CFG[VPN_PORT_FORWARDING]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *"- VPN_PORT_FORWARDING=on"* && "$o" != *UP_COMMAND* ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && CFG[VPN_PORT_FORWARDING]=on && ! vpn_pf_on )'
     st "port forwarding: hook + qbt conf"   '( mkdir -p $t/pf/bin; printf "#!/bin/sh\nfor a; do case \"\$a\" in json=*) printf \"%%s\\\\n\" \"\$a\" >>$t/pf/data;; http*) printf \"%%s\\\\n\" \"\$a\" >>$t/pf/url;; esac; done\nexit 0\n" >$t/pf/bin/wget; chmod +x $t/pf/bin/wget; render_pf_script >$t/pf/s.sh; sh -n $t/pf/s.sh && PATH=$t/pf/bin:$PATH MS_PF_STATUS=$t/pf/st sh $t/pf/s.sh up 45123 wg0 8200 bg >/dev/null && grep -q "^result=ok" $t/pf/st && grep -q "^port=45123" $t/pf/st && grep -qx "json={\"listen_port\":45123,\"current_network_interface\":\"wg0\",\"random_port\":false,\"upnp\":false}" $t/pf/data && grep -qx "http://127.0.0.1:8200/api/v2/app/setPreferences" $t/pf/url && st_prep internet jellyfin tailscale core && CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=protonvpn && CFG[VPN_PORT_FORWARDING]=on && FOLDER_FOR_DATA=$t/pf && mkdir -p $t/pf/qbittorrent/qBittorrent && printf "[BitTorrent]\nSession\\\\Port=1\n\n[Preferences]\nWebUI\\\\Port=8200\nWebUI\\\\LocalHostAuth=true\n" >$t/pf/qbittorrent/qBittorrent/qBittorrent.conf && docker() { :; } && sleep() { :; } && ensure_qbt_localhost >/dev/null && [[ $(grep -c "^WebUI\\\\LocalHostAuth=" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf) == 1 ]] && grep -q "^WebUI\\\\LocalHostAuth=false" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf && grep -q "^Session\\\\Port=1" $t/pf/qbittorrent/qBittorrent/qBittorrent.conf && CFG[WIREGUARD_ADDRESSES]=10.2.0.2/32 && looks_like_proton && CFG[WIREGUARD_ADDRESSES]=10.64.1.2/32 && ! looks_like_proton && v_wgpub "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=" && ! v_wgpub "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgy=" )'
     st "custom ProtonVPN -> protonvpn offer" '( st_prep internet jellyfin tailscale core; CFG[VPN_TYPE]=wireguard; CFG[VPN_SERVICE_PROVIDER]=custom; CFG[WIREGUARD_ADDRESSES]=10.2.0.2/32; CFG[VPN_ENDPOINT_IP]=203.0.113.9; CFG[VPN_ENDPOINT_PORT]=51820; CFG[WIREGUARD_PUBLIC_KEY]=bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=; is_tty() { return 0; }; ASSUME_YES=0; confirm() { return 0; }; vpn_offer_provider_switch >/dev/null; [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && "${CFG[VPN_ENDPOINT_IP]}" == 203.0.113.9 && "${CFG[WIREGUARD_ADDRESSES]}" == 10.2.0.2/32 ]] && ! vpn_custom_wg_endpoint && [[ -z "$(vpn_wg_pubkey_env)" ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *WIREGUARD_ENDPOINT_IP* ]] && CFG[VPN_SERVICE_PROVIDER]=custom && vpn_custom_wg_endpoint && [[ "$(vpn_wg_pubkey_env)" == bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo= ]] && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"WIREGUARD_ENDPOINT_IP=203.0.113.9"* ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[WIREGUARD_ADDRESSES]=10.64.0.2/32 && vpn_offer_provider_switch >/dev/null && [[ "${CFG[VPN_SERVICE_PROVIDER]}" == custom ]] )'
+    mkdir -p "$t/cv"; cat >"$t/cv/docker-compose.yaml" <<'FIX'
+services:
+  gluetun:
+    image: g
+  chromium:
+    image: c
+    ports:
+      - ${WEBUI_PORT_CHROMIUM:?err}:${WEBUI_PORT_CHROMIUM:?err}   # browser
+    networks:
+      - mediastack
+FIX
+    st "Chromium through the VPN"           '( st_prep internet jellyfin tailscale full; CFG[FOLDER_FOR_YAML]=$t/cv; FOLDER_FOR_YAML=$t/cv; o=$(render_override "$t/cv/docker-compose.yaml"); c=$(awk "/^  chromium:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o"); g=$(awk "/^  gluetun:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o"); [[ "$c" == *"network_mode: \"service:gluetun\""* && "$c" == *"networks: !reset []"* && "$c" == *"ports: !reset []"* ]] && [[ "$(tail -n 1 <<<"$g")" == "      - \${WEBUI_PORT_CHROMIUM:?err}:\${WEBUI_PORT_CHROMIUM:?err}" && "$(tail -n 2 <<<"$g" | head -n 1)" == "    ports:" ]] && CFG[CHROMIUM_VIA_VPN]=no && o=$(render_override "$t/cv/docker-compose.yaml") && [[ "$o" != *"  chromium:"* && "$o" != *WEBUI_PORT_CHROMIUM* ]] )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
