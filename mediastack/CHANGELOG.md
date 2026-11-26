@@ -3,6 +3,24 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.5.0 — 2026-11-26 — Containers one at a time, numbered service lists
+
+### Added
+- **M) Containers** in the main menu and `--container ACTION [SERVICE]`: restart, stop, start, recreate, view logs
+  (last N lines) or follow logs for one container. For Gluetun, the apps in its network are named, confirmed and
+  handled in order (stop: apps first; start/restart/recreate: Gluetun first, the apps once it is healthy), since
+  they lose their network whenever Gluetun's container goes away.
+- **One service picker everywhere the menus ask for a service:** alphabetical, numbered, with the live container
+  state (`healthy`, `running`, `unhealthy`, `starting`, `restarting`, `stopped`, `not created`, `disabled`), uptime,
+  and "via VPN" for apps in Gluetun's network; a number or a name is accepted. Used by M) Containers and
+  Logs → Container logs (which used to ask for a name).
+- Settings → 7 (services) lists services alphabetically, one per line, with each container's state next to its
+  setting; Settings → U shows the container state too.
+
+### Changed
+- Status board: status dots are twice the size (16 px).
+- Self-test: 103 checks.
+
 ## v3.4.3 — 2026-11-26 — qBittorrent's new settings layout
 
 ### Fixed
