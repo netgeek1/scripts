@@ -122,7 +122,8 @@ You can re-run detection any time with **Settings → D**.
 ```
  Setup        1) Full install / reconfigure   2) Settings   3) Secrets
  Operate      4) Apply + pull updates          5) Apply without pulling
-              6) Stop stack                    R) Restart containers
+              6) Stop stack                    R) Restart containers (all)
+              M) Containers (one at a time)
               7) Status                        8) Post-install helpers   9) Logs
               K) Certificate (refresh, show, fetch key, push receiver)
               L) URLs, ports and DNS names
@@ -152,6 +153,7 @@ You can re-run detection any time with **Settings → D**.
 |---|---|
 | `--install` | Full install / reconfigure |
 | `--settings` | Settings menu |
+| `--container ACTION [SERVICE]` | `restart`, `stop`, `start`, `recreate`, `logs` or `follow` one container; without SERVICE, pick from the list (see [Containers one at a time](#containers-one-at-a-time)) |
 | `--apply` / `--start` | Converge and start, with / without pulling images |
 | `--stop` | `docker compose down` (data kept) |
 | `--restart` | Restart the containers (no converge) |
@@ -183,6 +185,23 @@ The compose folder also gets wrappers, so the upstream workflow keeps working:
 `./get-apikeys.sh`.
 
 ---
+
+### Containers one at a time
+
+**M) Containers** (or `--container ACTION [SERVICE]`) lists every enabled or disabled service in alphabetical order,
+numbered, with its live state (`healthy`, `running`, `unhealthy`, `starting`, `restarting`, `stopped`, `not created`,
+`disabled`), how long it has been up or stopped, and "via VPN" for the apps in Gluetun's network. Pick one by
+number or name, then **Restart**, **Stop**, **Start**, **Recreate**, **Logs** (last N lines) or **Follow logs**
+(Ctrl-C returns to the menu).
+
+**Gluetun** is handled with the apps in its network: they share its network, so they lose it whenever Gluetun's
+container goes away. The menu names them and asks first, then:
+- restart / recreate: Gluetun first, then (once it is healthy) the apps
+- stop: the apps first, then Gluetun
+- start: Gluetun, then the apps once it is healthy
+
+The same numbered list with states is used wherever the menus ask for a service: Logs → Container logs,
+Settings → U (hostnames and ports), Settings → 7 (services, with each container's state next to its setting).
 
 ## URLs, ports and DNS
 
@@ -1050,7 +1069,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 101 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 103 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
