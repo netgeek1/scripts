@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.4.2"
+readonly SCRIPT_VERSION="3.4.3"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2344,14 +2344,20 @@ if [ "$1" = up ]; then data="json={\"listen_port\":$2,\"current_network_interfac
 else data='json={"listen_port":0,"current_network_interface":"lo"}'; fi
 report() { printf 'time=%s\naction=%s\nport=%s\nresult=%s\ndetail=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" >"$st.tmp" && mv -f "$st.tmp" "$st"; }
 report "$1" "$2" pending "waiting for qBittorrent on 127.0.0.1:$4"
-i=0; err=""
+i=0; why=""
 while [ "$i" -lt 30 ]; do
-    if err=$(wget -q -O /dev/null -T 10 --post-data "$data" "http://127.0.0.1:$4/api/v2/app/setPreferences" 2>&1); then
+    if out=$(wget -S -O /dev/null -T 10 --post-data "$data" "http://127.0.0.1:$4/api/v2/app/setPreferences" 2>&1); then
         report "$1" "$2" ok "qBittorrent listening port set"; exit 0
     fi
-    i=$((i + 1)); sleep 10
+    # the server's status line (e.g. "HTTP/1.1 403 Forbidden"), else wget's own error (e.g. "Connection refused")
+    why=$(echo "$out" | grep -o 'HTTP/[0-9.]* [0-9][0-9][0-9].*' | tail -n 1)
+    [ -n "$why" ] || why=$(echo "$out" | grep -iE 'refused|failed|timed out|error' | tail -n 1)
+    case "$why" in *403*) why="$why (qBittorrent wants a login from localhost: 'Bypass authentication for clients on localhost' is off)" ;; esac
+    i=$((i + 1))
+    report "$1" "$2" pending "attempt $i/30: ${why:-no answer}"
+    sleep 10
 done
-report "$1" "$2" failed "qBittorrent Web API on 127.0.0.1:$4 did not accept it: $(echo "$err" | tr '\n' ' ' | cut -c1-160)"
+report "$1" "$2" failed "qBittorrent Web API on 127.0.0.1:$4: $(echo "$why" | cut -c1-200)"
 exit 1
 SH
 }
@@ -2377,15 +2383,12 @@ ensure_qbt_localhost() {
     local f="$FOLDER_FOR_DATA/qbittorrent/qBittorrent/qBittorrent.conf" i tmp
     for (( i = 0; i < 12; i++ )); do [[ -s "$f" ]] && break; sleep 5; done
     [[ -s "$f" ]] || { log_warn "qBittorrent has not created $f yet; run Apply again so it takes the forwarded port."; return 0; }
-    grep -qE '^WebUI\\LocalHostAuth=false' "$f" && return 0
+    if awk '/^\[/ {s = $0} s == "[WebUI]" && /^LocalHostAuth=false/ {a = 1} s == "[Preferences]" && /^WebUI\\LocalHostAuth=false/ {b = 1} END {exit !(a && b)}' "$f"; then
+        return 0
+    fi
     docker stop qbittorrent >/dev/null 2>&1 || true
-    tmp=$(mktemp)
-    awk '
-        /^\[/ { if (insec && !done) { print "WebUI\\LocalHostAuth=false"; done = 1 } insec = ($0 == "[Preferences]") }
-        insec && /^WebUI\\LocalHostAuth=/ { if (!done) print "WebUI\\LocalHostAuth=false"; done = 1; next }
-        { print }
-        END { if (!done) { if (!insec) print "[Preferences]"; print "WebUI\\LocalHostAuth=false" } }' "$f" >"$tmp" && cat "$tmp" >"$f"
-    rm -f "$tmp"
+    tmp=$(mktemp); render_qbt_init | sed "s|^f=/config/qBittorrent/qBittorrent.conf|f='$f'|" >"$tmp"
+    sh "$tmp" >/dev/null; rm -f "$tmp"
     docker start qbittorrent >/dev/null 2>&1 || true
     log_ok "qBittorrent: localhost login bypass on (Gluetun sets its listening port to the forwarded port)"
 }
@@ -2398,16 +2401,21 @@ render_qbt_init() {
 #!/bin/sh
 # Managed by mediastack-installer -- runs before qBittorrent starts (LinuxServer custom-cont-init.d).
 # Gluetun's port-forwarding hook sets qBittorrent's listening port through the Web API on 127.0.0.1; that needs
-# "Bypass authentication for clients on localhost" (WebUI\LocalHostAuth=false). Logins from anywhere else are unchanged.
+# "Bypass authentication for clients on localhost". Logins from anywhere else are unchanged.
+#   newer qBittorrent: [WebUI] LocalHostAuth=false     older: [Preferences] WebUI\LocalHostAuth=false (both are set)
 f=/config/qBittorrent/qBittorrent.conf
 [ -f "$f" ] || exit 0
-if grep -q '^WebUI\\LocalHostAuth=' "$f"; then
-    sed -i 's/^WebUI\\LocalHostAuth=.*/WebUI\\LocalHostAuth=false/' "$f"
-elif grep -q '^\[Preferences\]' "$f"; then
-    sed -i '/^\[Preferences\]/a WebUI\\LocalHostAuth=false' "$f"
-else
-    printf '\n[Preferences]\nWebUI\\LocalHostAuth=false\n' >>"$f"
-fi
+set_key() {   # set_key SECTION KEY VALUE -- set KEY in [SECTION], adding the key or the section when missing
+    MS_SEC="[$1]" MS_KEY="$2" MS_VAL="$3" awk 'BEGIN { sec = ENVIRON["MS_SEC"]; key = ENVIRON["MS_KEY"]; val = ENVIRON["MS_VAL"] }
+       
+        function emit() { if (insec && !done) { print key "=" val; done = 1 } }
+        /^\[/ { emit(); insec = ($0 == sec); seen = seen || insec }
+        insec && index($0, key "=") == 1 { if (!done) print key "=" val; done = 1; next }
+        { print }
+        END { emit(); if (!seen) { print ""; print sec; print key "=" val } }' "$f" >"$f.ms" && cat "$f.ms" >"$f" && rm -f "$f.ms"
+}
+set_key WebUI LocalHostAuth false
+set_key Preferences 'WebUI\LocalHostAuth' false
 echo "[mediastack] qBittorrent: localhost login bypass on (for Gluetun's port hook)"
 SH
 }
@@ -7495,7 +7503,7 @@ services:
       - mediastack
 FIX
     st "Chromium through the VPN"           '( st_prep internet jellyfin tailscale full; CFG[FOLDER_FOR_YAML]=$t/cv; FOLDER_FOR_YAML=$t/cv; o=$(render_override "$t/cv/docker-compose.yaml"); c=$(awk "/^  chromium:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o"); g=$(awk "/^  gluetun:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o"); [[ "$c" == *"network_mode: \"service:gluetun\""* && "$c" == *"networks: !reset []"* && "$c" == *"ports: !reset []"* ]] && [[ "$(tail -n 1 <<<"$g")" == "      - \${WEBUI_PORT_CHROMIUM:?err}:\${WEBUI_PORT_CHROMIUM:?err}" && "$(tail -n 2 <<<"$g" | head -n 1)" == "    ports:" ]] && CFG[CHROMIUM_VIA_VPN]=no && o=$(render_override "$t/cv/docker-compose.yaml") && [[ "$o" != *"  chromium:"* && "$o" != *WEBUI_PORT_CHROMIUM* ]] )'
-    st "qBittorrent start-up script"        '( mkdir -p $t/qi/config/qBittorrent; render_qbt_init | sed "s|/config/|$t/qi/config/|" >$t/qi/s.sh; f=$t/qi/config/qBittorrent/qBittorrent.conf; ok=1; for c in "[Preferences]\nWebUI\\\\LocalHostAuth=true\nWebUI\\\\Port=8200\n" "[BitTorrent]\nx=1\n[Preferences]\nWebUI\\\\Port=8200\n" "[BitTorrent]\nx=1\n"; do printf "$c" >$f; sh $t/qi/s.sh >/dev/null; sh $t/qi/s.sh >/dev/null; [[ $(grep -c "^WebUI\\\\LocalHostAuth=false$" $f) == 1 && $(grep -c "LocalHostAuth" $f) == 1 ]] || ok=0; awk "/^\\[Preferences\\]/{p=1;next} /^\\[/{p=0} p&&/LocalHostAuth=false/{found=1} END{exit !found}" $f || ok=0; done; (( ok )) && st_prep internet jellyfin tailscale core && CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=protonvpn && CFG[VPN_PORT_FORWARDING]=on && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"/qbittorrent-init:/custom-cont-init.d:ro"* ]] && CFG[VPN_PF_QBITTORRENT]=no && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *custom-cont-init* ]] )'
+    st "qBittorrent start-up script"        '( mkdir -p $t/qi/config/qBittorrent; render_qbt_init | sed "s|/config/|$t/qi/config/|" >$t/qi/s.sh; f=$t/qi/config/qBittorrent/qBittorrent.conf; ok=1; for c in "[Preferences]\nWebUI\\\\LocalHostAuth=true\nWebUI\\\\Port=8200\n" "[BitTorrent]\nx=1\n[Preferences]\nGeneral\\\\Locale=en\n" "[BitTorrent]\nx=1\n" "[WebUI]\nLocalHostAuth=true\nPort=8200\n[Preferences]\nGeneral\\\\Locale=en\n"; do printf "$c" >$f; sh $t/qi/s.sh >/dev/null; sh $t/qi/s.sh >/dev/null; awk "/^\\[/{s=\$0} s==\"[WebUI]\" && \$0==\"LocalHostAuth=false\"{a++} s==\"[Preferences]\" && index(\$0,\"WebUI\")==1 && substr(\$0,7)==\"LocalHostAuth=false\"{b++} /LocalHostAuth=true/{bad=1} END{exit !(a==1&&b==1&&!bad)}" $f || { ok=0; cat $f >&2; }; grep -q "Port=8200\|Locale=en\|x=1" $f || ok=0; done; (( ok )) && st_prep internet jellyfin tailscale core && CFG[VPN_TYPE]=wireguard && CFG[VPN_SERVICE_PROVIDER]=protonvpn && CFG[VPN_PORT_FORWARDING]=on && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"/qbittorrent-init:/custom-cont-init.d:ro"* ]] && CFG[VPN_PF_QBITTORRENT]=no && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *custom-cont-init* ]] )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
