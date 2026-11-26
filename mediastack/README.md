@@ -123,7 +123,7 @@ You can re-run detection any time with **Settings → D**.
  Setup        1) Full install / reconfigure   2) Settings   3) Secrets
  Operate      4) Apply + pull updates          5) Apply without pulling
               6) Stop stack                    R) Restart containers (all)
-              M) Containers (one at a time)
+              M) Containers (one at a time)    A) Automatic updates
               7) Status                        8) Post-install helpers   9) Logs
               K) Certificate (refresh, show, fetch key, push receiver)
               L) URLs, ports and DNS names
@@ -153,6 +153,7 @@ You can re-run detection any time with **Settings → D**.
 |---|---|
 | `--install` | Full install / reconfigure |
 | `--settings` | Settings menu |
+| `--auto-update` | Update container images now, as the automatic-update timer does (see [Automatic updates](#automatic-updates)) |
 | `--container ACTION [SERVICE]` | `restart`, `stop`, `start`, `recreate`, `logs` or `follow` one container; without SERVICE, pick from the list (see [Containers one at a time](#containers-one-at-a-time)) |
 | `--apply` / `--start` | Converge and start, with / without pulling images |
 | `--stop` | `docker compose down` (data kept) |
@@ -985,6 +986,25 @@ PostgreSQL's folder is excluded from the `2775` pass. Seerr's folder is owned by
 
 ---
 
+## Automatic updates
+
+**A) Automatic updates** in the main menu sets a schedule: `off` (default), `daily` or `weekly`, at a time you
+choose (default Sunday 04:17; containers with a new image restart, so pick a quiet hour). A systemd timer
+(`mediastack-update.timer`, a few minutes of random delay, catches up after the host was off) then runs
+`mediastack-installer --auto-update`, which is **Apply with pull**:
+
+- new images are pulled and only the containers whose image changed are recreated
+- the managed override, patches and add-ons stay applied, and Gluetun's apps are recreated with it (an external
+  updater such as Watchtower would recreate containers outside these rules)
+- **Services not to update** (`AUTO_UPDATE_EXCLUDE`, picked from the numbered list) are not pulled and keep their
+  current image. Services that share an image (Authentik and its worker) are updated together.
+- **Old images** are removed afterwards (`docker image prune`, unused images only; `AUTO_UPDATE_PRUNE=no` keeps them)
+- an update waits for an open menu session or a running Apply, and is skipped (and recorded as skipped) after 30 min
+
+The menu and the status screen show the schedule, the next run, and the last result (when, ok / failed / skipped,
+which images were updated). Each run has its own log, `update-*.log` in `/var/log/mediastack/`, also opened from the
+menu. **Update now** in the same menu runs one at once.
+
 ## Upstream pinning and upgrades
 
 - `UPSTREAM_REF` defaults to a tested commit SHA. Each SHA is downloaded once and cached. If the tarball download
@@ -1082,7 +1102,7 @@ password**.
 ## Testing
 
 ```bash
-./mediastack-installer.sh --self-test     # 104 checks, no root/Docker/network needed
+./mediastack-installer.sh --self-test     # 106 checks, no root/Docker/network needed
 ```
 
 The self-test covers:
