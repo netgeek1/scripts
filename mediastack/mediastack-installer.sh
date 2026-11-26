@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.7.1"
+readonly SCRIPT_VERSION="3.8.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -105,7 +105,8 @@ CONF_KEYS=( FOLDER_FOR_MEDIA FOLDER_FOR_DATA FOLDER_FOR_YAML DOMAIN CLOUDFLARE_D
             SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES VPN_SERVERS_UPDATE_PERIOD VPN_UPDATER_PROTON_EMAIL
             DDNS_PROVIDER DDNS_RECORDS DDNS_CF_ZONE_ID DDNS_TTL DDNS_PROXIED DDNS_IP_VERSION DDNS_CONFIG_FILE
             SERVICE_HOSTNAMES SERVICE_PORTS VPN_PORT_FORWARDING VPN_PORT_FORWARDING_PROVIDER VPN_PF_QBITTORRENT
-            CHROMIUM_VIA_VPN HOMEPAGE_LINK_CHECKS )
+            CHROMIUM_VIA_VPN HOMEPAGE_LINK_CHECKS AUTO_UPDATE AUTO_UPDATE_TIME AUTO_UPDATE_DAY
+            AUTO_UPDATE_EXCLUDE AUTO_UPDATE_PRUNE )
 # Settings that did not exist before v2.0.0: an existing config without them keeps its old behaviour
 declare -A CONF_LEGACY=( [ACCESS_MODE]=internet [CERT_MODE]=letsencrypt [SERVICE_PRESET]=custom
                          [TAILSCALE_CONTROL]=headscale [PLAYER]=both )
@@ -429,6 +430,11 @@ set_default_config() {
         [VPN_PF_QBITTORRENT]="yes"
         [CHROMIUM_VIA_VPN]="yes"
         [HOMEPAGE_LINK_CHECKS]="yes"
+        [AUTO_UPDATE]="off"
+        [AUTO_UPDATE_TIME]="04:17"
+        [AUTO_UPDATE_DAY]="Sun"
+        [AUTO_UPDATE_EXCLUDE]=""
+        [AUTO_UPDATE_PRUNE]="yes"
     )
 }
 
@@ -3617,20 +3623,29 @@ compose_stream() {
 }
 
 # compose_pull -- pull with compact progress (see compose_stream) and report which images changed
+#   PULL_EXCLUDE "svc ..." -- services not pulled (they keep their current image); PULL_REPORT FILE -- changed images
+PULL_EXCLUDE="" PULL_REPORT=""
 compose_pull() {
-    local img a rc=0
-    local -a imgs changed=()
+    local img a rc=0 s
+    local -a imgs changed=() svcs=()
     local -A before=()
     mapfile -t imgs < <(compose_run config --images 2>/dev/null | sort -u)
     for img in "${imgs[@]}"; do [[ -n "$img" ]] && before[$img]=$(image_id "$img"); done
-    log_info "Pulling ${#imgs[@]} image(s); the first install can take several minutes..."
-    compose_stream pull || rc=$?
+    if [[ -n "$PULL_EXCLUDE" ]]; then
+        while IFS= read -r s; do [[ -n "$s" && " $PULL_EXCLUDE " != *" $s "* ]] && svcs+=("$s"); done < <(compose_run config --services 2>/dev/null)
+        log_info "Pulling images for ${#svcs[@]} service(s); not updated: $PULL_EXCLUDE"
+        compose_stream pull "${svcs[@]}" || rc=$?
+    else
+        log_info "Pulling ${#imgs[@]} image(s); the first install can take several minutes..."
+        compose_stream pull || rc=$?
+    fi
     (( rc == 0 )) || return "$rc"
     for img in "${imgs[@]}"; do
         [[ -n "$img" ]] || continue
         a=$(image_id "$img")
         [[ -n "$a" && "$a" != "${before[$img]:-}" ]] && changed+=("$img")
     done
+    [[ -n "$PULL_REPORT" ]] && printf '%s\n' "${changed[@]}" >"$PULL_REPORT"
     if (( ${#changed[@]} )); then
         log_ok "${#changed[@]} image(s) new or updated:"
         for img in "${changed[@]}"; do log_info "  $img"; done
@@ -3801,6 +3816,7 @@ stack_apply() {
     write_pf_script
     write_qbt_init
     cert_units
+    update_units
     requests_units
     report_dependencies die
     log_step "Starting MediaStack ($mode)"
@@ -3883,6 +3899,7 @@ show_status() {
         vpn_pf_status_line
         local vl; while IFS= read -r vl; do [[ -n "$vl" ]] && log_warn "VPN: $vl"; done <<<"$(vpn_problems)"
     fi
+    printf '  %-22s %s\n' "Automatic updates" "$(auto_update_desc); last: $(auto_update_last_line)"
     local t p
     for t in MEDIA DATA; do
         p=$(target_path "$t")
@@ -6975,6 +6992,157 @@ menu_containers() {
 }
 
 # -----------------------------------------------------------------------------
+# AUTOMATIC UPDATES: a systemd timer runs Apply with pull (new images, containers recreated only where the image
+# changed, the managed override and Gluetun's app order kept), then removes unused old images.
+# -----------------------------------------------------------------------------
+readonly UNIT_UPDATE="mediastack-update"
+auto_update_state() { printf '%s/auto-update.last' "$MS_STATE_DIR"; }
+v_autoupd() { [[ "$1" =~ ^(off|daily|weekly)$ ]]; }
+v_hhmm()    { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+v_dow()     { [[ "$1" =~ ^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$ ]]; }
+v_svclist() { [[ -z "$1" || "$1" =~ ^[a-z0-9-]+([[:space:]]+[a-z0-9-]+)*$ ]]; }
+
+auto_update_calendar() {
+    case "${CFG[AUTO_UPDATE]:-off}" in
+        daily)  printf '*-*-* %s:00' "${CFG[AUTO_UPDATE_TIME]:-04:17}" ;;
+        weekly) printf '%s *-*-* %s:00' "${CFG[AUTO_UPDATE_DAY]:-Sun}" "${CFG[AUTO_UPDATE_TIME]:-04:17}" ;;
+    esac
+}
+auto_update_desc() {
+    case "${CFG[AUTO_UPDATE]:-off}" in
+        off)    echo "off" ;;
+        daily)  echo "daily at ${CFG[AUTO_UPDATE_TIME]:-04:17}" ;;
+        weekly) echo "weekly, ${CFG[AUTO_UPDATE_DAY]:-Sun} at ${CFG[AUTO_UPDATE_TIME]:-04:17}" ;;
+    esac
+}
+
+update_units() {
+    local ud=${MS_UNIT_DIR:-/etc/systemd/system} svc timer cal chg=0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    cal=$(auto_update_calendar)
+    if [[ -z "$cal" ]]; then
+        if [[ -f "$ud/$UNIT_UPDATE.timer" ]]; then
+            run systemctl disable --now "$UNIT_UPDATE.timer" 2>/dev/null || true
+            run rm -f "$ud/$UNIT_UPDATE.timer" "$ud/$UNIT_UPDATE.service"
+            run systemctl daemon-reload 2>/dev/null || true
+            log_ok "Automatic updates off ($UNIT_UPDATE.timer removed)"
+        fi
+        return 0
+    fi
+    svc="[Unit]
+Description=mediastack-installer: update container images (Apply with pull)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$MS_INSTALL_BIN --auto-update --yes
+TimeoutStartSec=3h"
+    timer="[Unit]
+Description=mediastack-installer: automatic container updates ($(auto_update_desc))
+
+[Timer]
+OnCalendar=$cal
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target"
+    if [[ "$(cat "$ud/$UNIT_UPDATE.service" 2>/dev/null)" != "$svc" ]]; then printf '%s\n' "$svc" | write_file "$ud/$UNIT_UPDATE.service" 644 root:root; chg=1; fi
+    if [[ "$(cat "$ud/$UNIT_UPDATE.timer" 2>/dev/null)" != "$timer" ]]; then printf '%s\n' "$timer" | write_file "$ud/$UNIT_UPDATE.timer" 644 root:root; chg=1; fi
+    if (( chg )); then
+        run systemctl daemon-reload
+        run systemctl enable "$UNIT_UPDATE.timer"
+        run systemctl restart "$UNIT_UPDATE.timer"
+        log_ok "Automatic updates: $(auto_update_desc) ($UNIT_UPDATE.timer)"
+    elif ! systemctl is-active --quiet "$UNIT_UPDATE.timer" 2>/dev/null; then
+        run systemctl enable --now "$UNIT_UPDATE.timer"
+    fi
+    return 0
+}
+
+# auto_update_next -> when the timer fires next (blank when off / unknown)
+auto_update_next() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl show "$UNIT_UPDATE.timer" -p NextElapseUSecRealtime --value 2>/dev/null | grep -v '^n/a$' || true
+}
+
+auto_update_write_state() {   # result changed-images detail
+    local f; f=$(auto_update_state)
+    (( DRY_RUN )) && return 0
+    install -d -m 755 "$(dirname "$f")"
+    printf 'time=%s\nresult=%s\nupdated=%s\ndetail=%s\nlog=%s\n' "$(date '+%F %T')" "$1" "$2" "$3" "${LOG_FILE:-}" >"$f"
+}
+
+# auto_update -- the timer's job (also "Run an update now")
+auto_update() {
+    require_config; resolve_runtime; load_secrets
+    local rc=0 t0 n=0 reclaimed=""
+    t0=$(date +%s)
+    log_step "Automatic update ($(auto_update_desc))"
+    [[ -n "${CFG[AUTO_UPDATE_EXCLUDE]:-}" ]] && log_info "Not updated (excluded): ${CFG[AUTO_UPDATE_EXCLUDE]}"
+    PULL_EXCLUDE=${CFG[AUTO_UPDATE_EXCLUDE]:-}; PULL_REPORT=$(mktemp)
+    ( stack_apply pull ) || rc=$?
+    local upd; upd=$(xargs <"$PULL_REPORT" 2>/dev/null || true); n=$(wc -w <<<"$upd")
+    rm -f "$PULL_REPORT"; PULL_EXCLUDE=""; PULL_REPORT=""
+    if (( rc != 0 )); then
+        auto_update_write_state failed "$upd" "Apply ended with rc=$rc after $(( $(date +%s) - t0 ))s"
+        log_error "Automatic update failed (rc=$rc); see $LOG_FILE"
+        return "$rc"
+    fi
+    if [[ "${CFG[AUTO_UPDATE_PRUNE]:-yes}" == yes ]] && ! (( DRY_RUN )); then
+        reclaimed=$(docker image prune -f 2>/dev/null | sed -n 's/^Total reclaimed space: //p')
+        [[ -n "$reclaimed" ]] && log_ok "Old images removed ($reclaimed freed)"
+    fi
+    auto_update_write_state ok "$upd" "${n:-0} image(s) updated in $(( $(date +%s) - t0 ))s${reclaimed:+; $reclaimed freed}"
+    log_ok "Automatic update done: ${n:-0} image(s) updated"
+}
+
+auto_update_last_line() {
+    local f; f=$(auto_update_state)
+    [[ -f "$f" ]] || { echo "never run"; return 0; }
+    printf '%s %s: %s' "$(sed -n 's/^time=//p' "$f")" "$(sed -n 's/^result=//p' "$f")" "$(sed -n 's/^detail=//p' "$f")"
+}
+
+menu_auto_update() {
+    menu_prep || return 0
+    local ch v s ex
+    while :; do
+        printf '\n  %sAutomatic updates%s\n' "$B" "$NC"
+        printf '   Schedule      %s\n' "$(auto_update_desc)"
+        [[ "${CFG[AUTO_UPDATE]:-off}" != off ]] && printf '   Next run      %s\n' "$(auto_update_next || true)"
+        printf '   Last run      %s\n' "$(auto_update_last_line)"
+        [[ -f "$(auto_update_state)" ]] && [[ -n "$(sed -n 's/^updated=//p' "$(auto_update_state)")" ]] && \
+            printf '                 updated: %s\n' "$(sed -n 's/^updated=//p' "$(auto_update_state)")" | fold -s -w 110 | sed '2,$s/^/                 /'
+        printf '   Not updated   %s\n' "${CFG[AUTO_UPDATE_EXCLUDE]:-none}"
+        printf '   Old images    %s\n' "$([[ "${CFG[AUTO_UPDATE_PRUNE]:-yes}" == yes ]] && echo "removed after each update" || echo kept)"
+        printf '\n   1) Schedule   2) Services not to update   3) Remove old images on/off\n'
+        printf '   4) Update now   5) Last update log   0) Back\n'
+        read -rp "  Choice: " ch || return 0
+        case "$ch" in
+            1) ask_valid "CFG[AUTO_UPDATE]" "Automatic updates (off/daily/weekly)" "${CFG[AUTO_UPDATE]:-off}" v_autoupd "off, daily or weekly"
+               if [[ "${CFG[AUTO_UPDATE]}" != off ]]; then
+                   [[ "${CFG[AUTO_UPDATE]}" == weekly ]] && ask_valid "CFG[AUTO_UPDATE_DAY]" "Day (Mon..Sun)" "${CFG[AUTO_UPDATE_DAY]:-Sun}" v_dow "Mon, Tue, Wed, Thu, Fri, Sat or Sun"
+                   ask_valid "CFG[AUTO_UPDATE_TIME]" "Time (HH:MM, 24 h; containers restart, so pick a quiet hour)" "${CFG[AUTO_UPDATE_TIME]:-04:17}" v_hhmm "HH:MM"
+               fi
+               save_config; menu_action update_units ;;
+            2) log_info "Pick a service to add it to, or take it off, the list of services that keep their current image."
+               while pick_service s "Service to toggle" enabled; do
+                   ex=" ${CFG[AUTO_UPDATE_EXCLUDE]:-} "
+                   if [[ "$ex" == *" $s "* ]]; then ex=${ex/ $s / }; log_ok "$s: updated again"; else ex+="$s "; log_ok "$s: not updated"; fi
+                   CFG[AUTO_UPDATE_EXCLUDE]=$(xargs -n1 <<<"$ex" | sort -u | xargs)
+                   printf '   Not updated: %s\n' "${CFG[AUTO_UPDATE_EXCLUDE]:-none}"
+               done
+               save_config ;;
+            3) [[ "${CFG[AUTO_UPDATE_PRUNE]:-yes}" == yes ]] && CFG[AUTO_UPDATE_PRUNE]=no || CFG[AUTO_UPDATE_PRUNE]=yes; save_config ;;
+            4) confirm "Update now? Containers with a new image restart (a few minutes)." y && menu_action auto_update ;;
+            5) v=$(sed -n 's/^log=//p' "$(auto_update_state)" 2>/dev/null); [[ -f "$v" ]] && ${PAGER:-less} "$v" || log_info "No update log yet." ;;
+            0|q) return 0 ;;
+        esac
+    done
+}
+
+# -----------------------------------------------------------------------------
 # LOGS MENU
 # -----------------------------------------------------------------------------
 menu_logs() {
@@ -7056,6 +7224,11 @@ declare -A CONF_HELP=(
     [VPN_PF_QBITTORRENT]="yes | no -- set qBittorrent's listening port to the forwarded port"
     [CHROMIUM_VIA_VPN]="yes | no -- run the Chromium browser behind Gluetun (its traffic leaves through the VPN)"
     [HOMEPAGE_LINK_CHECKS]="yes | no -- Homepage checks every tile's link (status dot + response time)"
+    [AUTO_UPDATE]="off | daily | weekly -- update container images on a schedule (Apply with pull)"
+    [AUTO_UPDATE_TIME]="HH:MM (24 h) for automatic updates; containers with a new image restart"
+    [AUTO_UPDATE_DAY]="Mon..Sun -- the day for weekly automatic updates"
+    [AUTO_UPDATE_EXCLUDE]="services that keep their current image during automatic updates (space separated)"
+    [AUTO_UPDATE_PRUNE]="yes | no -- remove unused old images after each automatic update"
     [CERT_FETCH_SOURCE]="fetch mode: user@host:/folder holding the certificate files"
     [CERT_FETCH_CERT]="fetch mode: full-chain certificate file name in that folder"
     [CERT_FETCH_KEY]="fetch mode: private key file name in that folder"
@@ -7133,7 +7306,11 @@ validate_key() {   # validate_key KEY VALUE
         VPN_PORT_FORWARDING) v_onoff "$v" ;;
         VPN_PORT_FORWARDING_PROVIDER) v_pfprov "$v" ;;
         VPN_PF_QBITTORRENT) v_yesno "$v" ;;
-        CHROMIUM_VIA_VPN|HOMEPAGE_LINK_CHECKS) v_yesno "$v" ;;
+        CHROMIUM_VIA_VPN|HOMEPAGE_LINK_CHECKS|AUTO_UPDATE_PRUNE) v_yesno "$v" ;;
+        AUTO_UPDATE) v_autoupd "$v" ;;
+        AUTO_UPDATE_TIME) v_hhmm "$v" ;;
+        AUTO_UPDATE_DAY) v_dow "$v" ;;
+        AUTO_UPDATE_EXCLUDE) v_svclist "$v" ;;
         DDNS_CONFIG_FILE) [[ -z "$v" ]] || v_path "$v" ;;
         VPN_UPDATER_PROTON_EMAIL) [[ -z "$v" || "$v" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ;;
         CLOUDFLARE_EMAIL|EMAIL_SERVER_HOST|EMAIL_ADDRESS|EMAIL_SENDER| \
@@ -7813,6 +7990,8 @@ FIX
     st "containers: dependents + states"   '( st_prep internet jellyfin tailscale full; CFG[FOLDER_FOR_YAML]=$t/ct; FOLDER_FOR_YAML=$t/ct; d=$(ct_dependents gluetun | xargs); [[ "$d" == "chromium qbittorrent sonarr" && -z "$(ct_dependents sonarr)" ]] && CT_STATE=([gluetun]=running [sonarr]=running [homepage]=exited [qbittorrent]=running) && CT_STATUS=([gluetun]="Up 2 hours (healthy)" [sonarr]="Up 5 minutes" [homepage]="Exited (0) 3 hours ago" [qbittorrent]="Up 10 seconds (health: starting)") && [[ "$(ct_label gluetun)" == "healthy|2 hours" && "$(ct_label sonarr)" == "running|5 minutes" && "$(ct_label homepage)" == "stopped|3 hours ago" && "$(ct_label qbittorrent)" == "starting|10 seconds" && "$(ct_label chromium)" == "not created|" ]] )'
     st "containers: gluetun order + picker" '( st_prep internet jellyfin tailscale full; CFG[FOLDER_FOR_YAML]=$t/ct; FOLDER_FOR_YAML=$t/ct; require_config() { :; }; resolve_runtime() { :; }; load_secrets() { :; }; docker_up() { return 0; }; svc_exists() { return 0; }; is_tty() { return 1; }; ct_wait_up() { echo "wait $1" >>$t/ct/calls; }; ct_refresh() { :; }; run_logged() { shift; echo "compose $*" >>$t/ct/calls; }; : >$t/ct/calls; ct_action stop gluetun >/dev/null 2>&1; [[ "$(cat $t/ct/calls)" == "compose stop chromium qbittorrent sonarr"$'"'"'\n'"'"'"compose stop gluetun" ]] && : >$t/ct/calls && ct_action start gluetun >/dev/null 2>&1 && [[ "$(head -n 1 $t/ct/calls)" == "compose up -d --no-deps gluetun" && "$(sed -n 2p $t/ct/calls)" == "wait gluetun" && "$(sed -n 3p $t/ct/calls)" == "compose up -d --no-deps chromium qbittorrent sonarr" ]] && : >$t/ct/calls && ct_action restart sonarr >/dev/null 2>&1 && [[ "$(cat $t/ct/calls)" == "compose restart sonarr" ]] && docker() { :; } && x=$(pick_service p "Pick" all <<<"2" >/dev/null; echo "$p") && pick_service p "Pick" all <<<"sonarr" >/dev/null && [[ "$p" == sonarr ]] && s="" && pick_service s "Pick" all <<<"sonarr" >/dev/null && [[ "$s" == sonarr ]] && pick_service p "Pick" all <<<"2" >/dev/null && [[ -n "$p" ]] && ! pick_service p "Pick" all <<<"" >/dev/null )'
     st "Homepage link checks"               '( [[ "$(cidr_last_host 172.28.10.0/24)" == 172.28.10.254 && "$(cidr_last_host 10.0.0.0/16)" == 10.0.255.254 ]] && ! cidr_last_host bad && st_prep internet jellyfin tailscale core && CFG[FOLDER_FOR_YAML]=$t/hz && FOLDER_FOR_YAML=$t/hz && printf "DOCKER_SUBNET=172.28.10.0/24\nWEBUI_PORT_SONARR=8989\n" >$t/hz/.env && printf "  traefik:\n    image: t\n  homepage:\n    image: h\n" >>$t/hz/docker-compose.yaml && traefik_fixed_ip >/dev/null && o=$(render_override "$t/hz/docker-compose.yaml") && tr=$(awk "/^  traefik:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o") && hp=$(awk "/^  homepage:/{f=1;next} /^  [a-z]/{f=0} f" <<<"$o") && [[ "$tr" == *"ipv4_address: 172.28.10.254"* && "$hp" == *"extra_hosts:"* && "$hp" == *"- \"sonarr.\${CLOUDFLARE_DNS_ZONE:?err}:172.28.10.254\""* ]] && f=$(printf "sonarr|service:gluetun|sonarr.x.org||\n") && svc_enabled() { [[ "$1" != plex ]]; } && y=$(render_homepage_services "$f") && [[ "$y" == *"siteMonitor: https://sonarr.x.org"* ]] && CFG[HOMEPAGE_LINK_CHECKS]=no && y=$(render_homepage_services "$f") && [[ "$y" != *siteMonitor* ]] )'
+    st "automatic updates: timer"           '( CFG[AUTO_UPDATE]=weekly; CFG[AUTO_UPDATE_DAY]=Wed; CFG[AUTO_UPDATE_TIME]=03:41; [[ "$(auto_update_calendar)" == "Wed *-*-* 03:41:00" ]] && CFG[AUTO_UPDATE]=daily && [[ "$(auto_update_calendar)" == "*-*-* 03:41:00" ]] && v_hhmm 23:59 && ! v_hhmm 24:00 && v_dow Sun && ! v_dow Sunday && v_svclist "plex jellyfin" && ! v_svclist "plex;rm" && mkdir -p $t/un && MS_UNIT_DIR=$t/un && systemctl() { echo "systemctl $*" >>$t/un/calls; }; run() { "$@"; }; write_file() { cat >"$1"; }; update_units >/dev/null && grep -qx "OnCalendar=\*-\*-\* 03:41:00" $t/un/mediastack-update.timer && grep -qx "Persistent=true" $t/un/mediastack-update.timer && grep -q "^ExecStart=.* --auto-update --yes$" $t/un/mediastack-update.service && grep -q "enable mediastack-update.timer" $t/un/calls && CFG[AUTO_UPDATE]=off && update_units >/dev/null && [[ ! -e $t/un/mediastack-update.timer && ! -e $t/un/mediastack-update.service ]] )'
+    st "automatic updates: exclusions"      '( compose_run() { case "$*" in "config --images") printf "img/a:1\nimg/b:1\nimg/c:1\n" ;; "config --services") printf "a\nb\nc\n" ;; esac; }; compose_stream() { echo "$*" >$t/pull.args; }; declare -A IMGID=([img/a:1]=x1 [img/b:1]=y1 [img/c:1]=z1); image_id() { echo "${IMGID[$1]}"; }; compose_stream() { echo "$*" >$t/pull.args; IMGID[img/a:1]=x2; }; PULL_EXCLUDE="b"; PULL_REPORT=$t/pull.rep; compose_pull >/dev/null && [[ "$(cat $t/pull.args)" == "pull a c" && "$(cat $t/pull.rep)" == "img/a:1" ]] && PULL_EXCLUDE="" && compose_pull >/dev/null && [[ "$(cat $t/pull.args)" == "pull" ]] )'
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
@@ -7901,6 +8080,7 @@ main_menu() {
         printf '   6) Stop stack             (containers down, data kept)\n'
         printf '   R) Restart containers     (all; no converge)\n'
         printf '   M) Containers             (one at a time: restart, stop, start, recreate, logs)\n'
+        printf '   A) Automatic updates      (%s)\n' "$(auto_update_desc)"
         printf '   7) Status\n   8) Post-install helpers\n   9) Logs\n   K) Certificate          (refresh, show, fetch key, push receiver)\n'
         printf '   L) URLs, ports and DNS names\n'
         printf '  %sMaintenance%s\n' "$B" "$NC"
@@ -7920,6 +8100,7 @@ main_menu() {
             l) menu_action show_urls ;;
             r) menu_action stack_restart ;;
             m) menu_containers ;;
+            a) menu_auto_update ;;
             b) menu_backup ;;
             c) menu_action show_config ;;
             u) menu_uninstall ;;
@@ -7965,6 +8146,8 @@ Actions (default: interactive menu)
                          from file F, stdin (-) or a prompt (CERT_MODE=push)
   --cert-receive         Push receiver: read chain + key on stdin (run by the forced SSH command)
   --process-requests     Apply status board change requests (run by the mediastack-requests.path unit)
+  --auto-update          Update container images now, as the automatic-update timer does (Apply with pull,
+                         AUTO_UPDATE_EXCLUDE kept, old images removed)
   --container ACTION [SERVICE]
                          restart | stop | start | recreate | logs | follow one container (and, for Gluetun,
                          the apps in its network); without SERVICE a numbered list to pick from
@@ -8032,6 +8215,7 @@ main() {
             --status)       action=status ;;
             --urls)         action=urls ;;
             --helper)       action=helper; helper=${2:-}; shift ;;
+            --auto-update)  action=autoupdate ;;
             --container)    action=container; helper=${2:-}; arg1=${3:-}; shift 2 || true ;;
             --secrets)      action=secrets ;;
             --settings)     action=settings ;;
@@ -8057,9 +8241,15 @@ main() {
     fi
 
     check_root "${orig[@]}"
-    case "$action" in certrefresh|certreceive) init_logging cert ;; processrequests) init_logging request ;; *) init_logging ;; esac
+    case "$action" in certrefresh|certreceive) init_logging cert ;; processrequests) init_logging request ;; autoupdate) init_logging update ;; *) init_logging ;; esac
     if [[ "$action" == processrequests ]]; then   # a board request waits for a running menu/apply
         exec 9>"$MS_LOCK_FILE"; flock -w 900 9 || die "Busy: another run held the lock for 15 minutes."
+    elif [[ "$action" == autoupdate ]]; then      # waits for a menu session / apply; skipped (and recorded) after 30 min
+        exec 9>"$MS_LOCK_FILE"
+        if ! flock -w 1800 9; then
+            load_config; auto_update_write_state skipped "" "another installer run (an open menu?) held the lock for 30 minutes"
+            die "Busy: another run held the lock for 30 minutes; automatic update skipped."
+        fi
     elif [[ "$action" == certreceive ]]; then   # a push waits for a menu/apply run instead of failing
         exec 9>"$MS_LOCK_FILE"
         flock -w 300 9 || { printf '%s FAIL busy: another run held the lock for 5 minutes\n' "$CERT_RECEIVE_TAG"; exit 1; }
@@ -8091,6 +8281,7 @@ main() {
         certpush)  cert_push_setup "$arg1" ;;
         certreceive) cert_receive ;;
         processrequests) process_requests ;;
+        autoupdate) auto_update ;;
         status)    show_status ;;
         urls)      show_urls ;;
         secrets)   menu_secrets ;;
