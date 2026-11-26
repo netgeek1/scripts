@@ -3,6 +3,18 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.4.2 — 2026-11-25 — qBittorrent keeps taking the forwarded port
+
+### Fixed
+- **qBittorrent stopped taking the forwarded port** once its "Bypass authentication for clients on localhost" was
+  off again: the installer only turned it on during Apply, and Gluetun's hook only runs when the port changes.
+  - A start-up script (`<data>/qbittorrent-init/10-mediastack-localhost-auth`, mounted at `/custom-cont-init.d`,
+    which LinuxServer images run as root before the app) turns it back on at every qBittorrent start.
+  - Apply re-sends Gluetun's current forwarded port to qBittorrent.
+  - Status board: "Set qBittorrent's port now" on the Forwarded port card when qBittorrent didn't take the port
+    (request action `pf_resync`).
+- Self-test: 101 checks.
+
 ## v3.4.1 — 2026-11-25 — CrowdSec decisions explained on the board
 
 ### Fixed
