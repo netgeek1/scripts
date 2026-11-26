@@ -3,6 +3,16 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.4.3 — 2026-11-26 — qBittorrent's new settings layout
+
+### Fixed
+- **qBittorrent still answered 403 to the port hook.** Newer qBittorrent keeps its Web UI settings in a `[WebUI]`
+  section (`LocalHostAuth=false`) instead of `[Preferences]` (`WebUI\LocalHostAuth=false`), and moves them once
+  when it upgrades; the installer wrote only the old location, which it then ignores. The start-up script and Apply
+  now set both, so old and new versions are covered.
+- The hook's failure detail was empty (`wget -q` hides the reason). It now records qBittorrent's status line (e.g.
+  `HTTP/1.1 403 Forbidden`, with what it means) or the connection error, and shows each attempt while pending.
+
 ## v3.4.2 — 2026-11-25 — qBittorrent keeps taking the forwarded port
 
 ### Fixed
