@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.7.0"
+readonly SCRIPT_VERSION="3.7.1"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -2637,7 +2637,8 @@ gluetun_image() {
 }
 
 # traefik_api PATH -> JSON from Traefik's API (port 8080 inside the container; wget is in the image)
-traefik_api() { docker exec traefik wget -qO- -T 5 "http://127.0.0.1:8080$1" 2>/dev/null; }
+#   blank when the API is not answering yet (callers wait/retry on blank; never an error of its own)
+traefik_api() { docker exec traefik wget -qO- -T 5 "http://127.0.0.1:8080$1" 2>/dev/null || true; }
 
 # traefik_router_errors JSON -> "router: error" lines for routers Traefik could not build
 traefik_router_errors() {
@@ -2693,7 +2694,7 @@ traefik_ensure_middlewares() {
     svc_enabled traefik && docker ps -q --filter 'name=^traefik$' 2>/dev/null | grep -q . || return 0
     (( DRY_RUN )) && return 0
     local errs i
-    for (( i = 0; i < 6; i++ )); do       # the API needs a few seconds after a (re)start
+    for (( i = 0; i < 12; i++ )); do      # the API needs a few seconds after a (re)start (Apply may recreate Traefik)
         errs=$(traefik_router_errors "$(traefik_api /api/http/routers)")
         [[ -n "$(traefik_api /api/http/routers)" ]] && break
         sleep 5
