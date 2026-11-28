@@ -3,6 +3,31 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.9.0 — 2026-11-26 — Dynamic DNS for any provider
+
+### Added
+- **DDNS records mode** (`DDNS_PROVIDER=records`, Settings → **E**): DDNS-Updater records for any of its ~60
+  providers, not only Cloudflare.
+  - **Provider list.** Built from DDNS-Updater's own docs (latest release, `main` as fallback): every provider's
+    required, optional and alternative fields, with types and help.
+    - Downloaded on first use, re-downloaded by Apply once a week old, and on demand (menu **P** / board button).
+    - A failed download keeps the stored list.
+  - **Menu.** Add / edit / remove records with a numbered provider list and per-field prompts. Each record is checked
+    against the provider's rules before saving.
+  - **Board.** The DDNS tab gets a full editor: provider picker, a form generated from the catalogue, edit and remove,
+    and refresh provider list. Changes go through the validated request queue (`ddns_entry`, `ddns_catalog`).
+  - **Secrets.** Stored per record in the vault (`DDNS_<ID>_<FIELD>`) and passed as `${MS_DDNS_…}` references in
+    the override's `CONFIG`.
+    - Never in `ddns-records.json`, on the board or in logs; board request values are redacted.
+    - A blank secret on edit keeps the stored one; removing a record removes its secrets.
+- Self-test: DDNS records check (migration, add, refused incomplete record, render, `$` escaping, secret export,
+  remove).
+
+### Changed
+- `DDNS_PROVIDER=cloudflare` configs are migrated to records automatically (the token is copied per record).
+  `CLOUDFLARE_DNS_API_TOKEN` is now asked for only in Let's Encrypt mode.
+- The Settings summary shows the DDNS record count.
+
 ## v3.8.0 — 2026-11-26 — Automatic updates
 
 ### Added
