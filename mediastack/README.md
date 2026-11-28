@@ -143,7 +143,7 @@ You can re-run detection any time with **Settings → D**.
    7) Services           preset=core player=jellyfin tailscale=tailscale
    8) VPN / email        openvpn / mullvad
    9) Upstream / secrets / backups  8e908ae60bf4 full-download-vpn mode=vault
-   E) Dynamic DNS        cloudflare (media.example.org,*.media.example.org)
+   E) Dynamic DNS        records (2 record(s))
    U) Hostnames / ports  2 change(s) from the defaults
    D) Re-run detection   T) Test share mount   V) View all
    W) Save   A) Save + apply   0) Back
@@ -761,7 +761,7 @@ no capabilities, **no Docker socket**) and uses each tool's own API:
 | **Tailscale** | state, tailnet, this node, advertised routes/exit node, home relay; every peer with online state, IP, OS, direct/relay connection, traffic, last seen | ping a peer; a link to **Tailscale's own web interface** (`http://<tailscale-ip>:5252`, enabled by Apply) for exit node, routes and SSH changes | LocalAPI over the `tailscaled` socket (shared `<data>/tailscale/run`, read-only mount) |
 | **Headscale** | health, nodes (online, user, IPs, approved routes and routes **waiting for approval**, last seen, key expiry, tags), users | read-only; a link to **Headplane** for users, routes, nodes and keys | Headscale's REST API with the board's own API key (`STATUSBOARD_HEADSCALE_KEY`, created by Apply, separate from the Headplane sign-in key so either can be revoked alone) |
 | **Gluetun VPN** | VPN state, provider/type, public IP and location, forwarded port, when the server list was last updated (and how many servers) | restart / stop / start the VPN, update the server list now; **change the server selection** (countries, cities, hostnames, regions), or for provider `custom` WireGuard the **server endpoint** (IP, port, public key); **port forwarding on/off**; recreate Gluetun | control server with a generated API key (`HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE`) |
-| **DDNS** | provider, records, last update and current IP per record (from DDNS-Updater's `updates.json`), a link to its page | **change the records** (Cloudflare provider) | DDNS-Updater's data folder, read-only |
+| **DDNS** | provider, records, last update and current IP per record (from DDNS-Updater's `updates.json`), a link to its page | **add, edit and remove records** for any provider (a form built from the provider's documented settings; secrets are write-only), refresh the provider list | DDNS-Updater's data folder, read-only |
 | **CrowdSec** | metrics (alerts, log lines read and parsed, bouncer requests); active decisions counted by origin: your detections (`crowdsec`), manual bans (`cscli`), the community blocklist (`CAPI`) and subscribed lists, your own listed in full, the community ones folded away; an "Is an IP blocked?" lookup; recent alerts | ban an IP or range (duration, reason), unban | LAPI: the Traefik bouncer key for decisions, a `statusboard` machine login (registered by Apply) for alerts/ban/unban; metrics on :6060 |
 
 **Changes need the HTTPS address.** Actions are accepted only when the request comes through Traefik with an
@@ -881,21 +881,42 @@ the API directly, which forward-auth would break. It keeps upstream's security h
 ## Dynamic DNS (DDNS-Updater)
 
 DDNS-Updater keeps public DNS records pointed at your current public IP. **Its own web page is status-only**: it has
-no editor, its records come from a JSON config. The installer builds that config, so the records are set in
-**Settings → E) Dynamic DNS** (or on the status board's DDNS tab, which goes through the same validation).
+no editor, its records come from a JSON config. The installer builds that config for **any provider DDNS-Updater
+supports**. Records are set in **Settings → E) Dynamic DNS** or on the status board's DDNS tab, which goes through
+the same validation.
 
 | Key | Default | Notes |
 |---|---|---|
-| `DDNS_PROVIDER` | `none` | `none` (DDNS-Updater off in the presets), `cloudflare` or `custom` |
-| `DDNS_RECORDS` | `<zone>,*.<zone>` | Cloudflare: comma-separated names, each the zone or under it |
-| `DDNS_CF_ZONE_ID` | blank | Cloudflare Zone ID (32 hex: dashboard → your domain → Overview) |
-| `DDNS_TTL` / `DDNS_PROXIED` / `DDNS_IP_VERSION` | `1` (auto) / `no` / `ipv4` | Per-record settings for every record |
-| `DDNS_CONFIG_FILE` | blank | `custom`: your own `config.json` for any provider DDNS-Updater supports, copied to `<data>/ddns-updater/` |
+| `DDNS_PROVIDER` | `none` | `none` (DDNS-Updater off in the presets), `records` (records edited by the installer) or `custom` |
+| `DDNS_CONFIG_FILE` | blank | `custom`: your own `config.json`, copied to `<data>/ddns-updater/` |
 
-With `cloudflare`, the config goes into DDNS-Updater's `CONFIG` variable in the managed override. The API token is
-the vault's `CLOUDFLARE_DNS_API_TOKEN` (Zone → DNS → Edit), the same one Let's Encrypt mode uses, and is filled in by
-Compose at start, so it is never written to a file. Status shows the records and any problem (missing zone ID or
-token, records outside the zone).
+### Records mode
+
+- **Provider list.** The installer downloads DDNS-Updater's provider documentation from GitHub (the latest
+  release, or `main` if that fails) and builds a catalogue of every provider with its settings: required and optional
+  fields, alternatives (for example "token, or email + key"), types and help text. The catalogue lives in
+  `/var/lib/mediastack-installer/ddns-catalog.json`.
+  - It is downloaded on first use.
+  - Apply re-downloads it once it is a week old.
+  - **P** in the menu, or **Refresh provider list** on the board, downloads it now.
+  - If a download fails, the stored list is kept.
+- **Records.** **A** adds a record: pick the provider from the numbered list, then fill in its fields (required ones
+  first, Enter skips an optional one). **E** edits one, **R** removes one. A record is checked against the provider's
+  rules before it is saved, so a missing token or a non-number TTL is refused with the reason.
+- **Secrets.** Tokens, passwords, keys and secrets go into the encrypted vault as `DDNS_<ID>_<FIELD>`, never into
+  `ddns-records.json` or the board. When editing, leave a secret blank to keep the stored one. In the managed
+  override's `CONFIG`, secrets are `${MS_DDNS_…}` references that Compose fills in at start, so they are not written to
+  a file. Removing a record removes its secrets.
+- **Board.** The DDNS tab shows the records and the status DDNS-Updater reports for each. Over HTTPS, signed in, it
+  can add, edit and remove records with a form built from the catalogue (secret fields are password inputs and are never
+  sent back to the browser). Changes go through the request queue (see the status board section), and the request log
+  never records field values.
+- **Older configs.** A `DDNS_PROVIDER=cloudflare` setup (`DDNS_RECORDS`, `DDNS_CF_ZONE_ID`, `DDNS_TTL`,
+  `DDNS_PROXIED`, `DDNS_IP_VERSION`) is converted to records on the next Apply or the next visit to Settings → E. The
+  Cloudflare token is copied to each record's own vault key. `CLOUDFLARE_DNS_API_TOKEN` stays in the vault for
+  Let's Encrypt.
+
+Status shows any problem, for example a required field that is missing.
 
 ## Secrets
 
@@ -908,9 +929,9 @@ Secrets live encrypted in `/etc/mediastack/secrets.enc`. They are never logged a
   (`TLS_KEY_PASSPHRASE`).
 - **Generated once and reused:** the PostgreSQL password, Authentik secret key, headplane cookie secret and Homarr's
   `SECRET_ENCRYPTION_KEY`.
-- **Asked for only when used:** for example, the Cloudflare token only when Traefik runs with Let's Encrypt or
-  DDNS-Updater uses Cloudflare, and `PLEX_CLAIM` only when Plex is on.
+- **Asked for only when used:** for example, the Cloudflare token only when Traefik runs with Let's Encrypt, and `PLEX_CLAIM` only when Plex is on.
 - **Collected by a helper:** *ARR API tokens, Homarr's API key (`HOMARR_API_KEY`; stays in the vault, not in `.env`).
+- **Per DDNS record:** `DDNS_<ID>_<FIELD>` (Settings → E or the status board).
 
 | Backend | When | Protection |
 |---|---|---|
