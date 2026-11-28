@@ -3,6 +3,18 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.9.1 — 2026-11-28 — Apply no longer aborts while Tailscale comes online
+
+### Fixed
+- Apply stopped with `[FAIL] rc=1 at line …: paste -sd, -` / `sed -nE …"id"…` after Homarr's sync, when the Tailscale
+  container (Headscale control) had just been recreated and was not online yet. An empty "no node online" answer
+  counted as an error under `pipefail`, so Apply aborted instead of waiting. The Headscale JSON helpers now return an
+  empty answer for no match. The same flaw could hit the Headscale user lookup.
+- The wait for the Tailscale node to come online before approving its routes and exit node is now up to 240 s (was
+  60 s), matching the container health wait. A note is shown after 30 s; if it never comes online, Apply warns and
+  carries on.
+- Self-test: 107 checks (Headscale JSON with no match).
+
 ## v3.9.0 — 2026-11-26 — Dynamic DNS for any provider
 
 ### Added
