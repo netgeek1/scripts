@@ -3,6 +3,16 @@
 All notable changes to **mediastack-installer.sh**. Newest first.
 `SCRIPT_VERSION` in the script is the authoritative version string. Versions follow `MAJOR.MINOR.PATCH`.
 
+## v3.9.2 — 2026-11-28 — Tailscale node found on Headscale 0.29
+
+### Fixed
+- Apply waited the full 240 s ("Waiting for the Tailscale container to come online in Headscale") although Tailscale
+  was up: Headscale 0.29's `nodes list -o json` has no `online` field, so the node never matched. The node is now
+  found by name (the newest one wins if an old registration is left over). Approving routes works whether or not the
+  node is online, so Apply waits only while the node has not registered yet.
+- Routes already approved are detected ("routes and exit node already approved"), so no approve call is made.
+- Self-test: the Headscale check uses the 0.29.8 JSON layout (old + current node, approved routes).
+
 ## v3.9.1 — 2026-11-28 — Apply no longer aborts while Tailscale comes online
 
 ### Fixed
