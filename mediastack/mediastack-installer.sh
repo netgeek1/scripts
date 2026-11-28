@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.9.0"
+readonly SCRIPT_VERSION="3.9.1"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -6604,7 +6604,14 @@ hs() { docker exec headscale headscale "$@"; }
 #   (Headscale's -o json: an array of objects, "id" first, ids as strings; nested objects never start a line)
 json_ids_by_field() {
     tr -d '\n' <<<"$1" | sed -E 's/^[[:space:]]*\[//; s/\}[[:space:]]*,[[:space:]]*\{[[:space:]]*"id"/}\n{"id"/g' \
-        | grep -E "\"$2\":[[:space:]]*\"$3\"" | sed -nE 's/^[[:space:]]*\{[[:space:]]*"id":[[:space:]]*"?([0-9]+)"?.*/\1/p'
+        | { grep -E "\"$2\":[[:space:]]*\"$3\"" || true; } | sed -nE 's/^[[:space:]]*\{[[:space:]]*"id":[[:space:]]*"?([0-9]+)"?.*/\1/p'
+    return 0      # no match is an empty answer, not an error (set -e / pipefail would abort the caller)
+}
+# json_online_only JSON -> only the objects with "online": true (empty when none is online yet)
+json_online_only() {
+    tr -d '\n' <<<"$1" | sed -E 's/\}[[:space:]]*,[[:space:]]*\{[[:space:]]*"id"/}\n{"id"/g' \
+        | { grep -E '"online":[[:space:]]*true' || true; } | paste -sd, -
+    return 0
 }
 json_id_by_field() { json_ids_by_field "$@" | head -n1; }
 
@@ -6648,11 +6655,14 @@ headscale_join_tailscale() {
         compose_run up -d --force-recreate tailscale >>"$LOG_FILE" 2>&1 || { log_warn "Could not recreate the Tailscale container."; return 0; }
     fi
     # approve the advertised routes + exit node (idempotent)
-    for (( i = 0; i < 60; i += 3 )); do
-        out=$(hs nodes list -o json 2>/dev/null)
-        nid=$(json_ids_by_field "$(tr -d '\n' <<<"$out" | sed -E 's/\}[[:space:]]*,[[:space:]]*\{[[:space:]]*"id"/}\n{"id"/g' | grep -E '"online":[[:space:]]*true' | paste -sd, -)" name exit-node | tail -n1)
+    # a just-recreated Tailscale container can take minutes to come online: wait up to 240 s (like the health wait)
+    nid=""
+    for (( i = 0; i < 240; i += 5 )); do
+        out=$(hs nodes list -o json 2>/dev/null) || out=""
+        nid=$(json_ids_by_field "$(json_online_only "$out")" name exit-node | tail -n1)
         [[ -n "$nid" ]] && break
-        sleep 3
+        (( i == 30 )) && log_info "Waiting for the Tailscale container to come online in Headscale (up to 240 s)..."
+        sleep 5
     done
     if [[ -z "$nid" ]]; then
         log_warn "The Tailscale container has not registered with Headscale yet (sudo docker logs --tail 30 tailscale)."
@@ -8390,6 +8400,7 @@ sonarr|service:gluetun|sonarr.example.org tv.example.org|1|" ]] )'
     st "Headscale: no web page links"      '( no_webui headscale && ! no_webui headplane && f="headscale|service:x|headscale.x.org||" && o=$(F() { render_homepage_services "$f"; }; F) && awk "/- Headscale:/{f=1;next} /^    - /{f=0} f" <<<"$o" | grep -q "description:" && ! awk "/- Headscale:/{f=1;next} /^    - /{f=0} f" <<<"$o" | grep -q "href:" )'
     st "Headscale join: key, state, routes" '( st_prep internet jellyfin headscale core; FOLDER_FOR_DATA=$t/hj; FOLDER_FOR_YAML=$t/hj; mkdir -p $t/hj/tailscale; printf "DOCKER_SUBNET=172.28.10.0/24\n" >$t/hj/.env; echo old >$t/hj/tailscale/tailscaled.state; CFG[LOCAL_SUBNET]=192.168.11.0/24; LOG_FILE=/dev/null; SECRETS[TAILSCALE_AUTHKEY]=tskey-auth-old; save_secrets() { :; }; sleep() { :; }; compose_run() { echo "compose $*" >>$t/hj/calls; }; docker() { shift 3; case "$*" in "apikeys list") ;; "users list -o json") [[ -f $t/hj/u ]] && printf "[\n  {\n    \"id\": \"4\",\n    \"name\": \"exit-node\"\n  }\n]\n" || echo "[]" ;; "users create exit-node") touch $t/hj/u ;; "preauthkeys create --user 4 --reusable --expiration 365d") echo hskey-auth-Ab12-xyzxyzxyzxyzxyz ;; "nodes list -o json") echo "[{\"id\":\"9\",\"name\":\"exit-node\",\"online\":true}]" ;; nodes\ approve-routes*) echo "$*" >>$t/hj/calls ;; *) return 1 ;; esac; }; headscale_join_tailscale >/dev/null; [[ "${SECRETS[TAILSCALE_AUTHKEY]}" == hskey-auth-Ab12-xyzxyzxyzxyzxyz && ! -e $t/hj/tailscale/tailscaled.state && $(ls $t/hj/tailscale/tailscaled.state.bak-* | wc -l) == 1 && "$(cat $t/hj/tailscale/.control-server)" == http://headscale:8080 ]] && grep -q "compose up -d --force-recreate tailscale" $t/hj/calls && grep -q "approve-routes --identifier 9 --routes 192.168.11.0/24,172.28.10.0/24,0.0.0.0/0,::/0" $t/hj/calls && : >$t/hj/calls && headscale_join_tailscale >/dev/null && ! grep -q force-recreate $t/hj/calls )'
     st "Guacamole DB: create + schema once" '( st_prep internet jellyfin tailscale full; FOLDER_FOR_YAML=$t/gq; mkdir -p $t/gq; printf "POSTGRESQL_USERNAME=pg\nAUTHENTIK_DATABASE=ak\nGUACAMOLE_DATABASE=guac\n" >$t/gq/.env; : >$t/gq/calls; wait_postgres() { :; }; compose_run() { echo guacamole/guacamole:1.6.0; }; pg_query() { case "$2" in *pg_database*) [[ -f $t/gq/db ]] && echo 1 ;; *to_regclass*) [[ -f $t/gq/schema ]] && echo t || echo f ;; esac; }; pg_sql() { local q; q=$(cat); case "$q" in *"CREATE DATABASE \"guac\""*) touch $t/gq/db ;; *guacamole_user*) touch $t/gq/schema ;; esac; echo "sql $1" >>$t/gq/calls; }; docker() { case "$1" in run) echo "CREATE TABLE guacamole_user (x int);"; echo "run $*" >>$t/gq/calls ;; restart) echo "restart $2" >>$t/gq/calls ;; esac; }; svc_enabled() { [[ "$1" == guacamole || "$1" == postgresql ]]; }; guacamole_ensure_db >/dev/null 2>&1; [[ -f $t/gq/db && -f $t/gq/schema ]] && grep -q "run run --rm guacamole/guacamole:1.6.0 /opt/guacamole/bin/initdb.sh --postgresql" $t/gq/calls && grep -q "restart guacamole" $t/gq/calls && : >$t/gq/calls && guacamole_ensure_db >/dev/null 2>&1 && [[ ! -s $t/gq/calls ]] && rm $t/gq/schema && guacamole_ensure_db >/dev/null 2>&1 && grep -q initdb $t/gq/calls && ! grep -q "CREATE" $t/gq/calls )'
+    st "headscale JSON: no match is not an error" '( set -eo pipefail; j="[{\"id\":\"1\",\"name\":\"exit-node\",\"user\":{\"id\":\"2\",\"name\":\"x\"},\"online\":false},{\"id\":\"3\",\"name\":\"other\",\"online\":true}]"; a=$(json_ids_by_field "$(json_online_only "$j")" name exit-node | tail -n1); [[ -z "$a" ]]; b=$(json_ids_by_field "$j" name exit-node); [[ "$b" == 1 ]]; c=$(json_ids_by_field "$(json_online_only "${j/false/true}")" name exit-node | tail -n1); [[ "$c" == 1 ]]; d=$(json_id_by_field "[]" name nobody); [[ -z "$d" ]] )'
     st "hostnames: rules keep paths"        '( CFG[SERVICE_HOSTNAMES]="plex=watch,plex sonarr=tv"; [[ "$(hostname_rule plex "Host(\`plex.\${CLOUDFLARE_DNS_ZONE:?err}\`) && PathPrefix(\`/web/\`)")" == "(Host(\`watch.\${CLOUDFLARE_DNS_ZONE:?err}\`) || Host(\`plex.\${CLOUDFLARE_DNS_ZONE:?err}\`)) && PathPrefix(\`/web/\`)" && "$(hostname_rule sonarr "Host(\`sonarr.\${CLOUDFLARE_DNS_ZONE:?err}\`)")" == "Host(\`tv.\${CLOUDFLARE_DNS_ZONE:?err}\`)" && "$(svc_labels radarr)" == radarr && "$(svc_labels authentik)" == auth ]] && v_hostmap "a=x,y b=z" && ! v_hostmap "a=x b=x" && ! v_hostmap "a=x.y" && ! v_labels "tv," && v_portmap "plex=32401" && ! v_portmap "plex=70000" && [[ "$(map_set "b=2 a=1" c 3)" == "a=1 b=2 c=3" && "$(map_set "a=1 b=2" a "")" == "b=2" ]] )'
     mkdir -p "$t/hz"; cat >"$t/hz/docker-compose.yaml" <<'FIX'
 services:
