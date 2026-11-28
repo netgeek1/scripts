@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="3.8.0"
+readonly SCRIPT_VERSION="3.9.0"
 readonly SCRIPT_NAME="mediastack-installer"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
@@ -598,8 +598,7 @@ secret_needed() {
         WIREGUARD_PRIVATE_KEY) svc_enabled gluetun && [[ "${CFG[VPN_TYPE]}" == wireguard ]] ;;
         WIREGUARD_PRESHARED_KEY) return 1 ;;   # optional; most providers do not use one
         UPDATER_PROTONVPN_PASSWORD) svc_enabled gluetun && [[ "${CFG[VPN_SERVICE_PROVIDER]}" == protonvpn && -n "${CFG[VPN_UPDATER_PROTON_EMAIL]}" ]] ;;
-        CLOUDFLARE_DNS_API_TOKEN) { svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == letsencrypt ]]; } \
-                                  || { svc_enabled ddns-updater && [[ "${CFG[DDNS_PROVIDER]}" == cloudflare ]]; } ;;
+        CLOUDFLARE_DNS_API_TOKEN) svc_enabled traefik && [[ "${CFG[CERT_MODE]}" == letsencrypt ]] ;;
         TAILSCALE_AUTHKEY) svc_enabled tailscale ;;
         PLEX_CLAIM) svc_enabled plex ;;
         EMAIL_PASSWORD) svc_enabled authentik && [[ -n "${CFG[EMAIL_SERVER_HOST]}" ]] ;;
@@ -1522,12 +1521,12 @@ EOF
             printf '    networks:\n      mediastack:\n        ipv4_address: %s\n' "$(traefik_fixed_ip)"
             ;;
         ddns-updater)
-            printf '    # DDNS-Updater: records from the installer settings (DDNS_*); the API token comes from the vault\n'
+            printf '    # DDNS-Updater: records from the installer (Settings -> E / status board); secrets filled in from the vault\n'
             printf '    environment:\n'
-            if [[ "${CFG[DDNS_PROVIDER]}" == cloudflare ]]; then
-                printf "      - 'CONFIG=%s'\n" "$(ddns_config_json)"
+            if [[ "${CFG[DDNS_PROVIDER]}" == records && -n "$DDNS_CONFIG_RENDERED" ]]; then
+                printf "      - 'CONFIG=%s'\n" "$(ddns_config_yaml_value)"
             else
-                printf '      - CONFIG=\n'      # custom: <data>/ddns-updater/config.json
+                printf '      - CONFIG=\n'      # custom: <data>/ddns-updater/config.json; none / no records: nothing
             fi
             ;;
         authentik|authentic-worker)
@@ -3569,6 +3568,7 @@ compose_run() {
             in_list "$k" "${SECRET_NON_ENV[@]}" && continue
             if [[ "${CFG[SECRETS_MODE]}" == vault ]]; then export "$k=${SECRETS[$k]:-}"; fi
         done
+        ddns_export_secrets
         docker compose -p "$PROJECT_NAME" "$@"
     )
 }
@@ -3805,6 +3805,8 @@ stack_apply() {
     sync_preset
     deploy_files
     render_env
+    ddns_migrate_legacy
+    ddns_render
     write_override
     ensure_storage
     ensure_folders
@@ -3813,6 +3815,7 @@ stack_apply() {
     write_homepage_config
     write_statusboard_app
     write_ddns_custom_config
+    ddns_publish_board
     write_pf_script
     write_qbt_init
     cert_units
@@ -4691,7 +4694,8 @@ menu_settings() {
         printf '   7) Services           preset=%s player=%s tailscale=%s\n' "${CFG[SERVICE_PRESET]}" "${CFG[PLAYER]}" "${CFG[TAILSCALE_CONTROL]}"
         printf '   8) VPN / email        %s / %s\n' "${CFG[VPN_TYPE]}" "${CFG[VPN_SERVICE_PROVIDER]}"
         printf '   9) Upstream / secrets / backups  %s %s mode=%s\n' "${CFG[UPSTREAM_REF]:0:12}" "${CFG[UPSTREAM_VARIANT]}" "${CFG[SECRETS_MODE]}"
-        printf '   E) Dynamic DNS        %s%s\n' "${CFG[DDNS_PROVIDER]}" "$([[ -n "${CFG[DDNS_RECORDS]}" && "${CFG[DDNS_PROVIDER]}" == cloudflare ]] && printf ' (%s)' "${CFG[DDNS_RECORDS]}")"
+        printf '   E) Dynamic DNS        %s%s\n' "${CFG[DDNS_PROVIDER]}" "$(if [[ "${CFG[DDNS_PROVIDER]}" == records ]]; then printf ' (%s record(s))' "$(ddns_record_count)"
+             elif [[ -n "${CFG[DDNS_RECORDS]}" && "${CFG[DDNS_PROVIDER]}" == cloudflare ]]; then printf ' (%s)' "${CFG[DDNS_RECORDS]}"; fi)"
         printf '   U) Hostnames / ports  %s\n' "$(n=$(( $(wc -w <<<"${CFG[SERVICE_HOSTNAMES]:-}") + $(wc -w <<<"${CFG[SERVICE_PORTS]:-}") )); (( n )) && echo "$n change(s) from the defaults" || echo "defaults")"
         printf '   D) Re-run detection   T) Test share mount   V) View all\n'
         printf '   W) Save   A) Save + apply   0) Back\n'
@@ -5715,7 +5719,7 @@ req_result() {
 # process_requests -- apply status board change requests (strictly validated; whitelisted actions only)
 process_requests() {
     require_config; resolve_runtime; load_secrets
-    local dir="$FOLDER_FOR_DATA/statusboard/requests" f id base line k v action rc
+    local dir="$FOLDER_FOR_DATA/statusboard/requests" f id base line k v action rc msg
     [[ -d "$dir" ]] || return 0
     local -A kv
     for f in "$dir"/*.req; do      # every *.req: the path unit fires while any exists, so none may be left behind
@@ -5726,7 +5730,7 @@ process_requests() {
         mv -f "$f" "$dir/$id.run"
         kv=(); action=""
         while IFS= read -r line || [[ -n "$line" ]]; do
-            [[ "$line" =~ ^([A-Z_]{1,40})=(.{0,200})$ ]] || continue
+            [[ "$line" =~ ^([A-Z_]{1,40})=(.{0,4000})$ ]] || continue
             kv[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
         done <"$dir/$id.run"
         action=${kv[ACTION]:-}
@@ -5749,17 +5753,22 @@ process_requests() {
                 ( stack_apply nopull ) >>"$LOG_FILE" 2>&1 || rc=$?
                 if (( rc == 0 )); then req_result "$dir/$id.res" ok "Server selection applied (countries: ${CFG[SERVER_COUNTRIES]:-any}); Gluetun recreated." "$action"
                 else req_result "$dir/$id.res" error "Apply failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
-            ddns_records)
-                v=${kv[DDNS_RECORDS]:-}
-                if [[ "${CFG[DDNS_PROVIDER]}" != cloudflare ]]; then
-                    req_result "$dir/$id.res" error "Records can be edited here only with DDNS_PROVIDER=cloudflare." "$action"; rm -f "$dir/$id.run"; continue
-                elif ! v_ddns_records "$v" || ! ddns_records_in_zone "$v"; then
-                    req_result "$dir/$id.res" error "Not a list of names under $(tls_zone): '$v'" "$action"; rm -f "$dir/$id.run"; continue
+            ddns_entry)
+                # one record added / edited / removed on the board: REQ = base64 JSON {op, id, provider, fields}
+                if [[ "${CFG[DDNS_PROVIDER]}" != records ]]; then
+                    req_result "$dir/$id.res" error "DDNS records are edited here only with DDNS_PROVIDER=records (Settings -> E)." "$action"; rm -f "$dir/$id.run"; continue
                 fi
-                CFG[DDNS_RECORDS]=$v; save_config
+                v=$(printf '%s' "${kv[REQ]:-}" | base64 -d 2>/dev/null || true)
+                if [[ "$v" != \{* ]] || ! ddns_apply_request "$v"; then
+                    req_result "$dir/$id.res" error "Not saved: ${DDNS_MSG:-not a valid request}" "$action"; rm -f "$dir/$id.run"; continue
+                fi
                 ( stack_apply nopull ) >>"$LOG_FILE" 2>&1 || rc=$?
-                if (( rc == 0 )); then req_result "$dir/$id.res" ok "DDNS records now: ${v:-none}; DDNS-Updater recreated." "$action"
-                else req_result "$dir/$id.res" error "Apply failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
+                msg=saved; [[ "$v" =~ \"op\"[[:space:]]*:[[:space:]]*\"remove\" ]] && msg=removed
+                if (( rc == 0 )); then req_result "$dir/$id.res" ok "DDNS record $msg; DDNS-Updater recreated." "$action"
+                else req_result "$dir/$id.res" error "Saved, but Apply failed (rc=$rc); see $LOG_FILE on the host." "$action"; fi ;;
+            ddns_catalog)
+                if ddns_catalog_refresh quiet >>"$LOG_FILE" 2>&1; then req_result "$dir/$id.res" ok "Provider list updated: $(ddns_catalog_info)." "$action"
+                else req_result "$dir/$id.res" error "Could not download the provider list (no internet, or GitHub's API limit)." "$action"; fi ;;
             vpn_endpoint)
                 if [[ "${CFG[VPN_SERVICE_PROVIDER]}" != custom || "${CFG[VPN_TYPE]}" != wireguard ]]; then
                     req_result "$dir/$id.res" error "The server endpoint is set only for provider custom with WireGuard." "$action"; rm -f "$dir/$id.run"; continue
@@ -5802,23 +5811,136 @@ process_requests() {
 }
 
 # -----------------------------------------------------------------------------
-# DDNS-UPDATER (qmcgaw/ddns-updater): records from the installer settings
-#   cloudflare: CONFIG env built here; the token is the vault's CLOUDFLARE_DNS_API_TOKEN (interpolated by compose)
-#   custom    : your own config.json (any provider) copied to <data>/ddns-updater/config.json
+# DDNS-UPDATER (qmcgaw/ddns-updater)
+#   records: any provider DDNS-Updater supports. The provider catalogue (fields, required, descriptions) is built from
+#            DDNS-Updater's own docs, downloaded for the version in use; records in $MS_CONF_DIR/ddns-records.json
+#            (no secrets), secrets in the vault as DDNS_<ID>_<FIELD>. Apply renders DDNS-Updater's CONFIG with the
+#            secrets as ${MS_DDNS_<ID>_<FIELD>} references that compose fills in from the vault.
+#   custom : your own config.json copied to <data>/ddns-updater/config.json
+#   (cloudflare: the older single-provider mode; converted to records on the next Apply or Settings -> E)
 # -----------------------------------------------------------------------------
-ddns_records_in_zone() {   # every name must be the zone or under it
-    local x z; z=$(tls_zone)
-    for x in ${1//,/ }; do [[ "${x#\*.}" == "$z" || "$x" == *".$z" ]] || return 1; done
-    return 0
+DDNS_RECORDS_FILE="$MS_CONF_DIR/ddns-records.json"
+ddns_catalog_file() { printf '%s/ddns-catalog.json' "$MS_STATE_DIR"; }
+DDNS_CONFIG_RENDERED=""
+
+# json_str VALUE -> a JSON string literal (no control characters expected)
+json_str() { local v=$1; v=${v//\\/\\\\}; v=${v//\"/\\\"}; v=${v//$'\t'/\\t}; printf '"%s"' "$v"; }
+
+# ddns_tool CMD [ARGS] -- the embedded Python tool: host python3 when present, else a throwaway python container
+ddns_tool() {
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+        python3 -c "$DDNS_TOOL_PY" "$@"
+    else
+        docker_up || { echo "Docker is not running (needed to run the DDNS tool)" >&2; return 1; }
+        py_oneoff -- "$DDNS_TOOL_PY" "$@"
+    fi
 }
-ddns_config_json() {
-    local x out="" ttl=${CFG[DDNS_TTL]:-1} prox=false
-    [[ "${CFG[DDNS_PROXIED]}" == yes ]] && prox=true
+
+ddns_records_json() { [[ -s "$DDNS_RECORDS_FILE" ]] && cat "$DDNS_RECORDS_FILE" || echo "[]"; }
+ddns_record_count() { ddns_records_json | grep -o '"provider"' | wc -l; }
+ddns_save_records() {   # ddns_save_records JSON
+    (( DRY_RUN )) && return 0
+    install -d -m 700 "$MS_CONF_DIR"
+    printf '%s\n' "$1" >"$DDNS_RECORDS_FILE.tmp" && chmod 600 "$DDNS_RECORDS_FILE.tmp" && mv -f "$DDNS_RECORDS_FILE.tmp" "$DDNS_RECORDS_FILE"
+    ddns_publish_board
+}
+# the board reads the catalogue and the records (no secrets) from its app folder
+ddns_publish_board() {
+    local d="$FOLDER_FOR_DATA/statusboard/app"
+    [[ -n "${FOLDER_FOR_DATA:-}" && -d "$d" ]] && ! (( DRY_RUN )) || return 0
+    [[ -s "$(ddns_catalog_file)" ]] && install -m 644 "$(ddns_catalog_file)" "$d/ddns-catalog.json"
+    ddns_records_json >"$d/ddns-records.json"; chmod 644 "$d/ddns-records.json"
+}
+
+# ddns_catalog_refresh [quiet] -- download DDNS-Updater's provider docs and build the catalogue
+ddns_catalog_refresh() {
+    local out tmp n
+    (( DRY_RUN )) && return 0
+    [[ "${1:-}" == quiet ]] || log_info "Downloading DDNS-Updater's provider list and settings (github.com/qdm12/ddns-updater docs)..."
+    tmp=$(mktemp)
+    if ! ddns_tool catalog latest >"$tmp" 2>/dev/null || ! grep -q '"providers"' "$tmp"; then
+        rm -f "$tmp"; log_warn "DDNS: could not download the provider list (no internet, or GitHub's API limit); the stored one is kept."
+        return 1
+    fi
+    install -d -m 755 "$MS_STATE_DIR"; mv -f "$tmp" "$(ddns_catalog_file)"; chmod 644 "$(ddns_catalog_file)"
+    n=$(grep -o '"title"' "$(ddns_catalog_file)" | wc -l)
+    out=$(sed -n 's/^{"version": *"\([^"]*\)".*/\1/p' "$(ddns_catalog_file)")
+    log_ok "DDNS: provider list updated ($n providers, DDNS-Updater ${out:-?})"
+    ddns_publish_board
+}
+ddns_catalog_ensure() { [[ -s "$(ddns_catalog_file)" ]] || ddns_catalog_refresh; }
+ddns_catalog_info() {
+    local f; f=$(ddns_catalog_file)
+    [[ -s "$f" ]] || { echo "not downloaded yet"; return 0; }
+    printf '%s providers, DDNS-Updater %s, downloaded %s' "$(grep -o '"title"' "$f" | wc -l)" \
+        "$(sed -n 's/^{"version": *"\([^"]*\)".*/\1/p' "$f")" "$(date -r "$f" '+%F' 2>/dev/null)"
+}
+ddns_tool_input() { printf '{"catalog":%s,"entries":%s%s}' "$(cat "$(ddns_catalog_file)" 2>/dev/null || echo '{"providers":{}}')" "$(ddns_records_json)" "${1:+,\"request\":$1}"; }
+
+# ddns_apply_request JSON -- add/edit/remove one record through the tool; stores records + secrets; rc 1 on error
+#   with the reason in DDNS_MSG. Call it directly, never inside $(...): the vault changes must reach this shell.
+DDNS_MSG=""
+ddns_apply_request() {
+    local out first line k v rc=0
+    DDNS_MSG=""
+    out=$(ddns_tool_input "$1" | ddns_tool request 2>&1) || rc=$?
+    first=${out%%$'\n'*}
+    if (( rc )) || [[ "$first" == ERROR* || "$first" != \[* ]]; then DDNS_MSG=${first#ERROR$'\t'}; return 1; fi
+    while IFS=$'\t' read -r line k v; do
+        case "$line" in
+            SECRET) SECRETS[$k]=$(printf '%s' "$v" | base64 -d) ;;
+            DROP)   for v in "${!SECRETS[@]}"; do if [[ "$v" == DDNS_"${k^^}"_* ]]; then unset "SECRETS[$v]"; fi; done ;;
+        esac
+    done < <(tail -n +2 <<<"$out")
+    save_secrets >/dev/null
+    ddns_save_records "$first"
+}
+
+# older Cloudflare-only settings -> records (one per name); the token is copied into each record's vault entry
+ddns_migrate_legacy() {
+    [[ "${CFG[DDNS_PROVIDER]:-none}" == cloudflare ]] || return 0
+    local x id ents="" prox=false n=0
+    [[ "${CFG[DDNS_PROXIED]:-no}" == yes ]] && prox=true
     for x in ${CFG[DDNS_RECORDS]//,/ }; do
-        out+="${out:+,}{\"provider\":\"cloudflare\",\"zone_identifier\":\"${CFG[DDNS_CF_ZONE_ID]}\",\"domain\":\"$x\",\"ttl\":$ttl,\"token\":\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\",\"proxied\":$prox,\"ip_version\":\"${CFG[DDNS_IP_VERSION]:-ipv4}\"}"
+        id="e$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        ents+="${ents:+,}{\"id\":\"$id\",\"provider\":\"cloudflare\",\"fields\":{\"zone_identifier\":$(json_str "${CFG[DDNS_CF_ZONE_ID]:-}"),\"domain\":$(json_str "$x"),\"ttl\":$(json_str "${CFG[DDNS_TTL]:-1}"),\"proxied\":\"$prox\",\"ip_version\":$(json_str "${CFG[DDNS_IP_VERSION]:-ipv4}")},\"secret_fields\":[\"token\"]}"
+        secret_is_set CLOUDFLARE_DNS_API_TOKEN && SECRETS["DDNS_${id^^}_TOKEN"]=${SECRETS[CLOUDFLARE_DNS_API_TOKEN]}
+        n=$((n + 1))
     done
-    printf '{"settings":[%s]}' "$out"
+    (( DRY_RUN )) && return 0
+    save_secrets >/dev/null
+    ddns_save_records "[$ents]"
+    CFG[DDNS_PROVIDER]=records; save_config
+    log_ok "DDNS: $n Cloudflare record(s) moved to the record editor (Settings -> E)"
 }
+
+# ddns_render -- DDNS-Updater's CONFIG for the managed override (DDNS_CONFIG_RENDERED; blank when there is nothing)
+ddns_render() {
+    DDNS_CONFIG_RENDERED=""
+    [[ "${CFG[DDNS_PROVIDER]:-none}" == records ]] && svc_enabled ddns-updater || return 0
+    (( $(ddns_record_count) > 0 )) || return 0
+    ddns_catalog_ensure || true
+    # keep the provider list current: Apply re-downloads it once it is a week old (a failed download keeps the old one)
+    [[ -n "$(find "$(ddns_catalog_file)" -mtime +6 2>/dev/null)" ]] && { ddns_catalog_refresh quiet || true; }
+    DDNS_CONFIG_RENDERED=$(ddns_tool_input | ddns_tool render 2>/dev/null) || DDNS_CONFIG_RENDERED=""
+    [[ "$DDNS_CONFIG_RENDERED" == '{"settings":'* ]] || { log_warn "DDNS: could not build DDNS-Updater's settings (see Settings -> E)."; DDNS_CONFIG_RENDERED=""; }
+}
+# for the YAML line: compose interpolates $, so non-secret $ become $$; the secret references stay ${...}
+ddns_config_yaml_value() {
+    local v=${DDNS_CONFIG_RENDERED//\'/\'\'}
+    v=${v//\$/\$\$}; v=${v//\$\$\{MS_DDNS_/\$\{MS_DDNS_}
+    printf '%s' "$v"
+}
+# compose fills the secrets in: exported JSON-escaped (they land inside the CONFIG JSON string)
+ddns_export_secrets() {
+    local k v
+    for k in "${!SECRETS[@]}"; do
+        [[ "$k" =~ ^DDNS_E[0-9A-F]+_[A-Z0-9_]+$ ]] || continue
+        v=${SECRETS[$k]}; v=${v//\\/\\\\}; v=${v//\"/\\\"}
+        export "MS_$k=$v"
+    done
+}
+
 ddns_ui_url() {
     svc_enabled ddns-updater 2>/dev/null || return 0
     if svc_enabled traefik 2>/dev/null; then printf 'https://%s' "$(svc_host ddns-updater)"
@@ -5835,39 +5957,103 @@ write_ddns_custom_config() {
 ddns_problems() {
     svc_enabled ddns-updater || return 0
     case "${CFG[DDNS_PROVIDER]}" in
-        cloudflare)
-            [[ -n "${CFG[DDNS_RECORDS]}" ]] || echo "DDNS_RECORDS is empty"
-            [[ -n "${CFG[DDNS_CF_ZONE_ID]}" ]] || echo "DDNS_CF_ZONE_ID is not set (Cloudflare: domain overview page -> Zone ID)"
-            secret_is_set CLOUDFLARE_DNS_API_TOKEN || echo "CLOUDFLARE_DNS_API_TOKEN is not set (token with Zone.DNS edit)" ;;
+        records)
+            (( $(ddns_record_count) > 0 )) || { echo "no records yet (Settings -> E, or the status board's DDNS tab)"; return 0; }
+            [[ -s "$(ddns_catalog_file)" ]] || { echo "provider list not downloaded yet (Settings -> E -> P)"; return 0; }
+            ddns_tool_input | ddns_tool check 2>/dev/null || true ;;
         custom) [[ -f "${CFG[DDNS_CONFIG_FILE]}" ]] || echo "DDNS_CONFIG_FILE is not set or missing" ;;
     esac
     return 0
 }
 
+# ---- Settings -> E: the record editor
+# ddns_providers -> "name<TAB>title" for every provider in the catalogue
+ddns_providers() { ddns_tool_input | ddns_tool list 2>/dev/null; }
+
+ddns_pick_provider() {   # ddns_pick_provider VAR
+    local __v=$1 i=0 n t pick; local -a names=()
+    while IFS=$'\x1f' read -r n t; do [[ -n "$n" ]] && names+=("$n"); done < <(ddns_providers)
+    (( ${#names[@]} )) || { log_warn "The provider list is empty: refresh it (P)."; return 1; }
+    echo
+    for i in "${!names[@]}"; do printf '  %3d) %-16s' $((i + 1)) "${names[$i]}"; (( (i + 1) % 5 == 0 )) && echo; done; echo
+    while :; do
+        read -rp "  Provider (number or name, Enter = back): " pick || pick=""
+        [[ -n "$pick" ]] || return 1
+        if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#names[@]} )); then printf -v "$__v" '%s' "${names[$((pick - 1))]}"; return 0; fi
+        for n in "${names[@]}"; do [[ "$n" == "$pick" ]] && { printf -v "$__v" '%s' "$n"; return 0; }; done
+        log_warn "No provider '$pick'."
+    done
+}
+
+# ddns_edit_record PROVIDER [ID] -- prompts every field (from the catalogue) and applies the change
+ddns_edit_record() {
+    local prov=$1 id=${2:-} name req group secret type ex desc cur v fields="" msg
+    while IFS=$'\x1f' read -r name req group secret type ex desc cur; do
+        [[ -n "$name" ]] || continue
+        local tag="optional"; [[ "$req" == 1 ]] && tag="required"; [[ -n "$group" ]] && tag="one of: ${group#alt:}"
+        printf '\n  %s%s%s (%s%s)\n' "$B" "$name" "$NC" "$tag" "$([[ "$secret" == 1 ]] && echo ", secret, stored in the vault")"
+        [[ -n "$desc" ]] && printf '  %s\n' "$desc" | fold -s -w 110 | sed '2,$s/^/  /'
+        if [[ "$secret" == 1 ]]; then
+            [[ "$cur" == SET ]] && log_info "A value is stored; press Enter to keep it."
+            ask_secret v "$name"
+        else
+            [[ "$name" == ip_version ]] && log_info "ipv4, ipv6 or 'ipv4 or ipv6'"
+            [[ "$type" == bool ]] && log_info "true or false"
+            ask v "$name${ex:+ (e.g. $ex)}" "$cur"
+        fi
+        [[ "$secret" == 1 && -z "$v" ]] && continue
+        fields+="${fields:+,}$(json_str "$name"):$(json_str "$v")"
+    done < <(ddns_tool_input | ddns_tool fields "$prov" "$id")
+    if ddns_apply_request "{\"op\":\"$([[ -n "$id" ]] && echo edit || echo add)\",\"id\":$(json_str "$id"),\"provider\":$(json_str "$prov"),\"fields\":{$fields}}"; then
+        log_ok "DDNS record saved ($prov); Save + apply to use it"
+    else
+        log_warn "Not saved: $DDNS_MSG"
+    fi
+}
+
+ddns_list_records() {   # numbered table; prints the ids in order to fd 3 when open
+    local i=0 id prov dom ipv sec
+    printf '\n   %3s  %-14s %-36s %-12s %s\n' "#" "Provider" "Domain" "IP version" "Secrets"
+    while IFS=$'\x1f' read -r id prov dom ipv sec; do
+        [[ -n "$id" ]] || continue
+        i=$((i + 1))
+        printf '   %3d  %-14s %-36s %-12s %s\n' "$i" "$prov" "$dom" "${ipv:-default}" "${sec:-none}"
+    done < <(ddns_tool_input | ddns_tool table)
+    (( i )) || printf '   (no records yet)\n'
+}
+ddns_record_id() { ddns_tool_input | ddns_tool table | sed -n "${1}p" | cut -d$'\x1f' -f1; }
+
 cfg_ddns() {
     section "Dynamic DNS (DDNS-Updater)"
-    log_info "DDNS-Updater keeps public DNS records pointing at your current public IP. Its own web page is"
-    log_info "status-only; the records are set here (or on the status board's DDNS tab)."
-    ask_valid "CFG[DDNS_PROVIDER]" "Provider (none/cloudflare/custom)" "${CFG[DDNS_PROVIDER]}" v_ddnsprov "none, cloudflare or custom"
+    log_info "DDNS-Updater keeps public DNS records pointing at your current public IP, for any of the providers it"
+    log_info "supports. Its own page is status-only: records are set here or on the status board's DDNS tab."
+    [[ "${CFG[DDNS_PROVIDER]}" == cloudflare ]] && { [[ -f "$SECRETS_FILE" ]] && load_secrets || SECRETS_LOADED=1; ddns_migrate_legacy; }
+    local m=${CFG[DDNS_PROVIDER]:-none}; [[ "$m" == cloudflare ]] && m=records
+    ask_valid "CFG[DDNS_PROVIDER]" "DDNS (none / records = edit records here / custom = your own config.json)" "$m" v_ddnsprov "none, records or custom"
     case "${CFG[DDNS_PROVIDER]}" in
-        cloudflare)
-            local z t; z=$(tls_zone)
-            [[ -n "${CFG[DDNS_RECORDS]}" ]] || CFG[DDNS_RECORDS]="$z,*.$z"
-            while :; do
-                ask_valid "CFG[DDNS_RECORDS]" "Records (comma-separated, under $z)" "${CFG[DDNS_RECORDS]}" v_ddns_records "names such as $z,*.$z"
-                ddns_records_in_zone "${CFG[DDNS_RECORDS]}" && break
-                { (( ASSUME_YES )) || ! is_tty; } && die "DDNS_RECORDS must be $z or names under it."
-                log_warn "Every record must be $z or a name under it."
-            done
-            ask_valid "CFG[DDNS_CF_ZONE_ID]" "Cloudflare Zone ID (32 hex; dashboard -> $z -> Overview)" "${CFG[DDNS_CF_ZONE_ID]}" v_zoneid "32 hex characters"
-            ask_valid "CFG[DDNS_PROXIED]" "Proxy through Cloudflare (yes/no)" "${CFG[DDNS_PROXIED]}" v_yesno "yes or no"
-            ask_valid "CFG[DDNS_IP_VERSION]" "IP version (ipv4/ipv6/ipv4 or ipv6)" "${CFG[DDNS_IP_VERSION]}" v_ipver "ipv4, ipv6 or 'ipv4 or ipv6'"
+        records)
             [[ -f "$SECRETS_FILE" ]] && load_secrets || SECRETS_LOADED=1
-            if ! secret_is_set CLOUDFLARE_DNS_API_TOKEN && is_tty && ! (( ASSUME_YES )); then
-                log_info "Cloudflare API token with Zone -> DNS -> Edit for $z (stored in the vault; also used by Let's Encrypt mode)."
-                ask_secret t "Cloudflare API token"
-                if [[ -n "$t" ]]; then SECRETS[CLOUDFLARE_DNS_API_TOKEN]=$t; SECRETS_DIRTY=1; fi
-            fi ;;
+            [[ -n "${FOLDER_FOR_DATA:-}" ]] || resolve_runtime
+            ddns_catalog_ensure || true
+            local ch n id prov
+            while :; do
+                printf '\n  Provider list: %s\n' "$(ddns_catalog_info)"
+                ddns_list_records
+                printf '\n   A) Add a record   E) Edit   R) Remove   P) Refresh the provider list   Enter = done\n'
+                read -rp "  Choice: " ch || ch=""
+                case "${ch,,}" in
+                    a) ddns_pick_provider prov && ddns_edit_record "$prov" ;;
+                    e) read -rp "  Record number: " n || n=""; id=$([[ "$n" =~ ^[0-9]+$ ]] && ddns_record_id "$n")
+                       [[ -n "$id" ]] && ddns_edit_record "$(ddns_tool_input | ddns_tool table | sed -n "${n}p" | cut -d$'\x1f' -f2)" "$id" || log_warn "No record $n" ;;
+                    r) read -rp "  Record number: " n || n=""; id=$([[ "$n" =~ ^[0-9]+$ ]] && ddns_record_id "$n")
+                       if [[ -n "$id" ]] && confirm "Remove record $n?" n; then
+                           if ddns_apply_request "{\"op\":\"remove\",\"id\":$(json_str "$id")}"; then log_ok "Record removed; Save + apply to use it"
+                           else log_warn "Not removed: $DDNS_MSG"; fi
+                       fi ;;
+                    p) ddns_catalog_refresh || true ;;
+                    "") break ;;
+                esac
+            done ;;
         custom)
             ask_valid "CFG[DDNS_CONFIG_FILE]" "Your ddns-updater config.json (path)" "${CFG[DDNS_CONFIG_FILE]}" v_file "an existing file" ;;
     esac
@@ -5877,9 +6063,279 @@ cfg_ddns() {
     fi
     return 0
 }
-v_ddnsprov() { [[ "$1" =~ ^(none|cloudflare|custom)$ ]]; }
+v_ddnsprov() { [[ "$1" =~ ^(none|records|custom|cloudflare)$ ]]; }
 v_zoneid()   { [[ "$1" =~ ^[0-9a-f]{32}$ ]]; }
 v_ipver()    { [[ "$1" =~ ^(ipv4|ipv6|ipv4\ or\ ipv6)$ ]]; }
+
+# the DDNS tool (Python, stdlib only): see ddns_tool
+DDNS_TOOL_PY=$(cat <<'PYDDNS'
+"""mediastack-installer DDNS tool (runs in python:3.13-alpine; stdlib only).
+  catalog VERSION [DOCS_DIR]  -> provider catalogue JSON from DDNS-Updater's docs (downloaded, or read from DOCS_DIR)
+  render                      stdin {"catalog","entries"} -> CONFIG JSON for DDNS-Updater (secrets as ${MS_DDNS_..})
+  check                       stdin {"catalog","entries"} -> one problem per line
+  request                     stdin {"catalog","entries","request"} -> line 1: entries JSON; then SECRET<TAB>key<TAB>b64
+  list | table | fields PROV [ID]   stdin {"catalog","entries"} -> lines for the installer menu, fields split by \x1f
+"""
+import base64, json, os, re, secrets, sys, urllib.request
+
+REPO = "qdm12/ddns-updater"
+SECRET_RE = re.compile(r"(token|password|passwd|secret|credential|(^|_)key$|^key$|apikey|api_key|_key_|^private)", re.I)
+SKIP = {"provider"}
+
+def get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "mediastack-installer", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read().decode("utf-8", "replace")
+
+def clean(text, field=""):
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)          # [label](url) -> label
+    text = re.sub(r"\s+", " ", text.replace("`", "")).strip()
+    text = re.sub(r'^-\s*', "", text)
+    if field:                                                      # '"ttl" is the TTL ...' -> 'the TTL ...'
+        text = re.sub(r'^"%s"\s*(is\s+|:\s*)?' % re.escape(field), "", text)
+    if len(text) > 400:
+        text = text[:400].rsplit(" ", 1)[0] + " …"
+    return text[:1].upper() + text[1:] if text else text
+
+def section(md, title):
+    m = re.search(r"^###\s+" + title + r"[^\n]*\n(.*?)(?=^##|\Z)", md, re.S | re.M | re.I)
+    return m.group(1) if m else ""
+
+def parse_doc(name, md):
+    title = (re.search(r"^#\s+(.+)$", md, re.M) or [None, name])[1].strip()
+    example = {}
+    m = re.search(r"```json\s*\n(.*?)```", md, re.S)
+    if m:
+        try:
+            s = json.loads(m.group(1)).get("settings") or []
+            example = s[0] if s else {}
+        except ValueError:
+            pass
+    fields, order = {}, []
+    def add(f, **kw):
+        if f in SKIP:
+            return
+        if f not in fields:
+            fields[f] = {"name": f, "required": False, "group": "", "desc": "", "example": example.get(f, "")}
+            order.append(f)
+        for k, v in kw.items():
+            if v or k == "required":
+                fields[f][k] = v if k != "required" else (fields[f]["required"] or v)
+    # compulsory: a top-level bullet naming fields = required; nested bullets under "one of" = alternatives
+    comp = section(md, "Compulsory parameters")
+    group = None
+    for line in comp.splitlines():
+        if not line.strip().startswith("-"):
+            continue
+        nested = line.startswith(("  ", "\t"))
+        names = re.findall(r'`"([a-zA-Z0-9_]+)"`', line)
+        if not nested:
+            group = "one_of" if re.search(r"one of the following|either", line, re.I) and not names else None
+            for f in names:
+                add(f, required=(group is None), desc=clean(line, f if len(names) == 1 else ""))
+        elif group:
+            gid = "alt%d" % (len([1 for x in fields.values() if x.get("group")]) + 1)
+            for f in names:
+                add(f, group=gid if len(names) == 1 else "alt:" + "+".join(names), desc=clean(line))
+    for line in section(md, "Optional parameters").splitlines():
+        if not line.strip().startswith("-") or line.startswith(("  ", "\t")):
+            continue
+        names = re.findall(r'`"([a-zA-Z0-9_]+)"`', line)
+        for f in names:
+            add(f, desc=clean(line, f if len(names) == 1 else ""))
+    for f in example:                                       # example-only fields: optional
+        add(f)
+    out = []
+    for f in order:
+        x = fields[f]
+        ex = x["example"]
+        d = x["desc"].lower()
+        x["type"] = ("bool" if isinstance(ex, bool) or re.search(r"(set to|be|either) true\b|true or false", d)
+                     else "int" if isinstance(ex, int) or f == "ttl" or "integer" in d else "text")
+        x["secret"] = bool(SECRET_RE.search(f)) and x["type"] == "text"
+        if x["secret"]:
+            x["example"] = ""
+        else:
+            x["example"] = "" if ex is None else str(ex).lower() if isinstance(ex, bool) else str(ex)
+        if f == "ip_version" and not x["desc"]:
+            x["desc"] = "ipv4, ipv6 or ipv4 or ipv6"
+        out.append(x)
+    return {"title": title, "fields": out}
+
+def catalog(version, docs_dir=None):
+    if docs_dir:
+        names = sorted(n[:-3] for n in os.listdir(docs_dir) if n.endswith(".md"))
+        read = lambda n: open(os.path.join(docs_dir, n + ".md"), encoding="utf-8").read()
+        ref = version
+    else:
+        ref = version
+        if version in ("", "latest"):
+            try:
+                ref = json.loads(get("https://api.github.com/repos/%s/releases/latest" % REPO))["tag_name"]
+            except Exception:
+                ref = "master"
+        # the README links every provider page (raw.githubusercontent.com: no API rate limit); the API listing is the
+        # fallback when the README can't be read
+        try:
+            names = sorted(set(re.findall(r"docs/([a-z0-9.]+)\.md", get("https://raw.githubusercontent.com/%s/%s/README.md" % (REPO, ref)))))
+        except Exception:
+            names = []
+        if not names:
+            listing = json.loads(get("https://api.github.com/repos/%s/contents/docs?ref=%s" % (REPO, ref)))
+            names = sorted(x["name"][:-3] for x in listing if x["name"].endswith(".md"))
+        read = lambda n: get("https://raw.githubusercontent.com/%s/%s/docs/%s.md" % (REPO, ref, n))
+    provs, failed = {}, []
+    for n in names:
+        if n in ("example", "custom"):          # template, and the generic HTTP provider (handled as any other below)
+            if n == "example":
+                continue
+        try:
+            provs[n] = parse_doc(n, read(n))
+        except Exception as e:                   # one unreadable page must not lose the rest
+            failed.append("%s: %s" % (n, e))
+    return {"version": ref, "providers": provs, "failed": failed}
+
+def secret_key(eid, field):
+    return "DDNS_%s_%s" % (eid.upper(), re.sub(r"[^A-Za-z0-9]", "_", field).upper())
+
+def typed(f, v):
+    if f.get("type") == "int":
+        return int(v)
+    if f.get("type") == "bool":
+        return str(v).lower() in ("true", "yes", "1", "on")
+    return v
+
+def render(cat, entries):
+    out = []
+    for e in entries:
+        p = cat["providers"].get(e["provider"], {"fields": []})
+        fdef = {f["name"]: f for f in p["fields"]}
+        s = {"provider": e["provider"]}
+        for k, v in (e.get("fields") or {}).items():
+            if v == "" or k in SKIP:
+                continue
+            try:
+                s[k] = typed(fdef.get(k, {}), v)
+            except ValueError:
+                s[k] = v
+        for k in e.get("secret_fields") or []:
+            s[k] = "${MS_%s:?err}" % secret_key(e["id"], k)
+        out.append(s)
+    return {"settings": out}
+
+def check(cat, entries):
+    probs = []
+    for e in entries:
+        label = "%s %s" % (e.get("provider"), (e.get("fields") or {}).get("domain", ""))
+        p = cat["providers"].get(e.get("provider"))
+        if not p:
+            probs.append("%s: provider not in the catalogue (refresh the provider list)" % label)
+            continue
+        have = set(k for k, v in (e.get("fields") or {}).items() if v != "") | set(e.get("secret_fields") or [])
+        groups = {}
+        for f in p["fields"]:
+            if f["required"] and f["name"] not in have:
+                probs.append("%s: %s is required" % (label, f["name"]))
+            if f.get("group"):
+                groups.setdefault(f["group"], []).append(f["name"])
+        if groups and not any(all(n in have for n in names) for names in groups.values()):
+            probs.append("%s: needs one of: %s" % (label, " | ".join("+".join(v) for v in groups.values())))
+        for f in p["fields"]:
+            v = (e.get("fields") or {}).get(f["name"], "")
+            if v != "" and f.get("type") == "int" and not re.fullmatch(r"-?\d+", str(v)):
+                probs.append("%s: %s must be a number" % (label, f["name"]))
+    return probs
+
+US = "\x1f"                                            # field separator for the menu (bash read keeps empty fields)
+FIELD_RE = re.compile(r"^[a-zA-Z0-9_]{1,40}$")
+def apply_request(cat, entries, req):
+    """add | edit | remove one entry; secrets returned separately (never kept in the entries)."""
+    act, eid = req.get("op"), req.get("id") or ""
+    new_secrets = {}
+    if act == "remove":
+        if not any(e["id"] == eid for e in entries):
+            raise ValueError("no record %r" % eid)
+        return [e for e in entries if e["id"] != eid], new_secrets, [eid]      # DROP <id>: its vault entries go
+    prov = req.get("provider", "")
+    if prov not in cat["providers"]:
+        raise ValueError("unknown provider %r" % prov)
+    fdef = {f["name"]: f for f in cat["providers"][prov]["fields"]}
+    if act == "add":
+        eid = "e" + secrets.token_hex(3)
+        entry = {"id": eid, "provider": prov, "fields": {}, "secret_fields": []}
+        entries = entries + [entry]
+    elif act == "edit":
+        match = [e for e in entries if e["id"] == eid]
+        if not match:
+            raise ValueError("no record %r" % eid)
+        entry = match[0]
+        if entry["provider"] != prov:
+            raise ValueError("the provider of a record can't change; remove it and add a new one")
+    else:
+        raise ValueError("unknown operation %r" % act)
+    for k, v in (req.get("fields") or {}).items():
+        if not FIELD_RE.match(k) or k not in fdef or k in SKIP:
+            raise ValueError("unknown field %r for %s" % (k, prov))
+        v = str(v).strip()
+        if len(v) > 500 or "\n" in v:
+            raise ValueError("value for %s is too long or has a line break" % k)
+        if fdef[k]["secret"]:
+            if v:                                          # blank = keep the stored secret
+                new_secrets[secret_key(entry["id"], k)] = v
+                if k not in entry["secret_fields"]:
+                    entry["secret_fields"].append(k)
+        else:
+            entry["fields"][k] = v
+    probs = check(cat, [entry])
+    if probs:
+        raise ValueError("; ".join(probs))
+    return entries, new_secrets, []
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "catalog":
+        print(json.dumps(catalog(sys.argv[2] if len(sys.argv) > 2 else "latest", sys.argv[3] if len(sys.argv) > 3 else None)))
+        return
+    doc = json.load(sys.stdin)
+    cat, entries = doc.get("catalog") or {"providers": {}}, doc.get("entries") or []
+    if cmd == "render":
+        print(json.dumps(render(cat, entries), separators=(",", ":")))
+    elif cmd == "check":
+        for p in check(cat, entries):
+            print(p)
+    elif cmd == "list":                                  # name<TAB>title
+        for n, v in sorted(cat["providers"].items()):
+            print(US.join([n, v.get("title", n)]))
+    elif cmd == "table":                                 # id provider domain ip_version secrets(set/missing)
+        for e in entries:
+            f = e.get("fields") or {}
+            print(US.join([e["id"], e["provider"], f.get("domain", ""), f.get("ip_version", ""),
+                             ",".join(e.get("secret_fields") or []) or "-"]))
+    elif cmd == "fields":                                # name req group secret type example desc current
+        prov, eid = sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "")
+        e = next((x for x in entries if x["id"] == eid), {"fields": {}, "secret_fields": []})
+        for f in cat["providers"].get(prov, {}).get("fields", []):
+            cur = "SET" if f["secret"] and f["name"] in (e.get("secret_fields") or []) else ("" if f["secret"] else (e.get("fields") or {}).get(f["name"], ""))
+            print(US.join([f["name"], "1" if f["required"] else "0", f.get("group") or "", "1" if f["secret"] else "0",
+                             f["type"], f.get("example", ""), f.get("desc", "").replace("\t", " "), cur]))
+    elif cmd == "request":
+        try:
+            ents, sec, dropped = apply_request(cat, entries, doc.get("request") or {})
+        except (ValueError, KeyError, TypeError) as e:
+            print("ERROR\t%s" % e)
+            sys.exit(3)
+        print(json.dumps(ents))
+        for k, v in sec.items():
+            print("SECRET\t%s\t%s" % (k, base64.b64encode(v.encode()).decode()))
+        for rid in dropped:
+            print("DROP\t%s\t-" % rid)
+    else:
+        sys.exit("usage: catalog VERSION [DOCS_DIR] | render | check | request")
+
+if __name__ == "__main__":
+    main()
+PYDDNS
+)
 
 # -----------------------------------------------------------------------------
 # DASHBOARDS: Homarr (apps via its API) and Heimdall (tiles in its database), same list as Homepage
@@ -5915,7 +6371,7 @@ py_oneoff() {
     local -a args=()
     while [[ $# -gt 0 && "$1" != -- ]]; do args+=("$1"); shift; done
     shift
-    docker run --rm -i --network "$PROJECT_NAME" "${args[@]}" python:3.13-alpine python -c "$1"
+    docker run --rm -i --network "$PROJECT_NAME" "${args[@]}" python:3.13-alpine python -c "$1" "${@:2}"
 }
 
 HEIMDALL_PY='
@@ -7210,7 +7666,7 @@ declare -A CONF_HELP=(
     [SERVER_HOSTNAMES]="Gluetun server filter: server hostnames, comma-separated (blank = any)"
     [VPN_SERVERS_UPDATE_PERIOD]="Gluetun updates its VPN server list this often, e.g. 480h (min 360h); off = never"
     [VPN_UPDATER_PROTON_EMAIL]="protonvpn: Proton account email for server-list updates (password in the vault)"
-    [DDNS_PROVIDER]="none | cloudflare | custom (your own ddns-updater config.json): DDNS-Updater keeps public DNS on your IP"
+    [DDNS_PROVIDER]="none | records (any provider, edited in Settings -> E or on the status board) | custom (your own config.json)"
     [DDNS_RECORDS]="cloudflare: comma-separated names to keep updated, e.g. example.org,*.example.org"
     [DDNS_CF_ZONE_ID]="cloudflare: Zone ID (domain overview page in the Cloudflare dashboard)"
     [DDNS_TTL]="cloudflare: record TTL in seconds (1 = automatic)"
@@ -7295,7 +7751,7 @@ validate_key() {   # validate_key KEY VALUE
         VPN_SERVICE_PROVIDER) [[ -n "$v" ]] ;;
         SERVER_REGIONS|SERVER_COUNTRIES|SERVER_CITIES|SERVER_HOSTNAMES) [[ "$v" != *[=\[\]#/]* ]] ;;
         VPN_SERVERS_UPDATE_PERIOD) [[ "$v" == off || "$v" =~ ^[0-9]+h$ ]] ;;
-        DDNS_PROVIDER) [[ "$v" =~ ^(none|cloudflare|custom)$ ]] ;;
+        DDNS_PROVIDER) v_ddnsprov "$v" ;;
         DDNS_RECORDS) v_ddns_records "$v" ;;
         DDNS_CF_ZONE_ID) [[ -z "$v" || "$v" =~ ^[0-9a-f]{32}$ ]] ;;
         DDNS_TTL) [[ "$v" =~ ^[0-9]+$ ]] ;;
@@ -7995,7 +8451,37 @@ FIX
     st "Headscale 0.29 config migration"   '( f=$t/hs.yaml; printf "server_url: x\nephemeral_node_inactivity_timeout: 45m\nlog:\n  level: info\nrandomize_client_port: false\n" >"$f"; headscale_migrate_config "$f"; headscale_migrate_config "$f"; ! grep -qE "^(randomize_client_port|ephemeral_node_inactivity_timeout):" "$f" && [[ $(grep -c "^node:" "$f") == 1 ]] && grep -qx "    inactivity_timeout: 45m" "$f" && grep -qx "  level: info" "$f" )'
     st "web UI paths (Plex, Traefik, Headplane)" '( [[ "$(https_urls plex plex.x.org)" == https://plex.x.org/web/ && "$(https_urls traefik "traefik.x.org")" == https://traefik.x.org/dashboard/ && "$(https_urls headplane hp.x.org)" == https://hp.x.org/admin/ && "$(https_urls sonarr "sonarr.x.org tv.x.org")" == "https://sonarr.x.org https://tv.x.org" ]] )'
     st "status board wiring"               '( st_prep internet jellyfin tailscale core; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"  statusboard:"*"image: python:3.13-alpine"*"Host(\`status.\${CLOUDFLARE_DNS_ZONE:?err}\`)"* && "$o" == *"HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={\"auth\":\"apikey\",\"apikey\":\"\${STATUSBOARD_GLUETUN_KEY:?err}\"}"* ]] && in_list statusboard ${PRESET_CORE_COMMON} && [[ "$(render_statusboard_app | head -1)" == *"MediaStack status board"* ]] && render_statusboard_html | grep -q "</html>" )'
-    st "DDNS settings and config"          '( st_prep internet jellyfin tailscale core; CFG[CLOUDFLARE_DNS_ZONE]=certifiedgeeks.net; CFG[DDNS_PROVIDER]=cloudflare; CFG[DDNS_RECORDS]="certifiedgeeks.net,*.certifiedgeeks.net"; CFG[DDNS_CF_ZONE_ID]=0123456789abcdef0123456789abcdef; j=$(ddns_config_json); [[ "$j" == "{\"settings\":[{\"provider\":\"cloudflare\",\"zone_identifier\":\"0123456789abcdef0123456789abcdef\",\"domain\":\"certifiedgeeks.net\""* && "$j" == *"\"domain\":\"*.certifiedgeeks.net\""* && "$j" == *"\"token\":\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\""* ]] && { ! command -v python3 >/dev/null || python3 -c "import json,sys; json.loads(sys.argv[1].replace(\"\${CLOUDFLARE_DNS_API_TOKEN:?err}\",\"t\"))" "$j"; } && ddns_records_in_zone "certifiedgeeks.net,*.certifiedgeeks.net,a.certifiedgeeks.net" && ! ddns_records_in_zone "evil.org" && v_ddns_records "*.x.org,y.org" && ! v_ddns_records "a b" && apply_preset && st_on ddns-updater && o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"- '"'"'CONFIG={\"settings\""* ]] )'
+    mkdir -p "$t/dd/docs"
+    cat >"$t/dd/docs/duckdns.md" <<'FIX'
+# DuckDNS
+## Configuration
+### Example
+```json
+{"settings": [{"provider": "duckdns", "domain": "sub.duckdns.org", "token": "token", "ip_version": "ipv4"}]}
+```
+### Compulsory parameters
+- `"domain"` is the domain to update
+- `"token"`
+### Optional parameters
+- `"ip_version"` can be `ipv4` (A records), or `ipv6`
+FIX
+    cat >"$t/dd/docs/cloudflare.md" <<'FIX'
+# Cloudflare
+### Example
+```json
+{"settings": [{"provider": "cloudflare", "zone_identifier": "some id", "domain": "domain.com", "ttl": 600, "token": "yourtoken"}]}
+```
+### Compulsory parameters
+- `"zone_identifier"` is the Zone ID
+- `"domain"` is the domain to update
+- `"ttl"` integer value for record TTL in seconds
+- One of the following:
+  - Email `"email"` and Global API Key `"key"`
+  - API Token `"token"`
+### Optional parameters
+- `"proxied"` can be set to `true` to use the proxy services of Cloudflare
+FIX
+    st "DDNS records (any provider)"       '( command -v python3 >/dev/null || exit 0; st_prep internet jellyfin tailscale core; MS_CONF_DIR=$t/dd; MS_STATE_DIR=$t/dd; DDNS_RECORDS_FILE=$t/dd/ddns-records.json; FOLDER_FOR_DATA=$t/dd/none; save_secrets() { :; }; save_config() { :; }; ddns_tool catalog test $t/dd/docs >$t/dd/ddns-catalog.json && grep -q "\"duckdns\"" $t/dd/ddns-catalog.json && CFG[DDNS_PROVIDER]=cloudflare && CFG[DDNS_RECORDS]="example.org,*.example.org" && CFG[DDNS_CF_ZONE_ID]=0123456789abcdef0123456789abcdef && SECRETS[CLOUDFLARE_DNS_API_TOKEN]="cf\"tok" && ddns_migrate_legacy >/dev/null && [[ "${CFG[DDNS_PROVIDER]}" == records && $(ddns_record_count) == 2 ]] && [[ -z "$(ddns_tool_input | ddns_tool check)" ]] && ddns_apply_request "{\"op\":\"add\",\"provider\":\"duckdns\",\"fields\":{\"domain\":\"a\$b.duckdns.org\",\"token\":\"dk1\"}}" && [[ $(ddns_record_count) == 3 ]] && [[ "$(printf "%s\n" "${!SECRETS[@]}" | grep -c "^DDNS_E.*_TOKEN$")" == 3 ]] && ! ddns_apply_request "{\"op\":\"add\",\"provider\":\"duckdns\",\"fields\":{\"domain\":\"x.duckdns.org\"}}" >/dev/null && svc_enabled() { [[ "$1" == ddns-updater || "$1" == traefik ]]; } && ddns_render && [[ "$DDNS_CONFIG_RENDERED" == *"\"proxied\":false"* && "$DDNS_CONFIG_RENDERED" == *"\"ttl\":1"* ]] && y=$(ddns_config_yaml_value) && [[ "$y" == *"a\$\$b.duckdns.org"* && "$y" == *"\${MS_DDNS_E"*"_TOKEN:?err}"* && "$y" != *"\$\${MS_DDNS"* ]] && ( ddns_export_secrets; env | grep -q "^MS_DDNS_E[0-9A-F]*_TOKEN=cf\\\\\"tok$" ) && id=$(ddns_record_id 3) && ddns_apply_request "{\"op\":\"remove\",\"id\":\"$id\"}" && [[ $(ddns_record_count) == 2 ]] && [[ -z "$(printf "%s\n" "${!SECRETS[@]}" | grep "^DDNS_${id^^}_")" ]] )'
     st "WireGuard addresses + endpoint reset" '( [[ "$(wg_addresses_usable "10.2.0.2/32,2a07:b944::2:2/128")" == 10.2.0.2/32 && "$(wg_addresses_usable "10.64.1.2/32")" == 10.64.1.2/32 && "$(wg_addresses_usable "fd00::2/128")" == fd00::2/128 ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn CFG[VPN_ENDPOINT_IP]=1.2.3.4 CFG[VPN_ENDPOINT_PORT]=51820 CFG[WIREGUARD_PUBLIC_KEY]=x && vpn_normalize && [[ "${CFG[VPN_ENDPOINT_IP]}" == 1.2.3.4 && -z "$(vpn_wg_pubkey_env)" ]] && CFG[VPN_SERVICE_PROVIDER]=custom && [[ "$(vpn_wg_pubkey_env)" == x ]] && CFG[VPN_SERVICE_PROVIDER]=custom && CFG[VPN_TYPE]=wireguard && h=$(vpn_line_hints "ERROR VPN settings: provider settings: server selection: Wireguard server selection settings: endpoint IP is not set") && [[ "$h" == *"import your wg0.conf"* ]] && CFG[VPN_SERVICE_PROVIDER]=mullvad && h=$(vpn_line_hints "ERROR ... endpoint IP is not set") && [[ "$h" == *"must be blank"* ]] )'
     st "Gluetun server-list updater patch"  '( st_prep internet jellyfin tailscale core; CFG[VPN_SERVICE_PROVIDER]=mullvad; CFG[VPN_SERVERS_UPDATE_PERIOD]=480h; o=$(render_override "$t/y/docker-compose.yaml"); [[ "$o" == *"UPDATER_PERIOD=480h"* && "$o" != *PROTONVPN* ]] && CFG[VPN_SERVICE_PROVIDER]=protonvpn && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* ]] && CFG[VPN_UPDATER_PROTON_EMAIL]=me@example.org && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" == *"UPDATER_PROTONVPN_EMAIL=me@example.org"* && "$o" == *"UPDATER_PROTONVPN_PASSWORD=\${UPDATER_PROTONVPN_PASSWORD:-}"* ]] && CFG[VPN_SERVERS_UPDATE_PERIOD]=off && o=$(render_override "$t/y/docker-compose.yaml") && [[ "$o" != *UPDATER_PERIOD* && "$o" != *UPDATER_PROTONVPN* ]] && validate_key VPN_SERVERS_UPDATE_PERIOD 480h && ! validate_key VPN_SERVERS_UPDATE_PERIOD 15d && validate_key SERVER_COUNTRIES "Switzerland,Netherlands" && ! validate_key SERVER_CITIES "a=b" )'
     st "portable backup crypto round-trip"  '( printf "secret data\n" | portable_encrypt "correct horse battery" >"$t/b.msbak" && is_portable_backup "$t/b.msbak" && [[ "$(portable_decrypt "$t/b.msbak" "correct horse battery")" == "secret data" ]] && ! portable_decrypt "$t/b.msbak" "wrong passphrase!!" >/dev/null 2>&1 && ! grep -q "secret data" "$t/b.msbak" )'
